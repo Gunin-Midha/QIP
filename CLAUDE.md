@@ -13,7 +13,7 @@ This is a WorldQuant BRAIN alpha research system for the IIT Madras Quant Guild 
 
 - **Phase 1 and Phase 2: DONE.** 164 tests pass, none fail, none are skipped.
 - **Phase 3 (LLM agents): NOT STARTED.** Don't begin it unless the user asks.
-- This is not a git repo, so nothing has been committed.
+- Git repo: https://github.com/Gunin-Midha/QIP (branch `main`). The repo root is `QIP/`.
 
 ## Commands (run from `alpha_research/`)
 
