@@ -1,0 +1,37 @@
+# TEST CONFIG ONLY. The holdout dates and the two risk limits below are placeholders so the
+# fixture pipeline can run. They are NOT policy. The owner still has to answer OQ-4 and
+# OQ-9 in config/thresholds.yaml.
+gates:
+  sharpe_min: 1.25
+  fitness_min: 1.0
+  turnover_min: 0.01
+  turnover_max: 0.70
+  self_correlation_max: 0.70
+
+risk:
+  max_drawdown: 0.15              # test placeholder (OQ-4)
+  weight_concentration_max: 0.10  # test placeholder (OQ-4)
+  leg_balance_min_ratio: null
+  top_n_pnl_days_removed: 10
+  min_sharpe_after_top_pnl_removal: null
+  weak_year_sharpe_floor: null
+  max_yearly_sharpe_spread: null
+  stress_windows: []
+
+diversity:
+  max_pool_correlation: 0.70
+  min_marginal_pool_sharpe_gain: null
+
+auditor:
+  os_is_ratio_floor: null
+  deflation_method: "expected_max_normal"
+
+holdout:
+  start_date: 2024-01-01          # test placeholder (OQ-9)
+  end_date: 2025-12-31
+
+simulator:
+  max_poll_seconds: 600
+  poll_interval_seconds: 5
+  max_retries: 3
+  max_concurrent: 1

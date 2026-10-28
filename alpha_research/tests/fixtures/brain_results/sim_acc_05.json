@@ -1,0 +1,16 @@
+{
+  "status": "complete",
+  "sharpe": 1.95,
+  "fitness": 1.8095,
+  "turnover": 18.0,
+  "returns": 15.5,
+  "drawdown": 6.0,
+  "margin": 17.09,
+  "sub_universe_sharpe": 1.1,
+  "sub_universe_cutoff": 0.8,
+  "weight_concentration": 0.03,
+  "long_pnl": 6000000.0,
+  "short_pnl": 4500000.0,
+  "self_correlation": 0.27,
+  "daily_pnl_file": "pnl/sim_acc_05.csv"
+}

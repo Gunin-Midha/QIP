@@ -1,0 +1,26 @@
+# Levers are descriptions only in Phase 1. They are not applied to expressions yet.
+turnover:
+  - lever: increase_decay
+    step: {from: 3, to: 8}
+  - lever: lengthen_ts_window
+    step: {factor: 2}
+  - lever: wrap_in_smoothing
+    step: {operator: ts_mean, window: 5}
+  - lever: hump
+    step: {threshold: 0.01}
+concentration:
+  - lever: rank_transform
+    step: {}
+  - lever: winsorize
+    step: {quantile: 0.01}
+  - lever: tighten_truncation
+    step: {to: 0.05}
+self_correlation:
+  - lever: orthogonalize_against_pool
+    step: {}
+sub_universe:
+  - lever: restrict_to_liquid_fields
+    step: {}
+drawdown:
+  - lever: volatility_scale
+    step: {window: 20}

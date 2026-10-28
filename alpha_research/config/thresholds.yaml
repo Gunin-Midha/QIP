@@ -1,0 +1,40 @@
+# Submission gates (from the application and BRAIN's pass criteria)
+gates:
+  sharpe_min: 1.25
+  fitness_min: 1.0
+  turnover_min: 0.01        # 1%
+  turnover_max: 0.70        # 70%
+  self_correlation_max: 0.70
+
+# Risk manager (policy choices, owner must set. null = not configured)
+risk:
+  max_drawdown: null              # OQ-4
+  weight_concentration_max: null  # OQ-4
+  leg_balance_min_ratio: null     # OQ-5, min(long,short)/max(long,short)
+  top_n_pnl_days_removed: 10      # from the application's OS/IS robustness list
+  min_sharpe_after_top_pnl_removal: null   # OQ-5
+  weak_year_sharpe_floor: null    # OQ-6
+  max_yearly_sharpe_spread: null  # OQ-6
+  stress_windows: []              # optional list of [start_date, end_date], informational only
+
+# Diversity
+diversity:
+  max_pool_correlation: 0.70
+  min_marginal_pool_sharpe_gain: null   # OQ-7
+
+# Overfitting auditor
+auditor:
+  os_is_ratio_floor: null         # OQ-8
+  deflation_method: "expected_max_normal"   # documented in auditor.py
+
+# Holdout (must be set before any simulation runs)
+holdout:
+  start_date: null                # OQ-9
+  end_date: null
+
+# Simulator
+simulator:
+  max_poll_seconds: 600
+  poll_interval_seconds: 5
+  max_retries: 3
+  max_concurrent: 1               # OQ-3: real limit is account-specific

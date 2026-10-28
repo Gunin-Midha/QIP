@@ -1,0 +1,15 @@
+{
+  "status": "complete",
+  "sharpe": 1.58,
+  "fitness": 1.219,
+  "turnover": 21.0,
+  "returns": 12.5,
+  "drawdown": 6.0,
+  "margin": 11.81,
+  "sub_universe_sharpe": 0.5,
+  "sub_universe_cutoff": 0.73,
+  "weight_concentration": 0.03,
+  "long_pnl": 6000000.0,
+  "short_pnl": 4500000.0,
+  "self_correlation": 0.25
+}
