@@ -1,0 +1,12 @@
+# Example simulation settings for `cli generate --settings`. These values match the
+# hand-written fixture candidates; replace them with the settings of your own account.
+# Command-line flags override anything set here.
+region: USA
+universe: TOP3000
+delay: 1
+decay: 4
+neutralization: SUBINDUSTRY
+truncation: 0.08
+start_date: "2019-01-01"
+end_date: "2023-12-31"
+dataset: null

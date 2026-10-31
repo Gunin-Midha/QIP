@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alpha_research"
-version = "0.2.0"
-description = "Deterministic core of the multi-agent alpha research system (Phases 1 and 2)."
+version = "0.3.0"
+description = "Multi-agent alpha research system: deterministic core (Phases 1 and 2) and the Alpha Generator (Phase 3)."
 requires-python = ">=3.11"
 dependencies = ["pandas", "numpy", "scipy", "pyyaml"]
 
 [project.optional-dependencies]
 test = ["pytest"]
+llm = ["anthropic"]  # only needed for the real model; tests and --llm scripted run without it
 
 [tool.setuptools.packages.find]
 where = ["src"]
