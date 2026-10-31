@@ -9,10 +9,12 @@ This is a WorldQuant BRAIN alpha research system for the IIT Madras Quant Guild 
 - `BUILD_SPEC.md` is the authoritative spec for Phases 1 and 2.
 - `alpha_research/` holds the implementation.
 
-## Current status (as of 2026-10-28)
+## Current status (as of 2026-10-31)
 
-- **Phase 1 and Phase 2: DONE.** 164 tests pass, none fail, none are skipped.
-- **Phase 3 (LLM agents): NOT STARTED.** Don't begin it unless the user asks.
+- **Phase 1 and Phase 2: DONE.**
+- **Phase 3a, Alpha Generator: DONE.** `generator.py`, `fastexpr.py`, `llm.py` and `cli generate`. 284 tests pass (164 from Phases 1-2, 120 new), none fail, none are skipped.
+- **Rest of Phase 3: NOT STARTED.** Critic, Debate judge, Cheap Pre-Filter, Strategy Evolution, and repair levers that rewrite expressions. Don't begin them unless the user asks.
+- Generated candidates can't be simulated yet: `cli run` only has fixture results, so it exits 4 for them. They need `RealBrainClient` (OQ-2).
 - Git repo: https://github.com/Gunin-Midha/QIP (branch `main`). The repo root is `QIP/`.
 
 ## Commands (run from `alpha_research/`)
@@ -25,22 +27,30 @@ PYTHONPATH=src python3 -m alpha_research.cli run \
 PYTHONPATH=src python3 -m alpha_research.cli bandit \
     --candidates tests/fixtures/candidates/hand_written.json   # Phase 2 driver
 python3 tests/fixtures/generate_fixtures.py               # regenerate fixtures (deterministic)
+
+# Phase 3a: hypothesis or paper -> candidates (real model needs ANTHROPIC_API_KEY and `pip install -e ".[llm]"`)
+PYTHONPATH=src python3 -m alpha_research.cli generate --hypothesis "<text>" \
+    --settings config/generation_settings.example.yaml --n 10 --out generated/batch1.json
+#   also: --hypothesis-file F | --paper F.txt [--paper-title T], --datafields F, --dataset D,
+#   setting flags (--region ... --end-date) that override --settings, --model M.
+#   Offline / no key: --llm scripted --llm-script replies.json (a JSON list of reply strings).
+#   Writes batch1.json (loadable by `run`) and batch1.report.json (rejects, rationales, warnings).
 ```
 
 - The environment is system Python 3.12.4 with pandas, numpy, scipy, pyyaml and pytest already installed. There is no venv.
 - The first import after a cold start can take a minute or two (bytecode compilation).
 - Running `cli run` with the default `config/thresholds.yaml` exits with code 2 **on purpose**: the holdout is null (OQ-9).
-- CLI exit codes: 0 ok, 2 config error, 3 schema error, 4 real client not implemented.
+- CLI exit codes: 0 ok, 2 config error, 3 schema error, 4 real client not implemented (or no fixture for a candidate), 5 model unavailable or unusable reply, 6 `generate` produced no valid candidate.
 
 ## Hard rules (from BUILD_SPEC section 0, which still apply)
 
-1. No LLM or external API calls. No network code. Only the `RealBrainClient` stub may mention HTTP, and it must raise `NotImplementedError`.
+1. No network code, and no LLM calls outside `llm.py`. `llm.py` is the only module that may import a model provider SDK (optional, lazily imported); every other module depends on the `LLMClient` protocol, and tests use `ScriptedLLMClient`. Only the `RealBrainClient` stub may mention HTTP, and it must raise `NotImplementedError`. Nothing in the pipeline calls an LLM except the Generator (Phase 3a).
 2. Don't invent BRAIN response fields. Use only the fields in spec 3.2. If something is unclear, leave it null and add `TODO(open-question)`.
 3. Never hardcode a policy threshold. Thresholds live in `config/thresholds.yaml`. A `null` threshold means the check returns `passed=None` with note `"not configured"`. It never passes or fails silently.
-4. No credentials anywhere in the repo.
+4. No credentials anywhere in the repo. The model key is read from the `ANTHROPIC_API_KEY` environment variable in `llm.py` and nowhere else.
 5. A missing value is `None`, never `0`.
 6. Every component needs pytest tests, and a component isn't done until they pass.
-7. Use only the plain stack: dataclasses, pandas, numpy, scipy, sqlite3, pyyaml, pytest. No heavy frameworks, and no new dependencies (which is why PnL is stored as CSV, not Parquet).
+7. Use only the plain stack: dataclasses, pandas, numpy, scipy, sqlite3, pyyaml, pytest. No heavy frameworks, and no new required dependencies (which is why PnL is stored as CSV, not Parquet). The only addition is the optional `llm` extra (`anthropic`), needed only for the real model.
 8. Memory is append-only for candidates, results, decisions and variants. Never add update or delete methods to `MemoryStore`; a test checks for this. `os_is` is the only table that may be upserted.
 9. Stop and ask the user about genuinely ambiguous requirements. Don't resolve open questions silently.
 
@@ -56,6 +66,9 @@ QIP/
     pyproject.toml              # pytest pythonpath = src
     config/thresholds.yaml      # real config; OQ thresholds null, holdout null
     config/repair_playbook.yaml # turnover, concentration, self_correlation, sub_universe, drawdown
+    config/fastexpr.yaml        # SEED operator list (OQ-10), groups, base fields, constants
+    config/generator.yaml       # generator limits; complexity limits null (OQ-11)
+    config/generation_settings.example.yaml  # example --settings file
     src/alpha_research/
       schemas.py        # contracts + normalize_expression + experiment_hash
       config.py         # load/validate thresholds; ConfigError; require_holdout()
@@ -73,7 +86,10 @@ QIP/
       orchestrator.py   # Thompson sampling with floor quotas; run_rounds driver
       research_loop.py  # experiment_id, duplicates, lineage, queue, decide_next/route
       pipeline.py       # end-to-end wiring; load_candidate_file
-      cli.py            # `run` and `bandit` subcommands
+      cli.py            # `run`, `bandit` and `generate` subcommands
+      fastexpr.py       # Phase 3a: Fast Expression lexer/parser, analyze() against config/fastexpr.yaml
+      llm.py            # Phase 3a: LLMClient protocol, ScriptedLLMClient, AnthropicLLMClient (only provider code)
+      generator.py      # Phase 3a: AlphaGenerator (hypothesis/paper -> validated CandidateRecords)
     tests/
       conftest.py                       # shared fixtures: config, make_config(section__key=...), memory, candidate()
       fixtures/thresholds_test.yaml     # TEST-ONLY placeholders: holdout 2024-01-01..2025-12-31, max_drawdown 0.15, weight_concentration_max 0.10
@@ -81,6 +97,7 @@ QIP/
       fixtures/brain_results/           # 28 fixtures incl. screenshot_aggregate.json
       fixtures/candidates/hand_written.json  # 31 candidates with expected_decision / expected_failure_class
       test_*.py                         # one per module + test_pipeline.py acceptance test
+                                        # Phase 3a: test_fastexpr, test_generator, test_llm, test_cli_generate
 ```
 
 ## Key behaviours and decisions (don't silently change these)
@@ -122,6 +139,16 @@ QIP/
 - Orchestrator: each arm's floor is `floor(floor_share*budget/n_arms)`; remaining slots go one at a time by re-sampling Beta posteriors. The bandit driver defaults to budget 50 and skips arms with an invalid region.
 - Allowed universes are only TOP3000, TOP1000, TOP500 and TOP200 (TODO to extend).
 
+**Alpha Generator (Phase 3a, builder choices):**
+- The target language is **Fast Expression** only. `CandidateRecord.expression` is what the simulator submits, so Python alphas are not generated (nothing in the repo confirms BRAIN runs them).
+- Nothing the model writes reaches the output unless `fastexpr.analyze` and `CandidateRecord.validate` accept it. Unknown operators, wrong argument counts, unknown datafields (when a catalog is supplied) and syntax errors are rejected, then sent back once (`max_repair_rounds`) with the exact errors. `rejected` in the report holds the final failures.
+- Operators come only from `config/fastexpr.yaml` (a seed list, OQ-10). Fix the list there, never in code. Operator names must be lowercase.
+- Datafields: with `--datafields` a catalog makes unknown names an error. Without one, unknown names pass with a warning in the report. The prompt lists only the catalog fields most relevant to the hypothesis (`max_datafields_in_prompt`).
+- Paper and hypothesis text is wrapped in `<paper>`/`<hypothesis>` tags and the prompt calls it data. The validator is the real defence. PDFs are not read; convert to text first.
+- The model may suggest `decay` and `neutralization` per alpha (validated; bad values fall back to the settings with a warning). Region, universe, delay, truncation and dates always come from the settings. There are no built-in defaults for them, so a missing one is a config error (exit 2).
+- Candidate ids are `<batch_id>_NNN` with `batch_id = gen<UTC timestamp><4 hex of source hash>`. `prompt_version` comes from `config/generator.yaml` (bump it when prompts change; the bandit uses it as an arm key). `model` is the client's model name.
+- Duplicates (same experiment hash) inside a run or across calls on one generator are dropped and listed in the report. The pipeline's own duplicate check still applies later.
+
 ## Open questions (owner must answer, never guess)
 
 | ID | Topic | Where it shows up |
@@ -135,6 +162,8 @@ QIP/
 | OQ-7 | Min marginal pool Sharpe gain | `diversity.min_marginal_pool_sharpe_gain` |
 | OQ-8 | OS/IS ratio floor | `auditor.os_is_ratio_floor` |
 | OQ-9 | Holdout dates | `holdout.*`; the simulator raises ConfigError until set |
+| OQ-10 | Verify every operator and arity in the seed list against BRAIN's operator reference | `config/fastexpr.yaml`, `fastexpr.py` |
+| OQ-11 | Expression complexity limits (depth, operator calls, characters) | `config/generator.yaml` (null = not checked) |
 
 Two more TODOs exist: the full universe list (`schemas.py`) and the deflated-Sharpe citation (`auditor.py`).
 
@@ -144,12 +173,13 @@ Two more TODOs exist: the full universe list (`schemas.py`) and the deflated-Sha
 - When you add or change behaviour, update the tests, `README.md`, `REPORT.md` and this file.
 - If you change fixtures, edit `generate_fixtures.py` and rerun it. Don't hand-edit the generated JSON or CSV. Keep each candidate's `expected_decision` and `expected_failure_class` in sync, because `test_pipeline.py::test_pipeline_acceptance` asserts all 31.
 - Before saying a change is done, run the full suite and the definition-of-done greps:
-  `grep -rniE "requests|http|anthropic|openai" src tests config --exclude-dir=pnl` (expect only the stub comments) and
-  `grep -rniE "password|token|api_key" src tests config` (expect nothing).
+  `grep -rniE "requests|http|anthropic|openai" src tests config --exclude-dir=pnl --exclude-dir=__pycache__ --exclude='*llm*.py'` (expect only the two stub comments in `brain_client.py`) and
+  `grep -rniE "password|token|api_key" src tests config --exclude-dir=__pycache__ --exclude='*llm*.py'` (expect nothing). `llm.py` may name the provider and the key variable; also check that no literal key is present: `grep -rnE "\bsk-[A-Za-z0-9_-]{16,}" . --exclude-dir=.git` (expect nothing).
 - Runtime data (`data/`, `memory.sqlite`, `data/pnl/`) is git-ignored and must never be committed. Use tmp dirs in tests.
 
 ## Natural next steps (only when the user asks)
 
 1. Owner sets OQ-9 (holdout) and the OQ-4 limits in `config/thresholds.yaml`.
 2. Owner supplies a raw BRAIN response (OQ-2); then implement `RealBrainClient` and remap fields in `simulator.py`.
-3. Phase 3: LLM agents (Generator, Critic, Debate judge, Cheap Pre-Filter, Strategy Evolution) built on the existing contracts, and repair levers that actually rewrite expressions.
+3. Owner checks the operator seed list (OQ-10) and supplies a datafield catalog so the Generator can validate fields.
+4. Rest of Phase 3: Critic, Debate judge, Cheap Pre-Filter, Strategy Evolution built on the existing contracts, and repair levers that actually rewrite expressions. The generator's repair round (`_repair_prompt`) is the model for the Critic's feedback loop.

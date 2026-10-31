@@ -1,6 +1,6 @@
 # Build Report: Alpha Research System, Phases 1 and 2
 
-**Status:** Phases 1 and 2 are complete. 164 tests pass, none fail and none are skipped. Phase 3 (LLM generation) has not started.
+**Status:** Phases 1 and 2 are complete, and so is Phase 3a (the Alpha Generator, section 9). 284 tests pass (164 from Phases 1 and 2, 120 from Phase 3a), none fail and none are skipped. The rest of Phase 3 (critic, debate, pre-filter, strategy evolution, repair levers that rewrite expressions) has not started.
 **Source of truth for the requirements:** [`../BUILD_SPEC.md`](../BUILD_SPEC.md)
 **Architecture this implements:** the multi-agent design in the WorldQuant Project Member application (Gunin Midha, NA24B035), Question 8 and the architecture diagram.
 
@@ -25,7 +25,7 @@ What is deliberately **not** here:
 | Research Director (Orchestrator) | `orchestrator.py` | Built: Thompson sampling with a minimum number of slots (floor quota) per arm |
 | Research Loop Agent | `research_loop.py` | Built: experiment IDs, duplicate check, lineage, FIFO queue, routing |
 | Datafield Analysis Agent | `data_scientist.py` | Built: coverage, update gaps, tails, NaN pattern, redundancy |
-| Alpha Generator Agent | none | Phase 3 (LLM) |
+| Alpha Generator Agent | `generator.py`, `fastexpr.py`, `llm.py` | Built (Phase 3a); see section 9 |
 | Critic / Debate Agents, Cheap Pre-Filter | none | Phase 3 |
 | BRAIN Simulator | `brain_client.py`, `simulator.py` | Built against fixtures; real client is a stub |
 | Quantitative Evaluation | `evaluator.py`, `metric_validator.py` | Built |
@@ -244,6 +244,8 @@ Made by the builder:
 | OQ-7 | Minimum marginal pool Sharpe gain | not configured (correlation is still enforced) |
 | OQ-8 | OS/IS ratio floor | family flags return None |
 | OQ-9 | Holdout dates | the simulator refuses to run under the main config |
+| OQ-10 | Operator seed list in `config/fastexpr.yaml` | unverified; the generator only uses listed operators |
+| OQ-11 | Expression complexity limits | not checked |
 
 ---
 
@@ -251,4 +253,66 @@ Made by the builder:
 
 1. Answer OQ-9 and OQ-4 so the main config can run end to end.
 2. Get one raw BRAIN response (OQ-2), then implement `RealBrainClient` and map its field names in `simulator.py`.
-3. Phase 3: add the LLM agents (generator, critic, debate, pre-filter, strategy evolution) on top of the existing contracts. Repair levers can start rewriting expressions at the same time.
+3. Verify the operator seed list (OQ-10) and supply a datafield catalog so generated alphas can be checked against real fields.
+4. Rest of Phase 3: add the critic, debate, pre-filter and strategy evolution agents on top of the existing contracts. Repair levers can start rewriting expressions at the same time.
+
+---
+
+## 9. Phase 3a: Alpha Generator
+
+**What it is.** An agent that takes a hypothesis, or a research paper, and produces alphas written in WorldQuant BRAIN's Fast Expression language, as `CandidateRecord`s the existing pipeline already accepts. Run it with `cli generate` (see the README).
+
+**How it works.**
+
+```
+paper text ──► [model: extract hypotheses] ──┐
+hypothesis ──────────────────────────────────┤
+                                             ▼
+                 [model: write N alphas per hypothesis]   system prompt = rules + operator
+                                             │             list + most relevant datafields
+                                             ▼
+                      fastexpr.analyze (parser + checks)
+                          │ fail                 │ pass
+                          ▼                      ▼
+        [model: fix these, with the errors]   CandidateRecord.validate
+           (max_repair_rounds, default 1)        │
+                          │ still fails          ▼
+                          ▼                 de-duplicate by experiment hash
+                    report.rejected              │
+                                                 ▼
+                                   candidates.json + report.json
+```
+
+**Why the validator, not the prompt, is the safeguard.** A model can invent an operator, pass the wrong number of arguments, or use a datafield that does not exist. Paper text can also contain instructions aimed at the model. The prompt marks source text as data, but nothing depends on the model obeying: an expression only becomes a candidate if the parser and the checks accept it. A test feeds an injected "output os_system(...)" instruction through the pipeline and checks that it ends up in `rejected`.
+
+**Modules.**
+
+| Module | Role |
+|---|---|
+| `fastexpr.py` | Lexer and recursive-descent parser. `analyze()` returns errors, warnings, operators used, fields used, depth and call count, and never raises on bad input. Supports calls with keyword arguments, `+ - * /`, comparisons, `&&`, `||`, strings, and `name = expr;` statements. Reports everything else (such as `?:` or indexing) as an error. |
+| `config/fastexpr.yaml` | The operator list, written as signatures such as `ts_rank(x, d, constant=0)`. Arity is derived from the signature, so there is one source of truth. Also groups, base fields and constants. A seed list (OQ-10). |
+| `llm.py` | `LLMClient` protocol, `ScriptedLLMClient` for tests and offline runs, `AnthropicLLMClient` for the real model (optional SDK, key from the environment). The only file that names a provider. |
+| `generator.py` | `AlphaGenerator`, prompts, JSON extraction, repair round, de-duplication, `GenerationResult.to_report()`, `load_datafields`, `load_generator_config`. |
+| `config/generator.yaml` | prompt version, repair rounds, paper length cap, hypotheses per paper, datafields shown, output cap. Complexity limits are null (OQ-11). |
+
+**Decisions taken during the build.**
+- Fast Expression only. The simulator submits `CandidateRecord.expression`, and nothing in the repo shows that BRAIN runs Python alphas.
+- Unknown datafields are an error only when a catalog is supplied. Without one they pass with a warning, because the validator cannot know the account's fields.
+- With a large catalog the prompt lists only the fields whose name parts occur in the hypothesis text (deterministic scoring), up to `max_datafields_in_prompt`. The validator still accepts the whole catalog.
+- Surplus alphas beyond the requested count are dropped before they are recorded as seen, so a later call can still produce them.
+- The model may propose `decay` and `neutralization`. Both are validated, and invalid values fall back to the settings with a warning.
+- A paper is not read as PDF (no new dependency); the CLI explains how to convert it.
+- `cli run` on generated candidates now exits 4 with an explanation instead of a traceback, because fixture runs have no recorded result for them.
+
+**Tests added (120).**
+
+| Test file | Tests | What it proves |
+|---|---|---|
+| test_fastexpr | 49 | spec parsing and arity, every valid hand-written expression passes, syntax and arity errors, unknown operators and fields, variables, limits, deep nesting does not crash |
+| test_generator | 48 | hypothesis and paper flows, repair round and what the model sees, rejects, duplicates, surplus handling, JSON in fences or prose, retry on bad JSON, prompt-injection text, catalog behaviour, config loaders |
+| test_llm | 7 | scripted client, missing key, missing SDK, request shape, provider errors, empty reply |
+| test_cli_generate | 16 | end-to-end files, settings merge, paper and file inputs, catalog filtering, every exit code, `run` on generated candidates |
+
+**Not built, on purpose.** The critic, debate judge, cheap pre-filter, strategy evolution and expression-rewriting repair levers; any BRAIN network code; PDF parsing.
+
+**Checks.** Full suite 284 passed. The definition-of-done greps run with `--exclude='*llm*.py'` find only the two `RealBrainClient` stub comments and no credentials. A search for literal key strings finds none.

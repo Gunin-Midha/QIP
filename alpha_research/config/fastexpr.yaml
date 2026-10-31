@@ -1,0 +1,84 @@
+# Fast Expression language spec used by fastexpr.py to validate generated alphas.
+#
+# SEED LIST, NOT AN OFFICIAL REFERENCE (OQ-10). The owner must check every entry against
+# the operator reference on the BRAIN account and add or remove entries. The validator is
+# strict on purpose: an operator missing from this file makes the generator discard the
+# expression, and an operator that is listed here but does not exist on BRAIN would only
+# fail later, at simulation time. Correct the list here, never in code.
+#
+# Each operator is written as its signature. Arguments written as name=default are
+# optional. A trailing "..." means any number of further arguments. Arity is derived from
+# the signature, so there is one source of truth.
+
+operators:
+  # time series
+  - ts_mean(x, d)
+  - ts_std_dev(x, d)
+  - ts_sum(x, d)
+  - ts_delta(x, d)
+  - ts_delay(x, d)
+  - ts_rank(x, d, constant=0)
+  - ts_zscore(x, d)
+  - ts_corr(x, y, d)
+  - ts_covariance(y, x, d)
+  - ts_decay_linear(x, d, dense=false)
+  - ts_min(x, d)
+  - ts_max(x, d)
+  - ts_arg_max(x, d)
+  - ts_arg_min(x, d)
+  - ts_product(x, d)
+  - ts_av_diff(x, d)
+  - ts_backfill(x, d, k=1, ignore="NAN")
+  - ts_scale(x, d, constant=0)
+  - ts_quantile(x, d, driver=gaussian)
+  - ts_regression(y, x, d, lag=0, rettype=0)
+  - ts_count_nans(x, d)
+  - ts_skewness(x, d)
+  - days_from_last_change(x)
+  - last_diff_value(x, d)
+  # cross sectional
+  - rank(x, rate=2)
+  - zscore(x)
+  - scale(x, scale=1, longscale=0, shortscale=0)
+  - normalize(x, useStd=false, limit=0.0)
+  - winsorize(x, std=4)
+  - quantile(x, driver=gaussian, sigma=1.0)
+  - regression_neut(y, x)
+  - vector_neut(x, y)
+  # group
+  - group_neutralize(x, group)
+  - group_rank(x, group)
+  - group_zscore(x, group)
+  - group_scale(x, group)
+  - group_mean(x, weight, group)
+  - group_backfill(x, group, d, std=4.0)
+  # math and logic
+  - abs(x)
+  - sign(x)
+  - log(x)
+  - exp(x)
+  - sqrt(x)
+  - reverse(x)
+  - inverse(x)
+  - power(x, y)
+  - signed_power(x, y)
+  - min(a, b, ...)
+  - max(a, b, ...)
+  - if_else(cond, a, b)
+  - trade_when(trigger, alpha, exit)
+  - is_nan(x)
+  - densify(x)
+  - hump(x, hump=0.01)
+  - vec_avg(x)
+  - vec_sum(x)
+
+# Group identifiers that may be passed to group_* operators.
+groups: [sector, industry, subindustry, market, exchange, country]
+
+# Datafields that are always accepted. Everything else must come from the datafield
+# catalog the user supplies (--datafields). Without a catalog, other names are accepted
+# with a warning because they cannot be checked.
+base_fields: [close, open, high, low, volume, vwap, returns, cap, adv20]
+
+# Bare words that are values, not datafields.
+constants: ["nan", "true", "false", "gaussian", "uniform", "cauchy"]
