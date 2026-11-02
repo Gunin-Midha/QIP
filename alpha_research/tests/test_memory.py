@@ -91,3 +91,17 @@ def test_lineage_levers(memory, candidate):
                                    lever="lengthen_ts_window", decay=8,
                                    expression="rank(-ts_delta(close, 10))"))
     assert memory.lineage_levers("k2") == ["increase_decay", "lengthen_ts_window"]
+
+
+def test_candidate_outcomes_latest_decision_and_result(memory, candidate):
+    from alpha_research.schemas import DecisionRecord, ResultRecord
+    memory.put_candidate(candidate(candidate_id="a"))
+    memory.put_candidate(candidate(candidate_id="b", expression="rank(volume)"))
+    memory.put_result(ResultRecord(candidate_id="a", status="timeout"))
+    memory.put_result(ResultRecord(candidate_id="a", status="complete", sharpe=1.5))
+    memory.put_decision(DecisionRecord("a", "pending", "none"))
+    memory.put_decision(DecisionRecord("a", "accept", "none"))
+    rows = memory.candidate_outcomes()
+    assert [r["candidate"].candidate_id for r in rows] == ["a", "b"]
+    assert rows[0]["decision"].decision == "accept" and rows[0]["result"].sharpe == 1.5
+    assert rows[1]["decision"] is None and rows[1]["result"] is None

@@ -1,0 +1,35 @@
+# Example research plan for `cli research`. Each arm is one dataset in one region. The
+# Research Director decides how many simulations each arm gets per round; the Generator
+# works through the arm's hypotheses and papers in turn.
+#
+# Replace the settings with your own account's (see `cli brain options`) and the dataset
+# labels and hypotheses with your own. Paper paths are text files, relative to this file.
+arms:
+  - dataset: pv1
+    settings:
+      region: USA
+      universe: TOP3000
+      delay: 1
+      decay: 4
+      neutralization: SUBINDUSTRY
+      truncation: 0.08
+      start_date: "2019-01-01"
+      end_date: "2023-12-31"
+    hypotheses:
+      - "Stocks that fell sharply over the last week tend to rebound over the next week (short-term reversal)."
+      - "Stocks whose volume spikes without a price move are about to move as information is priced in."
+    papers: []
+
+  - dataset: fundamental6
+    settings:
+      region: USA
+      universe: TOP3000
+      delay: 1
+      decay: 0
+      neutralization: INDUSTRY
+      truncation: 0.08
+      start_date: "2019-01-01"
+      end_date: "2023-12-31"
+    hypotheses:
+      - "Firms with improving operating cash flow relative to assets outperform firms with deteriorating cash flow."
+    papers: []

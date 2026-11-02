@@ -1,7 +1,8 @@
 """Repair playbook lookup (spec section 12).
 
-Levers are descriptions only in Phase 1; nothing here rewrites an expression. One lever per
-repair: ``next_lever`` never returns more than one.
+This module only looks levers up. ``repair_agent.py`` applies them (mechanical rewrites, or
+the model for levers without one). One lever per repair: ``next_lever`` never returns more
+than one.
 """
 
 from __future__ import annotations

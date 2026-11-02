@@ -1,11 +1,10 @@
 """BRAIN client interface and implementations (spec section 4.1).
 
-``FixtureBrainClient`` replays JSON fixtures. ``RealBrainClient`` is a stub: no HTTP code
-exists in this phase.
+``FixtureBrainClient`` replays JSON fixtures. ``RealBrainClient`` lives in brain_api.py,
+the only module with network code; it translates BRAIN's responses into the same raw dict.
 
-Fixture file format (``<brain_sim_id>.json``). This is our own test format, not BRAIN's
-API. TODO(open-question) OQ-2: the real response shape is unknown until the owner
-provides a raw sample. The key names below are the names the simulator normalizes from.
+Fixture file format (``<brain_sim_id>.json``). This is our own format, not BRAIN's API.
+The key names below are the names the simulator normalizes from.
 
     {
       "responses": [                 # optional: a sequence returned by successive polls;
@@ -19,7 +18,9 @@ Without ``responses`` the whole file is the single response. Aggregate keys: sta
 sharpe, fitness, turnover (%), returns (%), drawdown (%), drawdown_date, margin (bps),
 sub_universe_sharpe, sub_universe_cutoff, weight_concentration, self_correlation,
 long_pnl, short_pnl, checks, yearly, and either daily_pnl ({"dates", "values"}) or
-daily_pnl_file (CSV path relative to the fixtures root, columns date,pnl).
+daily_pnl_file (CSV path relative to the fixtures root, columns date,pnl). Two optional
+keys: ``units: "fraction"`` means turnover, returns and drawdown are already fractions (the
+real client sends this), and ``notes`` is a list of strings copied onto the result.
 """
 
 from __future__ import annotations
@@ -43,6 +44,11 @@ class BrainClient(Protocol):
 
 class FixtureNotFoundError(LookupError):
     pass
+
+
+class SubmissionRejected(Exception):
+    """BRAIN refused the submission itself (bad settings or expression). The simulator
+    records a failed result instead of retrying."""
 
 
 class FixtureBrainClient:
@@ -94,18 +100,3 @@ class FixtureBrainClient:
         path = self.fixture_dir.parent / rel_path
         df = pd.read_csv(path)
         return {"dates": df["date"].astype(str).tolist(), "values": df["pnl"].astype(float).tolist()}
-
-
-class RealBrainClient:
-    """Stub. No HTTP code until a real response sample exists (OQ-2)."""
-
-    _MSG = "BRAIN API not yet integrated. Needs a real response sample. See OQ-2."
-
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def submit(self, candidate: CandidateRecord) -> str:
-        raise NotImplementedError(self._MSG)
-
-    def poll(self, brain_sim_id: str) -> dict:
-        raise NotImplementedError(self._MSG)

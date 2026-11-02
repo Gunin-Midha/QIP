@@ -3,13 +3,13 @@ import json
 
 import pytest
 
-from alpha_research import cli
+from alpha_research import brain_api, cli
 from alpha_research.brain_client import FixtureBrainClient
 from alpha_research.memory import MemoryStore
 from alpha_research.pipeline import Pipeline, load_candidate_file
 from alpha_research.schemas import SchemaError
 from alpha_research.simulator import VirtualClock
-from conftest import BRAIN_DIR, CANDIDATES_FILE, MAIN_CONFIG, PLAYBOOK, TEST_CONFIG
+from conftest import BRAIN_DIR, CANDIDATES_FILE, MAIN_CONFIG, PLAYBOOK, ROOT, TEST_CONFIG
 
 
 def run_file(config, playbook, data_dir, path=CANDIDATES_FILE):
@@ -101,10 +101,25 @@ def test_cli_schema_error(tmp_path):
     assert rc == cli.EXIT_SCHEMA
 
 
-def test_cli_real_client_not_implemented(tmp_path):
+def test_cli_real_client_without_credentials_exits_7(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv(brain_api.EMAIL_ENV_VAR, raising=False)
+    monkeypatch.delenv(brain_api.SECRET_ENV_VAR, raising=False)
     rc = cli.main(["run", "--candidates", str(CANDIDATES_FILE), "--config", str(TEST_CONFIG),
-                   "--playbook", str(PLAYBOOK), "--client", "real", "--data-dir", str(tmp_path / "d")])
-    assert rc == cli.EXIT_CLIENT
+                   "--playbook", str(PLAYBOOK), "--client", "real",
+                   "--brain-config", str(ROOT / "config" / "brain.yaml"),
+                   "--data-dir", str(tmp_path / "d")])
+    assert rc == cli.EXIT_BRAIN
+    assert "BRAIN_EMAIL" in capsys.readouterr().err
+
+
+def test_cli_real_client_checks_holdout_before_login(tmp_path, monkeypatch):
+    monkeypatch.setenv(brain_api.EMAIL_ENV_VAR, "someone@example.com")
+    monkeypatch.setenv(brain_api.SECRET_ENV_VAR, "not-used")
+    rc = cli.main(["run", "--candidates", str(CANDIDATES_FILE), "--config", str(MAIN_CONFIG),
+                   "--playbook", str(PLAYBOOK), "--client", "real",
+                   "--brain-config", str(ROOT / "config" / "brain.yaml"),
+                   "--data-dir", str(tmp_path / "d")])
+    assert rc == cli.EXIT_CONFIG
 
 
 def test_bandit_driver_floor_holds(capsys):

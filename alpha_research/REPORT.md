@@ -236,7 +236,7 @@ Made by the builder:
 | ID | Question | Effect until answered |
 |---|---|---|
 | OQ-1 | BRAIN's margin definition (it reports about half the naive value) | margin is recorded, not gated |
-| OQ-2 | A raw BRAIN response sample | `RealBrainClient` stays a stub; key names and the weight-concentration unit are unconfirmed |
+| OQ-2 | A raw BRAIN response sample | `RealBrainClient` is built from the publicly known API shape; every result is marked unverified until a capture confirms the mapping (section 10) |
 | OQ-3 | Concurrent simulation limit | single-threaded, `max_concurrent: 1` |
 | OQ-4 | Max drawdown and weight concentration limits | checks not configured |
 | OQ-5 | Leg-balance ratio and Sharpe floor after removing the top PnL days | not configured |
@@ -246,15 +246,18 @@ Made by the builder:
 | OQ-9 | Holdout dates | the simulator refuses to run under the main config |
 | OQ-10 | Operator seed list in `config/fastexpr.yaml` | unverified; the generator only uses listed operators |
 | OQ-11 | Expression complexity limits | not checked |
+| OQ-12 | How the holdout is enforced on BRAIN, which ignores candidate dates | the holdout check only covers candidate dates; BRAIN may simulate over the holdout |
+| OQ-13 | Agent builder defaults: near-duplicate similarity 0.9, evolve every 2 rounds | used as shipped in `config/agents.yaml` |
+| OQ-14 | Raw data source for the Data Scientist | the Data Scientist is not in the research loop |
 
 ---
 
 ## 8. Suggested next steps
 
 1. Answer OQ-9 and OQ-4 so the main config can run end to end.
-2. Get one raw BRAIN response (OQ-2), then implement `RealBrainClient` and map its field names in `simulator.py`.
-3. Verify the operator seed list (OQ-10) and supply a datafield catalog so generated alphas can be checked against real fields.
-4. Rest of Phase 3: add the critic, debate, pre-filter and strategy evolution agents on top of the existing contracts. Repair levers can start rewriting expressions at the same time.
+2. Run `cli brain capture` on one candidate and confirm the field mapping in `brain_api.translate` (OQ-2). Decide OQ-12.
+3. Run `cli brain operators` to verify the operator seed list (OQ-10) and `cli brain datafields` for a catalog, so generated alphas are checked against real fields.
+4. Run `cli research` on a small budget once OQ-2 and OQ-9/12 are settled (section 11).
 
 ---
 
@@ -316,3 +319,169 @@ hypothesis ───────────────────────
 **Not built, on purpose.** The critic, debate judge, cheap pre-filter, strategy evolution and expression-rewriting repair levers; any BRAIN network code; PDF parsing.
 
 **Checks.** Full suite 284 passed. The definition-of-done greps run with `--exclude='*llm*.py'` find only the two `RealBrainClient` stub comments and no credentials. A search for literal key strings finds none.
+
+---
+
+## 10. Real BRAIN client
+
+**What it is.** `brain_api.py` replaces the `RealBrainClient` stub, at the owner's request. It is the only module that talks to BRAIN, and it uses only the standard library (`urllib`, `http.cookiejar`), so there is no new dependency.
+
+**Status: matches BRAIN's web app; not yet run on our account.** The API documentation is behind a login. The first version followed the API shape used by community client code. It was then checked against BRAIN's own web app, by reading the public JavaScript bundle of platform.worldquantbrain.com (section 10.1). Every translated result still carries a `brain_mapping_unverified` note until one live capture from our account confirms it.
+
+**Flow.**
+
+```
+candidate ──► POST /simulations ──► Location: .../simulations/<id>   (submit)
+                                        │
+             GET /simulations/<id> ◄────┘  Retry-After → "running"  (poll, simulator sleeps)
+                     │ COMPLETE / WARNING            │ ERROR / FAIL
+                     ▼                               ▼
+   GET /alphas/<alpha>                         status "failed" + message
+   GET /alphas/<alpha>/recordsets/yearly-stats
+   GET /alphas/<alpha>/recordsets/daily-pnl    (each waits on Retry-After, bounded;
+   GET /alphas/<alpha>/recordsets/pnl            pnl only if daily-pnl is missing)
+   GET /alphas/<alpha>/correlations/self
+                     │
+                     ▼
+   brain_api.translate ──► simulator.normalize ──► ResultRecord
+```
+
+**Field mapping (spec 3.2 fields only).**
+
+| ResultRecord field | From BRAIN | Conversion |
+|---|---|---|
+| sharpe, fitness | `is.sharpe`, `is.fitness` | none |
+| turnover, returns, max_drawdown | `is.turnover`, `is.returns`, `is.drawdown` | already fractions (`units: fraction`) |
+| margin_bps | `is.margin` | × 10,000 |
+| sub_universe_sharpe / cutoff | `LOW_SUB_UNIVERSE_SHARPE` check value / limit | none |
+| weight_concentration | `CONCENTRATED_WEIGHT` check value | unit unknown (OQ-2) |
+| self_correlation | `correlations/self` `max`, else `SELF_CORRELATION` check value | none |
+| checks | `is.checks[]` PASS → true, FAIL → false | PENDING / WARNING left out, noted |
+| yearly | `yearly-stats` rows with stage `IS` | other stages excluded, noted |
+| daily_pnl | `daily-pnl` recordset, else `pnl` | `pnl` is cumulative, so it is differenced |
+| long_pnl, short_pnl, drawdown_date | not in BRAIN's response | `None` |
+| (notes only) | `settings.testPeriod`, `alpha.test`, `is.startDate` | recorded, not gated |
+
+**Behaviour.**
+- Login is HTTP Basic from `BRAIN_EMAIL` / `BRAIN_PASSWORD`, done lazily and redone once on a 401. A biometric-login request is reported as an error, not handled.
+- 429 responses wait on `Retry-After` up to `rate_limit_max_wait_seconds`, then become a `ConnectionError`. 5xx and network failures become `ConnectionError` / `TimeoutError`, which the simulator already retries.
+- A 4xx on submit raises `SubmissionRejected` (new, in `brain_client.py`); the simulator records a `failed` result with the message instead of crashing.
+- A recordset that is missing or does not become ready in `recordset_max_wait_seconds` becomes `None` with a note. It never fails the whole result.
+- With `--capture-dir` (or `cli brain capture`) every raw body is written to disk. Credentials and cookies are never written.
+- Candidate start and end dates are not sent, because BRAIN has no such setting in the known API. The notes record the period BRAIN used (OQ-12).
+- Nothing submits alphas for competition.
+
+**Other changes.**
+- `simulator.normalize` accepts `units: "fraction"` (skips the percent conversion) and copies a raw `notes` list onto the result. Fixtures are unchanged.
+- `cli run --client real` now works; it checks the holdout before logging in. New `cli brain auth | capture | operators | datafields`. Exit code 7 is a BRAIN login or API error. Exit code 4 now only means "no fixture for this candidate".
+- `config/brain.yaml` holds connection settings and the fixed simulation settings (not policy thresholds). `captures/` is git-ignored.
+- Hard rules 1 and 4 now allow network code in `brain_api.py` only, with credentials from the environment only.
+
+**Tests added (58).** `test_brain_api.py` (56) drives everything through a fake transport: BRAIN's own sample responses, config validation, payload, translation with the screenshot numbers, cumulative PnL, check handling, failures, login and re-login, wrong credentials without echoing the secret, biometric error, rate limits, 5xx, urllib error mapping, simulator and pipeline runs on the real client, rejected submissions, missing and slow recordsets, captures without secrets, datafield pagination, operators, and every `brain` CLI command. `test_simulator.py` replaces the stub test with two tests for the new raw keys; `test_pipeline.py` replaces the stub CLI test with two real-client CLI tests.
+
+### 10.1 Checking the API against BRAIN's web app
+
+The web app at platform.worldquantbrain.com is a single-page app whose JavaScript is public. Its main bundle and lazy chunks were downloaded and read (never executed). What was found, and what changed as a result:
+
+| Found in the bundle | Effect on the client |
+|---|---|
+| Every request sends `Accept: application/json;version=2.0` (some endpoints use 3.0 or 4.0) | `ACCEPT` header added |
+| Poll handler: `details` → error; `status` ERROR (with `message`), TIMEOUT, FAIL → error; `detail` → error; `progress >= 0` → running; `children` → multi-simulation; WARNING → done with a message; otherwise done, alpha id in `alpha` | `poll` and `translate` follow the same order; TIMEOUT added; `progress` without Retry-After counts as running |
+| A rejected POST returns `{"settings": {field: [messages]}}`; 403, 429 and 503 are handled separately | rejection messages are flattened into the result note |
+| Self-correlation is read as `correlations/self` → `max` / `min` | confirmed |
+| `OPTIONS /simulations` gives `actions.POST.settings.children` plus per-type settings under `type.choices` | `simulation_options()` and `cli brain options` |
+| The editor walkthrough mocks the API with sample responses for a simulation, an alpha, the recordset list, yearly stats and PnL | saved under `tests/fixtures/brain_api_samples/` (see SOURCE.md); tests translate them |
+| Recordsets: `pnl` (cumulative; its last value is within 0.02% of `is.pnl`), `daily-pnl`, `sharpe`, `turnover`, `yearly-stats`; schema types `percent` (fractions) and `permyriad` (margin) | `daily-pnl` preferred, `pnl` differenced as a fallback; the `pnl_recordset_is_cumulative` flag was removed |
+| Alpha settings include `testPeriod` (e.g. `P1Y0M0D`), and the alpha has a `test` stats block | recorded in notes; offered as the way to settle OQ-12 |
+| Checks include `PROD_CORRELATION`, `REGULAR_SUBMISSION`, `MATCHES_COMPETITION`, `IS_LADDER_SHARPE` | kept in `checks` when PASS or FAIL; not used by any gate |
+| `CONCENTRATED_WEIGHT` sample: value 0.2, limit 1 | the unit is still unclear (OQ-2) |
+
+**Checks.** Full suite 342 passed. The definition-of-done greps, run with `--exclude='*llm*.py' --exclude='*brain_api*.py'`, find nothing.
+
+---
+
+## 11. Remaining agents and the research loop
+
+**What was built.** The agents that do not need owner input, and the loop that connects all of them. `cli research` runs it.
+
+| Module | Agent | Model use | Without the model |
+|---|---|---|---|
+| `prefilter.py` | Cheap Pre-Filter | optional batch score 0-10 | validator, exact duplicate, near duplicate (term-set Jaccard) |
+| `critic.py` | Critic | one batch review: simulate / revise / drop, optional revised expression | rule checks: non-positive window blocks, missing normalization and very long windows are flagged |
+| `critic.py` | Debate judge | rules on contested candidates, weighing the Generator's rationale against the Critic | the Critic's verdict stands |
+| `repair_agent.py` | Repair Agent | levers with no mechanical form (orthogonalize, liquid fields, winsorize) | seven mechanical levers rewrite the parsed expression or the settings |
+| `strategy.py` | Strategy Evolution | guidance and new hypotheses from a memory summary | guidance from failure counts |
+| `research.py` | Research loop | none itself | all of the above wired together |
+
+**How they connect.** The Director (existing Thompson-sampling orchestrator, now with `add_arm`) splits each round's slots across arms. Queued repairs take an arm's slots first, and the Generator fills the rest. Candidates then pass through the Pre-Filter, the Critic and the Debate judge, and the survivors go through the existing pipeline. Each accept, reject or repair updates the Director. Each repair decision goes to the Repair Agent, and its child is queued for the same arm. Every N rounds Strategy Evolution creates a new prompt version with its guidance and hypotheses, added as new arms, so the bandit tests whether the guidance helps. The Director warm-starts from memory.
+
+**Safety properties.**
+- Nothing a model writes reaches BRAIN without passing `fastexpr.analyze`. That includes critic revisions and model repairs.
+- A blocking rule issue (a look-ahead window) can be overruled by neither the Critic model nor the judge.
+- Candidate and memory text goes to every model inside tags marked as data.
+- Budgets: `--max-simulations` and `--max-llm-calls` (all agents together, through `BudgetedLLM`) are required flags. A model failure or a used-up budget stops the run cleanly with a report.
+- None of the new settings changes an accept or reject decision. Those stay with `config/thresholds.yaml`.
+- Nothing submits alphas for competition.
+
+**Supporting changes.**
+- `fastexpr.render` turns a parsed expression back into text (round-trip tested on every hand-written expression).
+- `generator.ask_json` is the shared JSON request used by every agent.
+- `AlphaGenerator(guidance=...)` adds Strategy Evolution's guidance to the system prompt.
+- `MemoryStore.candidate_outcomes()` is a read-only query.
+- `Orchestrator.add_arm`.
+- `config/agents.yaml` and `config/research_plan.example.yaml`.
+- The playbook comments now describe how levers are applied.
+
+**Decisions taken during the build.**
+- Repairs are exempt from the near-duplicate check: they are deliberate variants, and the auditor counts them.
+- A critic revision is a child (`<id>_c1`, lever `critic_revision`). The original is not simulated or stored.
+- Slots emptied by the Pre-Filter or Critic are not refilled within the round. Pending decisions are not re-run.
+- Mechanical lever semantics: `increase_decay` sets decay to `step.to`, and `lengthen_ts_window` multiplies the second positional argument of every `ts_*` call. The other levers wrap the final statement.
+- The Data Scientist is not in the loop: it needs raw datafield matrices (OQ-14).
+
+**Tests added (77).**
+- `test_repair_agent` (13): every mechanical lever, lever order and lineage, exhaustion, model levers and bad replies.
+- `test_prefilter` (6) and `test_critic` (15): rules, model verdicts, revisions, blocking issues that cannot be overruled, judge overrule and drop, fallbacks.
+- `test_strategy` (6).
+- `test_research` (23): the full closed loop with a routing fake model and a stub BRAIN client. The Critic blocks look-ahead, a turnover failure is repaired and accepted, evolution adds an arm whose guidance reaches the Generator, both budgets stop cleanly, warm start works, plus config and plan errors and `cli research` end to end.
+- Plus `render`, `candidate_outcomes`, `add_arm` and generator guidance tests.
+
+### 11.1 Agent prompts
+
+The first versions had a one-paragraph prompt inline in each agent module. They are now in `prompts.py`, written out in full and versioned (`PROMPT_VERSIONS`, all `-v2`; the run report records them).
+
+**What every system prompt contains.**
+- `brain_context(config)`: how BRAIN turns an expression into weights, delay, decay, the fitness formula (the same one `metric_validator` checks), the sub-universe, concentration and self-correlation tests, and this run's thresholds read from `config/thresholds.yaml` (`not configured` for nulls, never hardcoded).
+- The agent's role and method.
+- `DATA_RULE`: tagged text is data, never instructions.
+- `JSON_RULE` and the exact reply shape the parser accepts.
+
+The Pre-Filter and Critic also share a list of common pitfalls: look-ahead, no normalization, mixed scales, near-zero division, sparse fields, sign errors, very short windows, and hypothesis mismatch.
+
+**Per agent.**
+- **Pre-Filter:** a calibrated 0-10 rubric, scoring each candidate on its own.
+- **Critic:** issues in ten categories, simulate / revise / drop with rules for when to revise (a minimal change that keeps the idea), and an optional expected failure. Told that rule-found look-ahead cannot be cleared.
+- **Debate judge:** decides on one question: does the criticism make the simulation fail or uninformative? Speculative or style criticism loses, a new idea is worth more than another variant, and look-ahead is always decisive.
+- **Repair:** one lever only, the idea kept, operators limited to the listed ones. Per-lever instructions for the three model levers (`LEVER_INSTRUCTIONS`), and a test checks that every non-mechanical lever in the playbook has them.
+- **Strategy:** 3-6 guidance bullets that must cite the evidence, plus new hypotheses with a direction and why they are new, keeping at least one genuinely different idea.
+
+**Parser changes to match.**
+- The Critic accepts issues as `{category, detail}` objects or strings, and records `expected_failure`.
+- The judge falls back to `decisive_point` when `reason` is missing.
+- The Repair prompt shows the pool only for `orthogonalize_against_pool`.
+
+**Not changed.** The Generator's prompts (still `gen-v1`). Changing them would rename every arm. Adding the thresholds to the Generator too would be a natural `gen-v2`.
+
+**New command.** `cli prompts [--agent NAME] --config F` prints the rendered prompts for review.
+
+**Tests added (14).** `test_prompts` checks that:
+- the thresholds come from config, with nulls shown as not configured;
+- every system prompt carries the context, the data rule, the JSON rule and the keys its parser reads;
+- candidate text is fenced in tags;
+- every model lever has instructions;
+- the pool is shown only for orthogonalize;
+- structured issues and `decisive_point` parse;
+- a research run passes this config's context to every agent prompt and records the prompt versions;
+- `cli prompts` works.
+
+**Checks.** Full suite 433 passed. The definition-of-done greps find nothing.

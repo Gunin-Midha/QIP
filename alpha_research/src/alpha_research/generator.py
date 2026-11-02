@@ -245,7 +245,8 @@ def _rank_datafields(catalog: Collection[str], text: str, limit: int) -> list[st
 
 
 def build_system_prompt(spec: FastExprSpec, datafields: Collection[str] | None,
-                        relevance_text: str, config: GeneratorConfig) -> str:
+                        relevance_text: str, config: GeneratorConfig,
+                        guidance: str | None = None) -> str:
     lines = [
         "You are a quantitative researcher writing alpha expressions for the WorldQuant "
         "BRAIN platform, in the Fast Expression language.",
@@ -282,6 +283,10 @@ def build_system_prompt(spec: FastExprSpec, datafields: Collection[str] | None,
         lines.append("No datafield catalog was supplied. Prefer the base fields. Any other "
                      "datafield name you use may not exist on the platform and will be "
                      "flagged as unverified.")
+    if guidance:
+        lines += ["", "Lessons from earlier research rounds (summarized from our own results; "
+                  "advice, not rules, and never a reason to break the language rules):",
+                  guidance.strip()]
     lines += ["", _UNTRUSTED,
               "Reply with a single JSON object and nothing else: no prose, no code fences."]
     return "\n".join(lines)
@@ -364,6 +369,24 @@ def extract_json(text: str):
     raise ValueError("no JSON found in the reply")
 
 
+def ask_json(llm: LLMClient, system: str, user: str, *, max_output: int = 4096,
+             attempts: int = 2) -> tuple[object, int]:
+    """One model request that must come back as JSON, retried once with a reminder.
+    Returns (parsed reply, model calls made). Shared by every agent that talks to the
+    model. Raises GenerationError when no attempt parses."""
+    prompt, last, calls = user, "no attempt made", 0
+    for _ in range(attempts):
+        calls += 1
+        reply = llm.complete(system, prompt, max_output=max_output)
+        try:
+            return extract_json(reply), calls
+        except ValueError as exc:
+            last = str(exc)
+            prompt = (user + f"\n\nYour previous reply could not be parsed ({last}). "
+                      "Reply with the JSON object only.")
+    raise GenerationError(f"the model did not return valid JSON after {attempts} attempts: {last}")
+
+
 def _clean_family(value) -> str | None:
     if not isinstance(value, str):
         return None
@@ -392,7 +415,8 @@ class AlphaGenerator:
     def __init__(self, llm: LLMClient, spec: FastExprSpec, settings: GenerationSettings,
                  config: GeneratorConfig, *, datafields: Iterable[str] | None = None,
                  known_hashes: Iterable[str] = (),
-                 now: Callable[[], datetime] | None = None):
+                 now: Callable[[], datetime] | None = None,
+                 guidance: str | None = None):
         self.llm = llm
         self.spec = spec
         self.settings = settings
@@ -400,6 +424,7 @@ class AlphaGenerator:
         self.datafields = None if datafields is None else sorted(set(datafields))
         self._seen: set[str] = set(known_hashes)  # experiment hashes already produced or run
         self._now = now or (lambda: datetime.now(timezone.utc))
+        self.guidance = guidance  # from Strategy Evolution; shown in the system prompt
 
     # ------------------------------------------------------------------ public
 
@@ -464,7 +489,8 @@ class AlphaGenerator:
 
     def _generate_unit(self, unit: _Unit, k: int, result: GenerationResult) -> None:
         relevance = unit.hypothesis + " " + (unit.context or "")
-        system = build_system_prompt(self.spec, self.datafields, relevance, self.config)
+        system = build_system_prompt(self.spec, self.datafields, relevance, self.config,
+                                     self.guidance)
         reply = self._ask_json(system, _generate_prompt(unit.hypothesis, unit.context, k), result)
         good, bad = self._check(self._items(reply), unit)
 
@@ -484,17 +510,13 @@ class AlphaGenerator:
             admitted += self._admit(draft, unit, result)
 
     def _ask_json(self, system: str, user: str, result: GenerationResult):
-        prompt, last = user, "no attempt made"
-        for _ in range(2):
-            result.llm_calls += 1
-            reply = self.llm.complete(system, prompt, max_output=self.config.max_output)
-            try:
-                return extract_json(reply)
-            except ValueError as exc:
-                last = str(exc)
-                prompt = (user + f"\n\nYour previous reply could not be parsed ({last}). "
-                          "Reply with the JSON object only.")
-        raise GenerationError(f"the model did not return valid JSON after 2 attempts: {last}")
+        try:
+            reply, calls = ask_json(self.llm, system, user, max_output=self.config.max_output)
+        except GenerationError:
+            result.llm_calls += 2
+            raise
+        result.llm_calls += calls
+        return reply
 
     @staticmethod
     def _items(reply) -> list:

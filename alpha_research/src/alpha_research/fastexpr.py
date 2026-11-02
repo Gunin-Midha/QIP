@@ -256,6 +256,43 @@ def parse(expression: str) -> tuple:
         raise FastExprError("expression is nested too deeply to parse") from exc
 
 
+_PREC = {"||": 1, "&&": 2, "<": 3, ">": 3, "<=": 3, ">=": 3, "==": 3, "!=": 3,
+         "+": 4, "-": 4, "*": 5, "/": 5}
+_UNARY_PREC = 6
+
+
+def render_node(node, parent_prec: int = 0, right_side: bool = False) -> str:
+    """Turn a syntax-tree node back into text, adding parentheses only where precedence
+    needs them (operators are left-associative, so an equal-precedence right operand is
+    wrapped). ``parse(render(...))`` gives back the same tree."""
+    if isinstance(node, Num):
+        return node.text
+    if isinstance(node, Str):
+        return f'"{node.value}"'
+    if isinstance(node, Name):
+        return node.name
+    if isinstance(node, Call):
+        parts = [render_node(a) for a in node.args] + [f"{k}={render_node(v)}" for k, v in node.kwargs]
+        return f"{node.name}({', '.join(parts)})"
+    if isinstance(node, Unary):
+        text = node.op + render_node(node.operand, _UNARY_PREC)
+        return f"({text})" if parent_prec > _UNARY_PREC else text
+    if isinstance(node, Binary):
+        prec = _PREC[node.op]
+        text = (f"{render_node(node.left, prec)} {node.op} "
+                f"{render_node(node.right, prec, right_side=True)}")
+        wrap = prec < parent_prec or (right_side and prec == parent_prec)
+        return f"({text})" if wrap else text
+    if isinstance(node, Assign):
+        return f"{node.name} = {render_node(node.value)}"
+    raise TypeError(f"cannot render {type(node).__name__}")
+
+
+def render(stmts: tuple) -> str:
+    """Render a parsed program: ``a = x; b = y; final``."""
+    return "; ".join(render_node(s) for s in stmts)
+
+
 # ---------------------------------------------------------------------------
 # spec (config/fastexpr.yaml)
 # ---------------------------------------------------------------------------

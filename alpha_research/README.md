@@ -1,15 +1,19 @@
-# alpha_research: deterministic core (Phases 1 and 2) and the Alpha Generator (Phase 3a)
+# alpha_research: deterministic core (Phases 1 and 2) and the LLM agents (Phase 3)
 
-This is the rule-based backbone of the multi-agent alpha research system, plus the first
-LLM agent, the Alpha Generator. Apart from `llm.py`, no module calls a model or the
-network. BRAIN is replaced by a fixture-backed client; `RealBrainClient` is a stub that
-raises `NotImplementedError` (OQ-2).
+This is the multi-agent alpha research system: the rule-based backbone, the LLM agents
+(Generator, Pre-Filter, Critic, Debate judge, Repair, Strategy Evolution), the research
+loop that connects them, and a real BRAIN API client. Only two modules reach the
+network: `llm.py` (the model) and `brain_api.py` (BRAIN). Tests and fixture runs use a
+fixture-backed BRAIN client and never touch the network. The real client follows the API
+as BRAIN's own web app uses it; it has not yet been run against our account (OQ-2, see
+"Real BRAIN client" below).
 
 | Module | Role in the architecture |
 |---|---|
 | `schemas.py` | CandidateRecord / ResultRecord / DecisionRecord contracts |
 | `config.py` | loads and validates `config/thresholds.yaml` |
 | `brain_client.py`, `simulator.py` | Backtester: validate, submit/resume, poll, retry, normalize, persist |
+| `brain_api.py` | the only module that talks to BRAIN: login, `RealBrainClient`, response translation, operator and datafield catalogs |
 | `metric_validator.py` | fitness / yearly / margin tripwires on every result |
 | `data_scientist.py` | Datafield Analysis Agent (coverage, update gaps, tails, NaN pattern, redundancy) |
 | `evaluator.py` | Quantitative Evaluation: hard gates, failure class, decision |
@@ -24,6 +28,12 @@ raises `NotImplementedError` (OQ-2).
 | `generator.py` | Alpha Generator Agent: hypothesis or paper to validated candidates (Phase 3a) |
 | `fastexpr.py` | Fast Expression parser and validator that gates everything the generator writes |
 | `llm.py` | the only module that talks to a model: `LLMClient` protocol, scripted client, real client |
+| `prefilter.py` | Cheap Pre-Filter: drops invalid, already-simulated and near-duplicate candidates before BRAIN |
+| `critic.py` | Critic (rule checks plus model review) and Debate judge |
+| `repair_agent.py` | Repair Agent: applies playbook levers (mechanical rewrites, or the model) |
+| `strategy.py` | Strategy Evolution: learns from memory, writes guidance and new hypotheses as a new prompt version |
+| `research.py` | the research loop that connects every agent (`cli research`) |
+| `prompts.py` | every prompt for the Pre-Filter, Critic, Debate judge, Repair and Strategy agents |
 
 ## Setup
 
@@ -65,8 +75,9 @@ python -m alpha_research.cli run \
 ```
 
 Options: `--data-dir` (default `$ALPHA_RESEARCH_DATA` or `./data`), `--client fixture|real`
-(`real` exits with code 4), `--fixtures-dir`, `--playbook`. Exit codes: 0 ok, 2 config error,
-3 schema error, 4 client not implemented. Each candidate prints one line:
+(see "Real BRAIN client"), `--brain-config`, `--capture-dir`, `--fixtures-dir`, `--playbook`.
+Exit codes: 0 ok, 2 config error, 3 schema error, 4 no fixture for a candidate, 5 model error,
+6 `generate` produced nothing, 7 BRAIN login or API error. Each candidate prints one line:
 `candidate_id | decision | failure_class | sharpe | fitness | turnover`.
 
 Fixture runs use a virtual clock, so timeouts resolve instantly. Running the command again
@@ -120,9 +131,142 @@ cannot be checked, and the model may invent fields. Supply one for real use.
 Offline: `--llm scripted --llm-script replies.json` replays a JSON list of reply strings, which
 is how the tests and demos run without a key.
 
-Limits: the generator stops at candidates. Simulating them needs the real BRAIN client
-(OQ-2), so `cli run` on generated candidates exits 4 with an explanation. Python alphas are
-not generated: the pipeline submits Fast Expressions.
+Limits: the generator stops at candidates. Fixture runs have no result for them, so
+`cli run` on generated candidates exits 4 with an explanation; simulate them with
+`--client real`. Python alphas are not generated: the pipeline submits Fast Expressions.
+
+## Real BRAIN client
+
+`brain_api.py` talks to `api.worldquantbrain.com` with the standard library only. Log in
+details come from the environment and are never stored, logged or captured:
+
+```bash
+export BRAIN_EMAIL=you@example.com
+export BRAIN_PASSWORD=...
+python -m alpha_research.cli brain auth                      # check the login
+python -m alpha_research.cli brain options                   # allowed regions, universes, neutralizations...
+python -m alpha_research.cli brain capture --candidates generated/batch1.json --limit 1
+python -m alpha_research.cli brain operators                 # diff against config/fastexpr.yaml (OQ-10)
+python -m alpha_research.cli brain datafields --region USA --universe TOP3000 --delay 1 \
+    --out captures/datafields_usa.json                       # then: generate --datafields ...
+python -m alpha_research.cli run --client real --candidates generated/batch1.json \
+    --config <config with a holdout set>
+```
+
+**Where the API shape comes from.** BRAIN's API docs are behind a login, so the client
+was built by reading the public JavaScript of platform.worldquantbrain.com: its endpoint
+paths, its `Accept: application/json;version=2.0` header, how it polls simulations, and the
+sample responses its editor walkthrough ships with. Those samples are kept in
+`tests/fixtures/brain_api_samples/` and the tests translate them. What is still missing is
+one live response from our account, so every result carries a `brain_mapping_unverified`
+note. Run `brain capture` on one candidate, compare the raw files in `captures/<sim id>/`
+with `translated.json` and `result.json`, fix `brain_api.translate` if anything is off, then
+close OQ-2. `captures/` is git-ignored.
+
+How it works: `submit` posts the candidate's settings and expression to `/simulations` and
+keeps the simulation id from the `Location` header. `poll` reports `running` while BRAIN
+sends `Retry-After` or a `progress` value, treats `ERROR`, `FAIL`, `TIMEOUT` and
+`detail`/`details` bodies as failures (as the web app does), then fetches the alpha's IS
+stats, yearly stats, daily PnL and self-correlation. A missing piece becomes `None` with a note, never zero. A 401 triggers
+one fresh login, a 429 waits (up to `rate_limit_max_wait_seconds`), and 5xx or network
+errors are retried by the simulator. A submission BRAIN rejects (400) becomes a `failed`
+result. Accounts that require biometric login are not supported; the error says so.
+
+Mapping (matches BRAIN's samples): `is.sharpe/fitness/turnover/returns/drawdown` as
+fractions, `is.margin` times 10,000 into bps, sub-universe Sharpe and cutoff from the
+`LOW_SUB_UNIVERSE_SHARPE` check's value and limit, weight concentration from the
+`CONCENTRATED_WEIGHT` check's value (unit still unclear), self-correlation from
+`correlations/self` `max` (or the `SELF_CORRELATION` check), daily PnL from the `daily-pnl`
+recordset, or else by differencing the cumulative `pnl` recordset. Yearly rows are kept
+only for stage `IS`. Checks that are neither PASS nor FAIL are left out. Long and short
+PnL and the drawdown date are not in BRAIN's response and stay `None`. The test-period
+stats (`alpha.test`) are recorded in the notes, not gated.
+
+BRAIN does not take start and end dates; it simulates its own period, and the result notes
+record that period (OQ-12). It does accept a `testPeriod` setting (ISO duration such as
+`P1Y0M0D`) that holds out the end of its period, which is the likely way to enforce our
+holdout; it is not set until the owner decides. Fixed settings sent with every simulation (instrument type,
+pasteurization, unit and NaN handling, language) live in `config/brain.yaml`.
+Simulations run one at a time (OQ-3). Alphas are never submitted for competition.
+
+## Research loop: all agents connected
+
+```bash
+export BRAIN_EMAIL=... BRAIN_PASSWORD=... ANTHROPIC_API_KEY=...
+python -m alpha_research.cli research --plan config/research_plan.example.yaml \
+    --config <thresholds with a holdout> --max-simulations 20 --max-llm-calls 60 \
+    --per-round 5 --rounds 4 --datafields captures/datafields_usa.json
+```
+
+Each round:
+
+1. **Research Director** splits `--per-round` simulation slots across the arms
+   (dataset × region × prompt version) by Thompson sampling, with a floor for every arm.
+   It starts from the outcomes already in memory, so a second run continues the first.
+2. **Repair queue first**: repaired children waiting for the arm take its slots.
+3. **Alpha Generator** fills the remaining slots from the arm's next hypothesis or paper
+   (the plan's sources are used in turn).
+4. **Cheap Pre-Filter** drops invalid expressions, experiments already simulated, and near
+   duplicates of anything in memory (term-set similarity, `config/agents.yaml`).
+   Optionally the model scores the batch.
+5. **Critic** checks rules (a non-positive window, which reads the future, always blocks;
+   a missing cross-sectional normalization is flagged), then the model reviews the batch:
+   simulate, revise or drop. **Debate judge** rules on the contested ones, weighing the
+   Generator's rationale against the Critic. A revision becomes a child candidate.
+6. **Pipeline** simulates on BRAIN and decides (gates, risk, diversity, pool, memory). The
+   Director learns from each accept, reject or repair.
+7. **Repair Agent** turns each `repair` decision into a child with the next playbook lever
+   (`config/repair_playbook.yaml`), queued for the same arm.
+8. Every `strategy.every_rounds` rounds, **Strategy Evolution** summarizes memory, writes
+   guidance for the Generator and proposes new hypotheses. They are released as a new
+   prompt version (`gen-v1+evo1`, ...) on new arms, so the Director measures whether the
+   guidance helps.
+
+The run stops at `--max-simulations` (candidates that reached BRAIN), at `--max-llm-calls`
+(all agents together), or after `--rounds`. A JSON report (`--report`, default
+`<data-dir>/<run id>.json`) lists every round: allocation, what each agent dropped and why,
+decisions, repairs and evolutions. Nothing submits alphas for competition.
+
+`config/agents.yaml` turns the model on or off per agent (off = rules only) and holds the
+Pre-Filter and Strategy settings. Its two builder defaults (near-duplicate similarity 0.9,
+evolve every 2 rounds) are OQ-13. None of these settings changes an accept or reject
+decision. A research plan lists arms with a dataset label, simulation settings,
+hypotheses and paper text files; see `config/research_plan.example.yaml`.
+
+**The model behind the agents.** Every agent that uses a model gets the same `LLMClient`
+from `llm.py`. With `--llm real` (the default) that is Claude, through `ANTHROPIC_API_KEY`
+and `--model`. `config/agents.yaml` switches the model off per agent, which leaves the rule
+checks.
+
+**Prompts.** All agent prompts are in `src/alpha_research/prompts.py` (the Generator's stay in
+`generator.py`). Each agent has a version in `PROMPT_VERSIONS`; bump it when you change its
+text, and the run report records the versions used. Each system prompt contains:
+
+- a shared section on how BRAIN judges an alpha (weights, delay, decay, the fitness
+  formula, sub-universe, concentration, self-correlation);
+- the pass thresholds, read from `config/thresholds.yaml` at run time (never typed into a
+  prompt);
+- the agent's own instructions;
+- the rule that tagged text is data, not instructions;
+- the exact JSON shape its parser accepts.
+
+To read them as the model sees them:
+
+```bash
+python -m alpha_research.cli prompts --agent critic --config config/thresholds.yaml   # or --agent all
+```
+
+| Agent | What its prompt asks for |
+|---|---|
+| Pre-Filter | a 0-10 score per candidate against a fixed rubric, with a one-line reason |
+| Critic | issues by category (lookahead, sign, normalization, scale, turnover, ...), a verdict, a minimal revised expression, the test it expects to fail |
+| Debate judge | a ruling per contested candidate, decided on one question: does the criticism make the simulation fail or uninformative? |
+| Repair | exactly one lever applied, keeping the idea, with lever-specific instructions (orthogonalize, liquid fields, winsorize) |
+| Strategy | 3-6 evidence-based guidance bullets and new hypotheses, each with a direction and why it is new |
+
+Known limits: slots that the Pre-Filter or Critic empty are not refilled in the same round.
+`pending` decisions are not re-run. The Data Scientist agent is not in the loop, because it
+needs raw datafield matrices that BRAIN's API does not provide (see open questions).
 
 ## Regenerating fixtures
 
@@ -151,8 +295,9 @@ screenshot values (aggregate plus yearly rows for 2019 to 2023).
 
 - **OQ-1 Margin definition.** BRAIN's reported margin is about half the naive
   `returns / (turnover * 252)`. Margin is recorded alongside the naive value and is not gated.
-- **OQ-2 Real BRAIN response format.** Needed before `RealBrainClient` can be written. The
-  raw key names and the unit of `weight_concentration` follow our fixture format.
+- **OQ-2 Real BRAIN response format.** `RealBrainClient` follows BRAIN's own web app and
+  its sample responses. Confirm with one `cli brain capture` from our account, including
+  the unit of `weight_concentration` and the shape of the `daily-pnl` recordset.
 - **OQ-3 Concurrent simulation limit.** Account-specific. `max_concurrent` is 1 and no
   threading is implemented.
 - **OQ-4 Drawdown and concentration limits.** Policy choice.
@@ -166,3 +311,12 @@ screenshot values (aggregate plus yearly rows for 2019 to 2023).
   listed, so a missing operator limits what it can write.
 - **OQ-11 Expression complexity limits.** Depth, operator calls and length are `null` (not
   checked) in `config/generator.yaml` until the owner chooses them.
+- **OQ-12 Simulation period on BRAIN.** BRAIN ignores the candidate's start and end dates,
+  so the holdout check on candidate dates does not stop BRAIN from simulating over the
+  holdout. BRAIN's `testPeriod` setting holds out the end of its period. Decide whether to
+  use it (and how long) or another way to enforce the holdout on real runs.
+- **OQ-13 Agent defaults.** `config/agents.yaml` ships with builder defaults so the loop
+  works: near-duplicate similarity 0.9 and Strategy Evolution every 2 rounds. Review them.
+- **OQ-14 Data Scientist input.** The datafield audit needs a dates × instruments matrix
+  per field. BRAIN's API (as far as the web app shows) does not provide raw data, so decide
+  the source: BRAIN's per-field statistics, an outside data source, or probe simulations.

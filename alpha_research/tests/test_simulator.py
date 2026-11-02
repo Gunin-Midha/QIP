@@ -3,8 +3,9 @@ from datetime import date
 
 import pytest
 
-from alpha_research.brain_client import FixtureBrainClient, RealBrainClient
+from alpha_research.brain_client import FixtureBrainClient
 from alpha_research.config import ConfigError
+from alpha_research.schemas import SchemaError
 from alpha_research.memory import MemoryStore
 from alpha_research.simulator import Simulator, VirtualClock, normalize, parentheses_balanced
 from conftest import BRAIN_DIR
@@ -146,8 +147,16 @@ def test_crash_after_submit_resumes_without_resubmitting(tmp_path, config, candi
     store.close()
 
 
-def test_real_client_is_a_stub(candidate):
-    with pytest.raises(NotImplementedError, match="OQ-2"):
-        RealBrainClient().submit(candidate())
-    with pytest.raises(NotImplementedError):
-        RealBrainClient().poll("x")
+def test_fraction_units_skip_percent_conversion_and_notes_are_kept():
+    raw = {"status": "complete", "units": "fraction", "turnover": 0.2578, "returns": 0.1119,
+           "drawdown": 0.0704, "notes": ["from client"],
+           "yearly": [{"year": 2019, "turnover": 0.2305}]}
+    r = normalize(raw, "c1", "s1")
+    assert (r.turnover, r.returns, r.max_drawdown) == (0.2578, 0.1119, 0.0704)
+    assert r.yearly[0].turnover == 0.2305 and r.notes == ["from client"]
+    assert normalize({"status": "complete", "turnover": 25.78}, "c1", "s1").turnover == pytest.approx(0.2578)
+
+
+def test_unknown_units_is_a_schema_error():
+    with pytest.raises(SchemaError, match="units"):
+        normalize({"status": "complete", "units": "bps"}, "c1", "s1")

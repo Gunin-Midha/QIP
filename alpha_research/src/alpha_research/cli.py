@@ -5,9 +5,13 @@
     python -m alpha_research.cli bandit --candidates tests/fixtures/candidates/hand_written.json
     python -m alpha_research.cli generate --hypothesis "..." --settings my_settings.yaml \
         --out generated/batch1.json
+    python -m alpha_research.cli brain auth | options | capture | operators | datafields
+    python -m alpha_research.cli research --plan config/research_plan.example.yaml \
+        --config <thresholds with holdout> --max-simulations 20 --max-llm-calls 60
 
-Exit codes: 0 success, 2 config error, 3 schema error, 4 client not implemented,
-5 model unavailable or unusable reply, 6 generate produced no valid candidate.
+Exit codes: 0 success, 2 config error, 3 schema error, 4 no fixture for a candidate,
+5 model unavailable or unusable reply, 6 generate produced no valid candidate,
+7 BRAIN login or API error.
 """
 
 from __future__ import annotations
@@ -16,11 +20,15 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import yaml
 
-from .brain_client import FixtureBrainClient, FixtureNotFoundError, RealBrainClient
+from .brain_api import (EMAIL_ENV_VAR, SECRET_ENV_VAR, BrainApiError, RealBrainClient,
+                        list_datafields, list_operators, load_brain_config, make_session,
+                        simulation_options)
+from .brain_client import FixtureBrainClient, FixtureNotFoundError, SubmissionRejected
 from .config import ConfigError, load_config
 from .fastexpr import FastExprSpec
 from .generator import (AlphaGenerator, GenerationError, GenerationSettings, Source,
@@ -30,10 +38,12 @@ from .memory import MemoryStore, default_data_dir
 from .orchestrator import run_rounds
 from .pipeline import Pipeline, load_candidate_file
 from .repair import Playbook
+from .research import Budget, ResearchRun, load_agents_config, load_plan, write_report
+from . import prompts as agent_prompts
 from .schemas import REGIONS, SchemaError
-from .simulator import VirtualClock
+from .simulator import VirtualClock, normalize
 
-EXIT_OK, EXIT_CONFIG, EXIT_SCHEMA, EXIT_CLIENT, EXIT_LLM, EXIT_EMPTY = 0, 2, 3, 4, 5, 6
+EXIT_OK, EXIT_CONFIG, EXIT_SCHEMA, EXIT_CLIENT, EXIT_LLM, EXIT_EMPTY, EXIT_BRAIN = 0, 2, 3, 4, 5, 6, 7
 PLACEHOLDER_PROMPT_VERSION = "pv0"  # Phase 2: prompt_version is a placeholder
 DEFAULT_MODEL = "claude-sonnet-5-5"
 SETTING_FLAGS = ("region", "universe", "delay", "decay", "neutralization", "truncation",
@@ -46,16 +56,22 @@ def _run(args) -> int:
     entries = load_candidate_file(args.candidates)
 
     if args.client == "real":
-        raise NotImplementedError(RealBrainClient._MSG)
-    client = FixtureBrainClient(args.fixtures_dir, {
-        e.candidate.candidate_id: e.meta["fixture_id"]
-        for e in entries if e.meta.get("fixture_id")
-    })
-    vclock = VirtualClock()  # fixture runs never wait in real time
+        config.require_holdout()  # fail before logging in, not after the first submit
+        brain_config = load_brain_config(args.brain_config)
+        client = RealBrainClient(make_session(brain_config), brain_config,
+                                 capture_dir=args.capture_dir)
+        sleep, clock = time.sleep, time.monotonic
+    else:
+        client = FixtureBrainClient(args.fixtures_dir, {
+            e.candidate.candidate_id: e.meta["fixture_id"]
+            for e in entries if e.meta.get("fixture_id")
+        })
+        vclock = VirtualClock()  # fixture runs never wait in real time
+        sleep, clock = vclock.sleep, vclock.clock
     memory = MemoryStore(args.data_dir)
     try:
-        pipeline = Pipeline(config, playbook, client, memory, sleep=vclock.sleep,
-                            clock=vclock.clock, out=sys.stdout)
+        pipeline = Pipeline(config, playbook, client, memory, sleep=sleep,
+                            clock=clock, out=sys.stdout)
         pipeline.run([e.candidate for e in entries])
     finally:
         memory.close()
@@ -173,6 +189,148 @@ def _generate(args) -> int:
     return EXIT_OK if result.candidates else EXIT_EMPTY
 
 
+def _brain_auth(args) -> int:
+    make_session(load_brain_config(args.brain_config)).authenticate()
+    print("BRAIN login ok")
+    return EXIT_OK
+
+
+def _brain_options(args) -> int:
+    """Allowed simulation settings for the account (regions, universes, neutralizations...)."""
+    options = simulation_options(make_session(load_brain_config(args.brain_config)))
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(options, indent=2) + "\n")
+    for name, spec in sorted(options["common"].items()):
+        choices = spec.get("choices") if isinstance(spec, dict) else None
+        if isinstance(choices, list):
+            values = [c.get("value") if isinstance(c, dict) else c for c in choices]
+            print(f"{name}: {values}")
+        elif choices is not None:
+            print(f"{name}: depends on {', '.join(map(str, choices)) if isinstance(choices, dict) else '?'}"
+                  " (see the file)")
+        else:
+            print(f"{name}: {json.dumps(spec)[:120]}")
+    print(f"types: {sorted(options['by_type'])}; wrote {out}")
+    return EXIT_OK
+
+
+def _brain_capture(args) -> int:
+    """Simulate a few candidates for real and save every raw response, so the field
+    mapping in brain_api.translate can be checked against our account (OQ-2)."""
+    brain_config = load_brain_config(args.brain_config)
+    entries = load_candidate_file(args.candidates)[: args.limit]
+    out_dir = Path(args.out_dir)
+    client = RealBrainClient(make_session(brain_config), brain_config, capture_dir=out_dir)
+    for e in entries:
+        c = e.candidate
+        try:
+            c.validate()
+            sim_id = client.submit(c)
+        except (SchemaError, SubmissionRejected) as exc:
+            print(f"{c.candidate_id} | skipped | {exc}")
+            continue
+        started = time.monotonic()
+        raw = client.poll(sim_id)
+        while raw["status"] == "running" and time.monotonic() - started < args.max_wait:
+            time.sleep(raw["retry_after"])
+            raw = client.poll(sim_id)
+        if raw["status"] == "running":
+            print(f"{c.candidate_id} | {sim_id} | still running after {args.max_wait:g}s")
+            continue
+        result = normalize(raw, c.candidate_id, sim_id)
+        (out_dir / sim_id).mkdir(parents=True, exist_ok=True)
+        (out_dir / sim_id / "candidate.json").write_text(json.dumps(c.to_dict(), indent=2) + "\n")
+        (out_dir / sim_id / "result.json").write_text(json.dumps(result.to_dict(), indent=2) + "\n")
+        print(f"{c.candidate_id} | {sim_id} | {result.status} | sharpe {result.sharpe} | "
+              f"fitness {result.fitness} | turnover {result.turnover} | saved {out_dir / sim_id}")
+    return EXIT_OK
+
+
+def _brain_operators(args) -> int:
+    session = make_session(load_brain_config(args.brain_config))
+    operators = list_operators(session)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(operators, indent=2) + "\n")
+    spec = FastExprSpec.load(args.fastexpr)
+    brain = {o["name"]: o.get("definition") for o in operators}
+    seed = set(spec.operators)
+    print(f"{len(brain)} operators on BRAIN, {len(seed)} in {args.fastexpr}; wrote {out}")
+    for name in sorted(seed - set(brain)):
+        print(f"in seed list, not on BRAIN: {name}")
+    for name in sorted(set(brain) - seed):
+        print(f"on BRAIN, not in seed list: {name}  {brain[name] or ''}")
+    for name in sorted(seed & set(brain)):
+        print(f"check arity: {name}  BRAIN: {brain[name]}")
+    return EXIT_OK
+
+
+def _brain_datafields(args) -> int:
+    brain_config = load_brain_config(args.brain_config)
+    session = make_session(brain_config)
+    fields = list_datafields(
+        session, region=args.region, universe=args.universe, delay=args.delay,
+        instrument_type=brain_config.settings.get("instrumentType", "EQUITY"), dataset=args.dataset)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(fields, indent=2) + "\n")
+    print(f"{len(fields)} datafields for {args.region}/{args.universe}/delay {args.delay}"
+          f"{' dataset ' + args.dataset if args.dataset else ''}; wrote {out} "
+          "(use it with generate --datafields)")
+    return EXIT_OK
+
+
+def _research(args) -> int:
+    config = load_config(args.config)
+    config.require_holdout()  # before logging in or calling the model
+    playbook = Playbook.load(args.playbook)
+    agents = load_agents_config(args.agents)
+    plans = load_plan(args.plan)
+    spec = FastExprSpec.load(args.fastexpr)
+    gen_config = load_generator_config(args.generator_config)
+    datafields = None
+    if args.datafields:
+        try:
+            datafields = load_datafields(args.datafields)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise ConfigError(f"cannot read datafield catalog {args.datafields}: {exc}") from exc
+    budget = Budget(max_simulations=args.max_simulations, per_round=args.per_round,
+                    max_llm_calls=args.max_llm_calls)
+    if min(budget.max_simulations, budget.per_round, budget.max_llm_calls) < 1:
+        raise ConfigError("--max-simulations, --per-round and --max-llm-calls must be >= 1")
+    llm = _llm_client(args)
+    brain_config = load_brain_config(args.brain_config)
+    client = RealBrainClient(make_session(brain_config), brain_config, capture_dir=args.capture_dir)
+    memory = MemoryStore(args.data_dir)
+    try:
+        run = ResearchRun(plans, agents, budget, llm=llm, client=client, config=config,
+                          playbook=playbook, spec=spec, generator_config=gen_config,
+                          memory=memory, datafields=datafields, seed=args.seed, out=sys.stdout)
+        report = run.run(args.rounds)
+        path = write_report(report, args.report or Path(args.data_dir) / f"{report['run_id']}.json")
+    finally:
+        memory.close()
+    print(f"stopped: {report['stop_reason']} | simulations {report['simulations_used']} | "
+          f"model calls {report['model_calls']} | pool {report['pool_size']} | report {path}")
+    for arm, s in report["arms"].items():
+        print(f"  {arm}: accepted {s['accepted']}, not accepted {s['not_accepted']}, "
+              f"pass rate {s['posterior_pass_rate']}, repairs queued {s['repairs_queued']}")
+    return EXIT_OK
+
+
+def _prompts(args) -> int:
+    """Print an agent's system prompt as the model will see it, thresholds included."""
+    config = load_config(args.config)
+    context = agent_prompts.brain_context(config)
+    builders = {"prefilter": agent_prompts.prefilter_system, "critic": agent_prompts.critic_system,
+                "judge": agent_prompts.judge_system, "repair": agent_prompts.repair_system,
+                "strategy": agent_prompts.strategy_system}
+    for name in builders if args.agent == "all" else [args.agent]:
+        print(f"===== {name} ({agent_prompts.PROMPT_VERSIONS[name]})\n{builders[name](context)}\n")
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="alpha_research")
     sub = p.add_subparsers(dest="command", required=True)
@@ -184,6 +342,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--data-dir", default=str(default_data_dir()))
     run.add_argument("--client", choices=["fixture", "real"], default="fixture")
     run.add_argument("--fixtures-dir", default="tests/fixtures/brain_results")
+    run.add_argument("--brain-config", default="config/brain.yaml")
+    run.add_argument("--capture-dir", default=None,
+                     help="with --client real: save every raw BRAIN response here")
     run.set_defaults(func=_run)
 
     bandit = sub.add_parser("bandit", help="Phase 2 driver: allocation rounds over fixture arms")
@@ -220,6 +381,65 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--model", default=os.environ.get("ALPHA_RESEARCH_MODEL", DEFAULT_MODEL))
     gen.add_argument("--llm-script", help="JSON list of replies for --llm scripted (offline)")
     gen.set_defaults(func=_generate)
+
+    rs = sub.add_parser("research", help="closed research loop: Director, Generator, "
+                        "Pre-Filter, Critic, Debate, BRAIN, Repair, Strategy Evolution")
+    rs.add_argument("--plan", required=True, help="research plan YAML (arms, hypotheses, papers)")
+    rs.add_argument("--max-simulations", type=int, required=True,
+                    help="stop after this many candidates reached BRAIN")
+    rs.add_argument("--max-llm-calls", type=int, required=True,
+                    help="stop after this many model calls (all agents together)")
+    rs.add_argument("--per-round", type=int, default=10, help="simulation slots per round")
+    rs.add_argument("--rounds", type=int, default=5)
+    rs.add_argument("--seed", type=int, default=None)
+    rs.add_argument("--report", default=None, help="report JSON (default: <data-dir>/<run id>.json)")
+    rs.add_argument("--config", default="config/thresholds.yaml")
+    rs.add_argument("--playbook", default="config/repair_playbook.yaml")
+    rs.add_argument("--agents", default="config/agents.yaml")
+    rs.add_argument("--fastexpr", default="config/fastexpr.yaml")
+    rs.add_argument("--generator-config", default="config/generator.yaml")
+    rs.add_argument("--datafields", help="datafield catalog (see brain datafields)")
+    rs.add_argument("--data-dir", default=str(default_data_dir()))
+    rs.add_argument("--brain-config", default="config/brain.yaml")
+    rs.add_argument("--capture-dir", default=None)
+    rs.add_argument("--llm", choices=["real", "scripted"], default="real")
+    rs.add_argument("--model", default=os.environ.get("ALPHA_RESEARCH_MODEL", DEFAULT_MODEL))
+    rs.add_argument("--llm-script", help="JSON list of replies for --llm scripted (offline)")
+    rs.set_defaults(func=_research)
+
+    pr = sub.add_parser("prompts", help="print the agents' system prompts with this config's thresholds")
+    pr.add_argument("--agent", choices=["all", "prefilter", "critic", "judge", "repair", "strategy"],
+                    default="all")
+    pr.add_argument("--config", default="config/thresholds.yaml")
+    pr.set_defaults(func=_prompts)
+
+    brain = sub.add_parser("brain", help=f"BRAIN account tools (needs {EMAIL_ENV_VAR} and {SECRET_ENV_VAR})")
+    bsub = brain.add_subparsers(dest="brain_command", required=True)
+    b_auth = bsub.add_parser("auth", help="check that the BRAIN login works")
+    b_auth.set_defaults(func=_brain_auth)
+    b_opt = bsub.add_parser("options", help="list the simulation settings BRAIN allows")
+    b_opt.add_argument("--out", default="captures/simulation_options.json")
+    b_opt.set_defaults(func=_brain_options)
+    b_cap = bsub.add_parser("capture", help="simulate candidates and save the raw responses (OQ-2)")
+    b_cap.add_argument("--candidates", required=True)
+    b_cap.add_argument("--limit", type=int, default=1, help="candidates to simulate (default 1)")
+    b_cap.add_argument("--out-dir", default="captures")
+    b_cap.add_argument("--max-wait", type=float, default=900.0, help="seconds per simulation")
+    b_cap.set_defaults(func=_brain_capture)
+    b_ops = bsub.add_parser("operators", help="download BRAIN's operator list and diff it "
+                            "against the seed list (OQ-10)")
+    b_ops.add_argument("--out", default="captures/operators.json")
+    b_ops.add_argument("--fastexpr", default="config/fastexpr.yaml")
+    b_ops.set_defaults(func=_brain_operators)
+    b_df = bsub.add_parser("datafields", help="download a datafield catalog for generate --datafields")
+    b_df.add_argument("--region", required=True)
+    b_df.add_argument("--universe", required=True)
+    b_df.add_argument("--delay", type=int, required=True)
+    b_df.add_argument("--dataset", help="limit to one dataset id")
+    b_df.add_argument("--out", required=True)
+    b_df.set_defaults(func=_brain_datafields)
+    for sp in (b_auth, b_opt, b_cap, b_ops, b_df):
+        sp.add_argument("--brain-config", default="config/brain.yaml")
     return p
 
 
@@ -233,17 +453,17 @@ def main(argv: list[str] | None = None) -> int:
     except SchemaError as exc:
         print(f"schema error: {exc}", file=sys.stderr)
         return EXIT_SCHEMA
-    except NotImplementedError as exc:
-        print(f"client error: {exc}", file=sys.stderr)
-        return EXIT_CLIENT
     except FixtureNotFoundError as exc:
         print(f"client error: {exc}. Fixture runs can only simulate candidates that have a "
-              "recorded BRAIN result; generated candidates need the real client (OQ-2).",
+              "recorded BRAIN result; generated candidates need the real client (--client real).",
               file=sys.stderr)
         return EXIT_CLIENT
     except (LLMUnavailable, GenerationError) as exc:
         print(f"model error: {exc}", file=sys.stderr)
         return EXIT_LLM
+    except (BrainApiError, ConnectionError, TimeoutError) as exc:
+        print(f"BRAIN error: {exc}", file=sys.stderr)
+        return EXIT_BRAIN
 
 
 if __name__ == "__main__":

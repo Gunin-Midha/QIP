@@ -415,3 +415,16 @@ def test_load_datafields_formats(tmp_path):
     (tmp_path / "e.json").write_text(json.dumps([1, 2]))
     with pytest.raises(ValueError):
         load_datafields(tmp_path / "e.json")
+
+
+# ------------------------------------------------------------------ strategy guidance
+
+def test_guidance_is_shown_in_the_system_prompt(spec, settings, cfg):
+    llm = ScriptedLLMClient([alphas(E1)])
+    make(llm, spec, settings, cfg, guidance="- prefer longer windows").generate(
+        Source("hypothesis", HYP), 1, batch_id="g1")
+    system = llm.calls[0]["system"]
+    assert "Lessons from earlier research rounds" in system and "- prefer longer windows" in system
+    llm = ScriptedLLMClient([alphas(E1)])
+    make(llm, spec, settings, cfg).generate(Source("hypothesis", HYP), 1, batch_id="g2")
+    assert "Lessons from earlier" not in llm.calls[0]["system"]

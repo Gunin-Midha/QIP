@@ -264,6 +264,26 @@ class MemoryStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def candidate_outcomes(self) -> list[dict]:
+        """Every candidate with its latest decision and latest result, oldest first. Used
+        by the Research Director (warm start) and Strategy Evolution. Read-only."""
+        rows = self.conn.execute(
+            "SELECT c.candidate_id, c.payload_json AS cand, "
+            "(SELECT payload_json FROM decisions d WHERE d.candidate_id = c.candidate_id "
+            " ORDER BY d.id DESC LIMIT 1) AS dec, "
+            "(SELECT payload_json FROM results r WHERE r.candidate_id = c.candidate_id "
+            " ORDER BY r.id DESC LIMIT 1) AS res "
+            "FROM candidates c ORDER BY c.rowid"
+        ).fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "candidate": CandidateRecord.from_dict(json.loads(r["cand"])),
+                "decision": DecisionRecord.from_dict(json.loads(r["dec"])) if r["dec"] else None,
+                "result": ResultRecord.from_dict(json.loads(r["res"])) if r["res"] else None,
+            })
+        return out
+
     def lineage_levers(self, candidate_id: str) -> list[str]:
         """Lever names applied along the parent chain, oldest first, including this one."""
         levers: list[str] = []

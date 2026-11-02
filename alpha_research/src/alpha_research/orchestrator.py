@@ -56,6 +56,15 @@ class Orchestrator:
             slots[self.arms[int(np.argmax(samples))]] += 1
         return {a: slots[a] for a in self.arms}
 
+    def add_arm(self, arm: Hashable) -> bool:
+        """Add a new arm with a fresh Beta(1, 1) prior (Strategy Evolution adds one per new
+        prompt version). Returns False if the arm already exists."""
+        if arm in self.state:
+            return False
+        self.arms.append(arm)
+        self.state[arm] = ArmState()
+        return True
+
     def update(self, arm: Hashable, passed: bool) -> None:
         if arm not in self.state:
             raise KeyError(f"unknown arm {arm!r}")

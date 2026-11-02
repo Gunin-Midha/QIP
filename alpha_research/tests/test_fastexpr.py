@@ -231,3 +231,33 @@ def test_spec_round_trips_through_yaml_text():
     raw = yaml.safe_load(SPEC_FILE.read_text())
     again = FastExprSpec.from_dict(yaml.safe_load(yaml.safe_dump(raw)))
     assert set(again.operators) == set(FastExprSpec.from_dict(raw).operators)
+
+
+# ------------------------------------------------------------------ render
+
+@pytest.mark.parametrize("expr, text", [
+    ("rank(-ts_delta(close,5))", "rank(-ts_delta(close, 5))"),
+    ("a=close/open;rank(a-(b-c))*-1", "a = close / open; rank(a - (b - c)) * -1"),
+    ("(a+b)*c", "(a + b) * c"),
+    ("a-b-c", "a - b - c"),
+    ("a/(b*c)", "a / (b * c)"),
+    ("-(a+b)", "-(a + b)"),
+    ("x||y&&z", "x || y && z"),
+    ("(x||y)&&z", "(x || y) && z"),
+    ("(a<b)+1", "(a < b) + 1"),
+    ('ts_backfill(x,20,k=1,ignore="NAN")', 'ts_backfill(x, 20, k=1, ignore="NAN")'),
+])
+def test_render_round_trips(expr, text):
+    from alpha_research.fastexpr import parse, render
+    assert render(parse(expr)) == text
+    assert parse(text) == parse(expr)
+
+
+def test_render_round_trips_every_hand_written_expression():
+    from alpha_research.fastexpr import parse, render
+    for c in json.loads(CANDIDATES_FILE.read_text()):
+        try:
+            tree = parse(c["expression"])
+        except FastExprError:
+            continue
+        assert parse(render(tree)) == tree

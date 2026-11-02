@@ -51,3 +51,11 @@ def test_run_rounds_floor_every_round():
     assert len(hist) == 10
     assert all(h["floor_held"] and h["total"] == 25 for h in hist)
     assert hist[-1]["allocation"][ARMS[0]] >= hist[-1]["allocation"][ARMS[3]]
+
+
+def test_add_arm_starts_from_the_prior():
+    o = Orchestrator(["a"], seed=0)
+    o.update("a", True)
+    assert o.add_arm("b") is True and o.add_arm("b") is False
+    assert o.arms == ["a", "b"] and o.pass_rate("b") == 0.5
+    assert sum(o.allocate(10).values()) == 10

@@ -1,0 +1,31 @@
+# Settings for the agents that run around the Generator in `cli research` (research.py).
+# None of these changes an accept or reject decision: the gates, risk and diversity checks
+# in config/thresholds.yaml still decide that. These only decide which candidates are worth
+# a BRAIN simulation and how the model is used.
+#
+# Values marked OQ-13 are builder defaults chosen so the loop works out of the box. The
+# owner should review them.
+
+prefilter:
+  near_duplicate_similarity: 0.9   # OQ-13: term-set Jaccard vs memory; null = check off
+  use_model: false                 # true = one model call per batch scores candidates 0-10
+  min_model_score: null            # null = scores only recorded; a number drops lower scores
+
+critic:
+  use_model: true                  # false = rule checks only
+
+debate:
+  use_model: true                  # false = the critic's verdict stands
+
+repair:
+  use_model: true                  # for levers with no mechanical rewrite (orthogonalize, ...)
+
+strategy:
+  every_rounds: 2                  # OQ-13: evolve after every 2nd round; 0 = never
+  max_hypotheses: 3                # new hypotheses proposed per evolution
+  max_guidance_chars: 1500
+
+director:
+  floor_share: 0.2                 # spec 13.1 default: share of each round reserved as floor slots
+
+max_output: 4096                   # output cap for one model call

@@ -17,7 +17,7 @@ from datetime import date
 from typing import Callable
 
 from . import metric_validator
-from .brain_client import BrainClient
+from .brain_client import BrainClient, SubmissionRejected
 from .config import Config
 from .memory import MemoryStore
 from .schemas import (
@@ -33,9 +33,8 @@ log = logging.getLogger(__name__)
 TRANSIENT_ERRORS = (TimeoutError, ConnectionError)
 BACKOFF_BASE_SECONDS = 1.0
 
-# raw key -> ResultRecord field, and whether the raw value is a percent.
-# TODO(open-question) OQ-2: raw key names follow our fixture format; map to BRAIN's real
-# names once a response sample exists.
+# raw key -> ResultRecord field, and whether the raw value is a percent. These are our raw
+# keys (see brain_client.py); brain_api.translate maps BRAIN's responses onto them.
 _AGGREGATE_MAP = {
     "sharpe": ("sharpe", False),
     "fitness": ("fitness", False),
@@ -143,22 +142,27 @@ def _to_int(value, key: str) -> int | None:
 
 
 def normalize(raw: dict, candidate_id: str, brain_sim_id: str | None) -> ResultRecord:
-    """Map a raw response to a ResultRecord. Percents become fractions. Missing keys
-    become None, never zero. Keys outside section 3.2 are ignored."""
+    """Map a raw response to a ResultRecord. Percents become fractions (unless the raw
+    dict says ``units: "fraction"``). Missing keys become None, never zero. Keys outside
+    section 3.2 are ignored, apart from ``notes``, which is copied onto the result."""
     status = raw.get("status")
     if status not in ("complete", "failed"):
         raise SchemaError(f"cannot normalize a response with status {status!r}")
+    units = raw.get("units", "percent")
+    if units not in ("percent", "fraction"):
+        raise SchemaError(f"raw 'units' must be 'percent' or 'fraction', got {units!r}")
+    convert = _pct if units == "percent" else (lambda v: v)
     values = {}
     for key, (name, is_pct) in _AGGREGATE_MAP.items():
         v = _to_float(raw.get(key), key)
-        values[name] = _pct(v) if is_pct else v
+        values[name] = convert(v) if is_pct else v
 
     yearly = []
     for row in raw.get("yearly") or []:
         y = {"year": _to_int(row.get("year"), "yearly.year")}
         for key, (name, is_pct) in _YEARLY_MAP.items():
             v = _to_float(row.get(key), f"yearly.{key}")
-            y[name] = _pct(v) if is_pct else v
+            y[name] = convert(v) if is_pct else v
         y["long_count"] = _to_int(row.get("long_count"), "yearly.long_count")
         y["short_count"] = _to_int(row.get("short_count"), "yearly.short_count")
         yearly.append(YearRow(**y))
@@ -176,6 +180,7 @@ def normalize(raw: dict, candidate_id: str, brain_sim_id: str | None) -> ResultR
         yearly=yearly,
         daily_pnl=series_from_dict(raw.get("daily_pnl")),
         checks={str(k): bool(v) for k, v in checks.items()},
+        notes=[str(n) for n in raw.get("notes") or []],
         **values,
     )
     result.validate()
@@ -214,6 +219,9 @@ class Simulator:
                 sim_id = self._with_retry(lambda: self.client.submit(candidate))
             except TRANSIENT_ERRORS as exc:
                 return self._persist(self._failure(candidate.candidate_id, None, exc, "submit"))
+            except SubmissionRejected as exc:
+                return self._persist(ResultRecord(candidate_id=candidate.candidate_id,
+                                                  status="failed", notes=[f"submit_rejected: {exc}"]))
             self.memory.put_pending(candidate.candidate_id, sim_id)
 
         result = self._poll_until_done(candidate.candidate_id, sim_id)

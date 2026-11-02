@@ -1,4 +1,7 @@
-# Levers are descriptions only in Phase 1. They are not applied to expressions yet.
+# Levers per failure class, tried in order (one per repair). repair_agent.py applies them:
+# increase_decay, tighten_truncation, lengthen_ts_window, wrap_in_smoothing, hump,
+# rank_transform and volatility_scale are mechanical rewrites; any other lever is handed
+# to the model and its answer must pass the Fast Expression validator.
 turnover:
   - lever: increase_decay
     step: {from: 3, to: 8}
