@@ -20,6 +20,12 @@ and never needs a network.
   Each host's key is read from its own environment variable (HOSTS) and sent only in the
   ``Authorization`` header.
 
+Rate limits: when Gemini or a hosted endpoint answers HTTP 429 and says how long to wait
+("try again in 7.95s", or Gemini's ``retryDelay``), the client waits that long and retries,
+up to RATE_LIMIT_RETRIES times, as long as the wait is at most RATE_LIMIT_MAX_WAIT_SECONDS.
+A longer wait (a daily quota) or a 429 without a wait fails as before. The retries happen
+inside one ``complete`` call, so the research budget counts them as one model call.
+
 The provider is inferred from the model id (``provider_of``): ``claude-*`` is Anthropic,
 ``gemini-*`` is Google, and a hosted id belongs to its maker (``groq:qwen/...`` is
 ``qwen``), not to the host, because the critic rule is about who made the model. Agents
@@ -29,19 +35,25 @@ compare providers by this name, never by client class.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Callable, Protocol, Sequence
 
 
+log = logging.getLogger(__name__)
+
 KEY_ENV_VAR = "ANTHROPIC_API_KEY"
 GEMINI_KEY_ENV_VAR = "GEMINI_API_KEY"
 GEMINI_ROOT = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_TIMEOUT_SECONDS = 300.0   # thinking models can take minutes on a long prompt
 HOSTED_TIMEOUT_SECONDS = 300.0
+RATE_LIMIT_MAX_WAIT_SECONDS = 60.0   # a longer requested wait is a daily quota: give up
+RATE_LIMIT_RETRIES = 3
 # host -> (chat-completions URL, key environment variable). The default host serves
 # plain "<maker>/<model>" ids; other hosts are named as a "<host>:" prefix on the id.
 HOSTS = {
@@ -152,11 +164,61 @@ def _urllib_transport(url: str, body: bytes, headers: dict, timeout: float) -> t
         return exc.code, exc.read()
 
 
+_WAIT_RE = re.compile(
+    r"(?:try again|retry) in\s+((?:\d+h)?(?:\d+m(?!s))?(?:\d+(?:\.\d+)?(?:ms|s))?)", re.I)
+_WAIT_PART_RE = re.compile(r"(\d+(?:\.\d+)?)(h|ms|m|s)")
+_WAIT_UNITS = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}
+
+
+def rate_limit_wait(data, raw: bytes) -> float | None:
+    """Seconds a 429 reply asks us to wait, or None when it does not say. Reads Gemini's
+    ``RetryInfo.retryDelay`` ("43s") and messages such as "Please try again in 1m2.5s"."""
+    texts = []
+    error = data.get("error") if isinstance(data, dict) else None
+    if isinstance(error, dict):
+        for d in error.get("details") or []:
+            if isinstance(d, dict) and isinstance(d.get("retryDelay"), str):
+                texts.append(f"retry in {d['retryDelay']}")
+        if isinstance(error.get("message"), str):
+            texts.append(error["message"])
+    elif raw:
+        texts.append(raw[:500].decode("utf-8", "replace"))
+    for t in texts:
+        m = _WAIT_RE.search(t)
+        if m and m.group(1):
+            return sum(float(n) * _WAIT_UNITS[u] for n, u in _WAIT_PART_RE.findall(m.group(1)))
+    return None
+
+
+def _post_json(transport: Transport, sleep: Callable[[float], None], url: str, body: bytes,
+               headers: dict, timeout: float, model: str) -> tuple[int, bytes, object]:
+    """POST with waits on short rate limits. Returns (status, raw body, parsed JSON or {})."""
+    for attempt in range(RATE_LIMIT_RETRIES + 1):
+        try:
+            status, raw = transport(url, body, headers, timeout)
+        except (OSError, TimeoutError) as exc:  # network failure -> clean exit
+            raise LLMUnavailable(f"model call failed: {type(exc).__name__}: {exc}") from exc
+        try:
+            data = json.loads(raw) if raw else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            data = {}
+        if status == 429 and attempt < RATE_LIMIT_RETRIES:
+            wait = rate_limit_wait(data, raw)
+            if wait is not None and wait <= RATE_LIMIT_MAX_WAIT_SECONDS:
+                log.warning("%s is rate-limited; waiting %.0fs before retry %d of %d",
+                            model, wait + 1, attempt + 1, RATE_LIMIT_RETRIES)
+                sleep(wait + 1)  # one second of margin over what the host asked for
+                continue
+        return status, raw, data
+    raise AssertionError("unreachable")
+
+
 class GeminiLLMClient:
     provider = "google"
 
     def __init__(self, model: str, api_key: str | None = None, *,
-                 transport: Transport | None = None, timeout: float = GEMINI_TIMEOUT_SECONDS):
+                 transport: Transport | None = None, timeout: float = GEMINI_TIMEOUT_SECONDS,
+                 sleep: Callable[[float], None] = time.sleep):
         key = api_key or os.environ.get(GEMINI_KEY_ENV_VAR)
         if not key:
             raise LLMUnavailable(
@@ -165,6 +227,7 @@ class GeminiLLMClient:
         self._key = key
         self._transport = transport or _urllib_transport
         self._timeout = timeout
+        self._sleep = sleep
 
     def complete(self, system: str, user: str, *, max_output: int = 4096) -> str:
         url = f"{GEMINI_ROOT}/models/{urllib.parse.quote(self.model)}:generateContent"
@@ -174,14 +237,8 @@ class GeminiLLMClient:
             "generationConfig": {"maxOutputTokens": max_output},
         }).encode()
         headers = {"Content-Type": "application/json", "x-goog-api-key": self._key}
-        try:
-            status, raw = self._transport(url, body, headers, self._timeout)
-        except (OSError, TimeoutError) as exc:  # network failure -> clean exit
-            raise LLMUnavailable(f"model call failed: {type(exc).__name__}: {exc}") from exc
-        try:
-            data = json.loads(raw) if raw else {}
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            data = {}
+        status, raw, data = _post_json(self._transport, self._sleep, url, body, headers,
+                                       self._timeout, self.model)
         if status != 200:
             msg = (data.get("error") or {}).get("message") if isinstance(data, dict) else None
             raise LLMUnavailable(f"model call failed: HTTP {status}: {msg or 'no message'}")
@@ -206,7 +263,8 @@ class ChatCompletionsLLMClient:
     ``host`` who serves it."""
 
     def __init__(self, model: str, api_key: str | None = None, *,
-                 transport: Transport | None = None, timeout: float = HOSTED_TIMEOUT_SECONDS):
+                 transport: Transport | None = None, timeout: float = HOSTED_TIMEOUT_SECONDS,
+                 sleep: Callable[[float], None] = time.sleep):
         hosted = split_hosted(model)
         if hosted is None:
             raise LLMUnavailable(f"not a hosted model id: {model!r} (expected maker/model)")
@@ -220,6 +278,7 @@ class ChatCompletionsLLMClient:
         self._key = key
         self._transport = transport or _urllib_transport
         self._timeout = timeout
+        self._sleep = sleep
 
     def complete(self, system: str, user: str, *, max_output: int = 4096) -> str:
         body = json.dumps({
@@ -230,14 +289,8 @@ class ChatCompletionsLLMClient:
         }).encode()
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self._key}",
                    "User-Agent": USER_AGENT, "X-Title": "QIP alpha research"}
-        try:
-            status, raw = self._transport(self._url, body, headers, self._timeout)
-        except (OSError, TimeoutError) as exc:  # network failure -> clean exit
-            raise LLMUnavailable(f"model call failed: {type(exc).__name__}: {exc}") from exc
-        try:
-            data = json.loads(raw) if raw else {}
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            data = {}
+        status, raw, data = _post_json(self._transport, self._sleep, self._url, body, headers,
+                                       self._timeout, self.model)
         error = data.get("error") if isinstance(data, dict) else None
         if status != 200 or error:  # a host can report an upstream error with HTTP 200
             msg = error.get("message") if isinstance(error, dict) else None

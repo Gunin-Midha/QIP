@@ -130,8 +130,10 @@ PYTHONPATH=src python3 -m alpha_research.cli research \
 ```
 
 Keep the budgets this small at first. The free tiers allow only a few calls per minute,
-so the run may stop early with `HTTP 429: Rate limit reached`. That is expected for now:
-the report is still written, and the next run picks up where this one left off.
+so the run may stop early with `HTTP 429: Rate limit reached`. Short limits are waited
+out automatically (you will see "rate-limited; waiting 9s"); a daily quota still stops the
+run. The report is still written, and the next run learns from every result so far and
+skips formulas already tried. Repairs queued in a stopped run are not carried over.
 
 Results are stored on your laptop in `data/` (a database plus a report JSON per run).
 They are not shared with the team and must never be committed.
@@ -148,7 +150,7 @@ hypotheses, and pass your copy to `--plan`.
 | `zsh: not an identifier` | You typed your password in place of the variable name | Type `read -s BRAIN_PASSWORD` exactly, then paste the password after pressing Enter |
 | Exit code 7, BRAIN login error | Wrong BRAIN email or password, or the variables are not set in this terminal | Redo step 5 in this terminal |
 | `GEMINI_API_KEY is not set` (or `GROQ_...`) | The key is not set in this terminal | Redo step 5 |
-| `HTTP 429: Rate limit reached` | A free tier's per-minute or daily limit | Wait a minute, or use a smaller `--max-llm-calls` |
+| `HTTP 429: Rate limit reached` (run stopped) | A free tier's daily limit, or a per-minute limit that kept recurring | Try again later or tomorrow, or use a smaller `--max-llm-calls` |
 | `HTTP 403: error code: 1010` | Cloudflare blocked the request | Pull the latest code (`git pull`); this is fixed |
 | `HTTP 404` or "model not found" | The model id changed at Google or Groq | Check the model lists (step 4) and tell Gunin |
 | Exit code 2, holdout or config error | A config file was changed | `git status` and undo local changes to `config/` |

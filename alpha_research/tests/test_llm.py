@@ -6,7 +6,7 @@ import pytest
 
 from alpha_research.llm import (AnthropicLLMClient, GeminiLLMClient, LLMUnavailable,
                                 ChatCompletionsLLMClient, ScriptedLLMClient, make_real_client,
-                                provider_of)
+                                provider_of, rate_limit_wait)
 
 
 def test_scripted_client_replays_in_order_and_records_calls():
@@ -236,3 +236,77 @@ def test_hosted_errors_are_unavailable(monkeypatch, reply, match):
     transport, _ = fake_transport(reply)
     with pytest.raises(LLMUnavailable, match=match):
         ChatCompletionsLLMClient("groq:qwen/qwen3.8-27b", transport=transport).complete("s", "u")
+
+
+# ---------------------------------------------------------------- rate limits: wait and retry
+
+
+GROQ_429 = (429, json.dumps({"error": {"message": "Rate limit reached for model `qwen/qwen3.8-27b` "
+                                       "on tokens per minute. Please try again in 7.954s."}}).encode())
+GEMINI_429 = (429, json.dumps({"error": {"code": 429, "message": "Quota exceeded.", "details": [
+    {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "43s"}]}}).encode())
+
+
+def sequence_transport(*replies):
+    calls = []
+
+    def transport(url, body, headers, timeout):
+        calls.append(url)
+        return replies[min(len(calls), len(replies)) - 1]
+    return transport, calls
+
+
+@pytest.mark.parametrize("message, wait", [
+    ("Please try again in 7.954s.", 7.954), ("try again in 450ms", 0.45),
+    ("Please try again in 1m30.5s", 90.5), ("Please retry in 2h", 7200.0),
+    ("Rate limit reached", None),
+])
+def test_rate_limit_wait_parses_the_hosts_hint(message, wait):
+    got = rate_limit_wait({"error": {"message": message}}, b"")
+    assert got == (pytest.approx(wait) if wait is not None else None)
+
+
+def test_rate_limit_wait_reads_gemini_retry_delay_and_plain_text():
+    assert rate_limit_wait(json.loads(GEMINI_429[1]), GEMINI_429[1]) == 43.0
+    assert rate_limit_wait({}, b"slow down, try again in 3s") == 3.0
+
+
+def test_hosted_waits_and_retries_on_a_short_rate_limit(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "dummy")
+    transport, calls = sequence_transport(GROQ_429, GROQ_429, hosted_reply("ok"))
+    slept = []
+    llm = ChatCompletionsLLMClient("groq:qwen/qwen3.8-27b", transport=transport, sleep=slept.append)
+    assert llm.complete("s", "u") == "ok"
+    assert len(calls) == 3 and slept == [pytest.approx(8.954), pytest.approx(8.954)]
+
+
+def test_gemini_waits_and_retries_on_a_short_rate_limit(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "dummy")
+    transport, calls = sequence_transport(GEMINI_429, gemini_reply([{"text": "ok"}]))
+    slept = []
+    llm = GeminiLLMClient("gemini-x", transport=transport, sleep=slept.append)
+    assert llm.complete("s", "u") == "ok" and slept == [44.0] and len(calls) == 2
+
+
+@pytest.mark.parametrize("reply", [
+    (429, json.dumps({"error": {"message": "Daily quota used. Please try again in 5h3m"}}).encode()),
+    (429, json.dumps({"error": {"message": "Rate limit reached"}}).encode()),
+])
+def test_long_or_unknown_waits_fail_without_sleeping(monkeypatch, reply):
+    monkeypatch.setenv("GROQ_API_KEY", "dummy")
+    transport, calls = sequence_transport(reply)
+    slept = []
+    llm = ChatCompletionsLLMClient("groq:qwen/qwen3.8-27b", transport=transport, sleep=slept.append)
+    with pytest.raises(LLMUnavailable, match="HTTP 429"):
+        llm.complete("s", "u")
+    assert slept == [] and len(calls) == 1
+
+
+def test_rate_limit_retries_run_out(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "dummy")
+    transport, calls = sequence_transport(GROQ_429)
+    slept = []
+    llm = ChatCompletionsLLMClient("groq:qwen/qwen3.8-27b", transport=transport, sleep=slept.append)
+    with pytest.raises(LLMUnavailable, match="try again in 7.954s"):
+        llm.complete("s", "u")
+    assert len(calls) == 4 and len(slept) == 3   # RATE_LIMIT_RETRIES = 3
