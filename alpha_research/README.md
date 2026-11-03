@@ -37,6 +37,8 @@ on 2026-11-03 (OQ-2, see "Real BRAIN client" below).
 
 ## Setup
 
+Setting this up on a new laptop? Follow `../SETUP.md` (step by step, free keys only).
+
 Python 3.11 or newer. Dependencies: pandas, numpy, scipy, pyyaml, pytest.
 
 ```bash
