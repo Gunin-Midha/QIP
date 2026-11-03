@@ -1,8 +1,8 @@
 """Append-only SQLite memory store (spec section 11.1).
 
 Rules:
-* candidates, results, decisions and variants are append-only. This class exposes no
-  method that updates or deletes those rows.
+* candidates, results, decisions, variants and critic_reviews are append-only. This class
+  exposes no method that updates or deletes those rows.
 * ``os_is`` may be upserted (explicitly allowed by the spec) via ``record_os_is``.
 * Every write runs inside a transaction.
 
@@ -65,6 +65,19 @@ CREATE TABLE IF NOT EXISTS pending_submissions (
     brain_sim_id TEXT NOT NULL,
     submitted_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS critic_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT,
+    candidate_id TEXT NOT NULL,
+    critic_model TEXT,
+    role TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    source TEXT NOT NULL,
+    generator_model TEXT,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_critic_reviews_candidate ON critic_reviews(candidate_id);
 CREATE INDEX IF NOT EXISTS ix_candidates_hash ON candidates(expression_hash);
 CREATE INDEX IF NOT EXISTS ix_candidates_family ON candidates(family);
 CREATE INDEX IF NOT EXISTS ix_results_candidate ON results(candidate_id);
@@ -163,6 +176,23 @@ class MemoryStore:
             cur = self.conn.execute(
                 "INSERT INTO variants (family, candidate_id, created_at) VALUES (?, ?, ?)",
                 (family, candidate_id, _now()),
+            )
+        return cur.lastrowid
+
+    def put_critic_review(self, *, run_id: str | None, candidate_id: str,
+                          critic_model: str | None, role: str, verdict: str, source: str,
+                          generator_model: str | None, payload: dict | None = None) -> int:
+        """One critic verdict. ``role`` is "primary" (it decided) or "shadow" (recorded only,
+        for comparing critic models). ``critic_model`` is None for a rules-only critic."""
+        if role not in ("primary", "shadow"):
+            raise ValueError(f"critic review role must be primary or shadow, got {role!r}")
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO critic_reviews (run_id, candidate_id, critic_model, role, verdict, "
+                "source, generator_model, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (run_id, candidate_id, critic_model, role, verdict, source, generator_model,
+                 json.dumps(payload or {}), _now()),
             )
         return cur.lastrowid
 
@@ -283,6 +313,14 @@ class MemoryStore:
                 "result": ResultRecord.from_dict(json.loads(r["res"])) if r["res"] else None,
             })
         return out
+
+    def critic_reviews(self) -> list[dict]:
+        """Every critic verdict, oldest first. Read-only."""
+        rows = self.conn.execute(
+            "SELECT run_id, candidate_id, critic_model, role, verdict, source, generator_model, "
+            "payload_json FROM critic_reviews ORDER BY id").fetchall()
+        return [{**{k: r[k] for k in r.keys() if k != "payload_json"},
+                 "payload": json.loads(r["payload_json"])} for r in rows]
 
     def lineage_levers(self, candidate_id: str) -> list[str]:
         """Lever names applied along the parent chain, oldest first, including this one."""

@@ -2,7 +2,8 @@
 
 One round:
 
-    Research Director (Thompson sampling over arms = dataset x region x prompt_version)
+    Research Director (Thompson sampling over arms =
+                       dataset x region x prompt_version x generator model)
         | slots per arm, capped by the simulation budget
         v
     queued repairs for the arm  +  Alpha Generator (next hypothesis or paper of the arm)
@@ -10,6 +11,7 @@ One round:
     Cheap Pre-Filter            drops invalid, already-simulated and near-duplicate ideas
         v
     Critic -> Debate judge      drops flawed tests, or swaps in a revised expression
+      (+ shadow critics)        the other critic models review the same batch; recorded only
         v
     Pipeline (BRAIN simulation, gates, risk, diversity, pool, memory)
         |-- accept / reject / repair  -> Director.update(arm, accepted)
@@ -17,6 +19,15 @@ One round:
         v
     every N rounds: Strategy Evolution -> guidance + hypotheses as a new prompt version,
                     added as new arms so the Director measures whether it helps
+
+Models (``models`` in config/agents.yaml): each agent has its own model, and the provider
+comes from the model id (``llm.provider_of``). Every generator model is a separate arm, so
+the Director compares them on accept rate. The primary critic for an arm is the first
+listed critic from a different provider than the arm's generator, so the two do not share
+blind spots; a config with no such critic is an error. With ``shadow_critics`` the other
+critic models review the same batch and their verdicts are stored in memory
+(``critic_reviews``) next to the primary's, for ``compare.py``. Shadows never change what
+is simulated.
 
 Budgets stop the run cleanly: ``max_simulations`` (candidates that reached BRAIN; invalid
 and duplicate ones do not count) and ``max_llm_calls`` (every model call by every agent).
@@ -39,11 +50,12 @@ import yaml
 
 from .brain_client import BrainClient
 from .config import Config, ConfigError
-from .critic import Critic, DebateJudge, review_and_debate
+from .critic import Critic, DebateJudge, ReviewOutcome, review_and_debate
+from .compare import arm_models, model_comparison
 from .fastexpr import FastExprSpec
 from .generator import (AlphaGenerator, GenerationError, GenerationSettings, GeneratorConfig,
                         Source)
-from .llm import LLMClient, LLMUnavailable
+from .llm import LLMClient, LLMUnavailable, provider_of
 from .memory import MemoryStore
 from .orchestrator import Orchestrator
 from .pipeline import Pipeline
@@ -61,25 +73,75 @@ class LLMBudgetExhausted(LLMUnavailable):
     pass
 
 
-class BudgetedLLM:
-    """Counts every model call across all agents and stops at ``max_calls``."""
+class CallCounter:
+    """One model-call budget shared by every agent and every model."""
 
-    def __init__(self, inner: LLMClient, max_calls: int | None):
-        self.inner = inner
-        self.model = getattr(inner, "model", "unknown")
+    def __init__(self, max_calls: int | None):
         self.max_calls = max_calls
         self.calls = 0
+        self.by_model: dict[str, int] = {}
+
+
+class BudgetedLLM:
+    """Counts every model call across all agents and stops at ``max_calls``. ``model``
+    labels the calls (and the candidates the client writes); it defaults to the inner
+    client's model."""
+
+    def __init__(self, inner: LLMClient, max_calls: int | None = None, *,
+                 counter: CallCounter | None = None, model: str | None = None):
+        self.inner = inner
+        self.counter = counter or CallCounter(max_calls)
+        self.model = model or getattr(inner, "model", "unknown")
+        self.provider = provider_of(self.model)
+
+    @property
+    def calls(self) -> int:
+        return self.counter.calls
 
     def complete(self, system: str, user: str, *, max_output: int = 4096) -> str:
-        if self.max_calls is not None and self.calls >= self.max_calls:
-            raise LLMBudgetExhausted(f"model call budget of {self.max_calls} used up")
-        self.calls += 1
+        c = self.counter
+        if c.max_calls is not None and c.calls >= c.max_calls:
+            raise LLMBudgetExhausted(f"model call budget of {c.max_calls} used up")
+        c.calls += 1
+        c.by_model[self.model] = c.by_model.get(self.model, 0) + 1
         return self.inner.complete(system, user, max_output=max_output)
 
 
 # ---------------------------------------------------------------------------
 # configuration
 # ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ModelsConfig:
+    """Model id per agent. ``generator`` and ``critic`` are lists: every generator model is
+    an arm, and critics are ordered by preference."""
+    default: str
+    generator: tuple[str, ...]
+    critic: tuple[str, ...]
+    shadow_critics: bool
+    prefilter: str
+    debate: str
+    repair: str
+    strategy: str
+
+    def all_models(self) -> list[str]:
+        return list(dict.fromkeys([*self.generator, *self.critic, self.prefilter, self.debate,
+                                   self.repair, self.strategy]))
+
+    def primary_critic(self, generator_model: str) -> str | None:
+        """First listed critic whose provider differs from the generator's."""
+        g = provider_of(generator_model)
+        return next((c for c in self.critic if provider_of(c) != g), None)
+
+    def with_default(self, model: str) -> "ModelsConfig":
+        """Replace the default model (``--model``); agents that named their own keep it."""
+        swap = lambda m: model if m == self.default else m
+        return dataclasses.replace(
+            self, default=model, generator=tuple(swap(m) for m in self.generator),
+            critic=tuple(dict.fromkeys(swap(m) for m in self.critic)),
+            prefilter=swap(self.prefilter), debate=swap(self.debate), repair=swap(self.repair),
+            strategy=swap(self.strategy))
+
 
 @dataclass(frozen=True)
 class AgentsConfig:
@@ -90,6 +152,32 @@ class AgentsConfig:
     strategy: StrategyConfig
     floor_share: float
     max_output: int
+    models: ModelsConfig
+
+    def used_models(self) -> list[str]:
+        """Model ids this config will call (agents with the model switched off left out)."""
+        m = self.models
+        used = list(m.generator)
+        used += [m.strategy] if self.strategy.every_rounds else []
+        used += list(m.critic) if self.critic_model else []
+        used += [m.prefilter] if self.prefilter.use_model else []
+        used += [m.debate] if self.debate_model else []
+        used += [m.repair] if self.repair_model else []
+        return list(dict.fromkeys(used))
+
+    def check_models(self) -> None:
+        """Every model id has a known provider; with the critic model on, every generator
+        model has a critic from another provider."""
+        for m in self.models.all_models():
+            if provider_of(m) is None:
+                raise ConfigError(f"agents config: unknown provider for model {m!r} "
+                                  "(expected claude-* or gemini-*)")
+        if self.critic_model:
+            for g in self.models.generator:
+                if self.models.primary_critic(g) is None:
+                    raise ConfigError(
+                        f"agents config: generator model {g!r} needs a critic from a different "
+                        f"provider ({provider_of(g)}); add one to models.critic")
 
 
 def _bool(sec: dict, name: str, key: str) -> bool:
@@ -113,6 +201,37 @@ def _pos_int(sec: dict, name: str, key: str, lo: int = 1) -> int:
     if isinstance(v, bool) or not isinstance(v, int) or v < lo:
         raise ConfigError(f"agents config: {name}.{key} must be an integer >= {lo}")
     return v
+
+
+def _model_list(sec: dict, key: str, default: str) -> tuple[str, ...]:
+    v = sec.get(key)
+    if v is None:
+        return (default,)
+    if isinstance(v, str):
+        v = [v]
+    if not isinstance(v, list) or not v or not all(isinstance(m, str) and m for m in v):
+        raise ConfigError(f"agents config: models.{key} must be a model id or a list of them")
+    return tuple(dict.fromkeys(v))
+
+
+def models_config_from_dict(sec) -> ModelsConfig:
+    if not isinstance(sec, dict):
+        raise ConfigError("agents config: missing section 'models'")
+    default = sec.get("default")
+    if not isinstance(default, str) or not default:
+        raise ConfigError("agents config: models.default must be a model id")
+    single = {}
+    for key in ("prefilter", "debate", "repair", "strategy"):
+        v = sec.get(key)
+        if v is not None and (not isinstance(v, str) or not v):
+            raise ConfigError(f"agents config: models.{key} must be null or a model id")
+        single[key] = v or default
+    shadows = sec.get("shadow_critics")
+    if not isinstance(shadows, bool):
+        raise ConfigError("agents config: models.shadow_critics must be true or false")
+    return ModelsConfig(default=default, generator=_model_list(sec, "generator", default),
+                        critic=_model_list(sec, "critic", default), shadow_critics=shadows,
+                        **single)
 
 
 def agents_config_from_dict(raw) -> AgentsConfig:
@@ -142,6 +261,7 @@ def agents_config_from_dict(raw) -> AgentsConfig:
             max_guidance_chars=_pos_int(st, "strategy", "max_guidance_chars")),
         floor_share=float(floor),
         max_output=_pos_int(raw, "agents", "max_output", lo=256),
+        models=models_config_from_dict(raw.get("models")),
     )
 
 
@@ -150,7 +270,9 @@ def load_agents_config(path: str | Path) -> AgentsConfig:
         raw = yaml.safe_load(Path(path).read_text())
     except (OSError, yaml.YAMLError) as exc:
         raise ConfigError(f"cannot read agents config {path}: {exc}") from exc
-    return agents_config_from_dict(raw)
+    agents = agents_config_from_dict(raw)
+    agents.check_models()
+    return agents
 
 
 @dataclass
@@ -213,7 +335,8 @@ class Budget:
 
 class ResearchRun:
     def __init__(self, plans: list[ArmPlan], agents: AgentsConfig, budget: Budget, *,
-                 llm: LLMClient, client: BrainClient, config: Config, playbook: Playbook,
+                 llm_factory: Callable[[str], LLMClient], client: BrainClient,
+                 config: Config, playbook: Playbook,
                  spec: FastExprSpec, generator_config: GeneratorConfig, memory: MemoryStore,
                  datafields: list[str] | None = None, seed: int | None = None,
                  sleep: Callable[[float], None] = time.sleep,
@@ -221,7 +344,11 @@ class ResearchRun:
                  run_id: str | None = None):
         self.budget = budget
         self.agents = agents
-        self.llm = BudgetedLLM(llm, budget.max_llm_calls)
+        agents.check_models()
+        self.models = agents.models
+        self.counter = CallCounter(budget.max_llm_calls)
+        self._llm_factory = llm_factory
+        self._llms: dict[str, BudgetedLLM] = {}
         self.memory = memory
         self.spec = spec
         self.generator_config = generator_config
@@ -232,25 +359,34 @@ class ResearchRun:
                                  out=out)
         limits, mo = generator_config.limits, agents.max_output
         ctx = brain_context(config)  # thresholds from config, shown to every agent's model
-        self.prefilter = PreFilter(agents.prefilter, spec, memory,
-                                   llm=self.llm if agents.prefilter.use_model else None,
+        m = self.models
+        pf_llm = self.llm(m.prefilter) if agents.prefilter.use_model else None
+        self.prefilter = PreFilter(agents.prefilter, spec, memory, llm=pf_llm,
                                    datafields=datafields, limits=limits, max_output=mo, context=ctx)
-        self.critic = Critic(spec, llm=self.llm if agents.critic_model else None,
-                             datafields=datafields, limits=limits, max_output=mo, context=ctx)
-        self.judge = DebateJudge(llm=self.llm if agents.debate_model else None, max_output=mo,
-                                 context=ctx)
+        # one Critic per critic model; without the critic model, one rules-only Critic
+        critic_models = m.critic if agents.critic_model else (None,)
+        self.critics = {cm: Critic(spec, llm=self.llm(cm) if cm else None, datafields=datafields,
+                                   limits=limits, max_output=mo, context=ctx)
+                        for cm in critic_models}
+        self.judge = DebateJudge(llm=self.llm(m.debate) if agents.debate_model else None,
+                                 max_output=mo, context=ctx)
         self.repairer = RepairAgent(playbook, spec, memory,
-                                    llm=self.llm if agents.repair_model else None,
+                                    llm=self.llm(m.repair) if agents.repair_model else None,
                                     datafields=datafields, limits=limits, max_output=mo,
                                     context=ctx)
-        self.strategist = StrategyEvolution(agents.strategy, llm=self.llm, max_output=mo,
+        st_llm = self.llm(m.strategy) if agents.strategy.every_rounds else None
+        self.strategist = StrategyEvolution(agents.strategy, llm=st_llm, max_output=mo,
                                             context=ctx)
 
         base_pv = generator_config.prompt_version
         self.arms: dict[tuple, ArmPlan] = {}
         self.generators: dict[tuple, AlphaGenerator] = {}
         for p in plans:
-            self.arms[(p.dataset, p.settings.region, base_pv)] = p
+            for gm in m.generator:
+                # every generator model is its own arm, with its own copy of the sources so
+                # each model works through the same hypotheses in the same order
+                self.arms[(p.dataset, p.settings.region, base_pv, gm)] = dataclasses.replace(
+                    p, sources=deque(p.sources))
         self.director = Orchestrator(self.arms.keys(), seed=seed)
         self.repair_queue: dict[tuple, deque] = {k: deque() for k in self.arms}
         self.sims_used = 0
@@ -260,11 +396,28 @@ class ResearchRun:
 
     # ------------------------------------------------------------------ setup
 
+    def llm(self, model: str) -> BudgetedLLM:
+        """The budgeted client for a model id, built once and shared by every agent."""
+        if model not in self._llms:
+            self._llms[model] = BudgetedLLM(self._llm_factory(model), counter=self.counter,
+                                            model=model)
+        return self._llms[model]
+
+    def _critics_for(self, key: tuple) -> tuple[str | None, list[str]]:
+        """(primary critic model, shadow critic models) for an arm."""
+        if not self.agents.critic_model:
+            return None, []
+        primary = self.models.primary_critic(key[3])
+        shadows = [cm for cm in self.critics if cm != primary] if self.models.shadow_critics else []
+        return primary, shadows
+
     def _warm_start(self) -> int:
         n = 0
-        for row in self.memory.candidate_outcomes():
+        outcomes = self.memory.candidate_outcomes()
+        models = arm_models(outcomes, self.memory.critic_reviews())
+        for row in outcomes:
             c, d = row["candidate"], row["decision"]
-            key = (c.dataset, c.region, c.prompt_version)
+            key = (c.dataset, c.region, c.prompt_version, models.get(c.candidate_id))
             if d is not None and d.decision in DECIDED and key in self.director.state:
                 self.director.update(key, d.decision == "accept")
                 n += 1
@@ -278,8 +431,8 @@ class ResearchRun:
         if key not in self.generators:
             plan = self.arms[key]
             cfg = dataclasses.replace(self.generator_config, prompt_version=key[2])
-            self.generators[key] = AlphaGenerator(self.llm, self.spec, plan.settings, cfg,
-                                                  datafields=self.datafields,
+            self.generators[key] = AlphaGenerator(self.llm(key[3]), self.spec, plan.settings,
+                                                  cfg, datafields=self.datafields,
                                                   guidance=plan.guidance)
         return self.generators[key]
 
@@ -347,7 +500,16 @@ class ResearchRun:
 
         pf = self.prefilter.run(batch)
         log["prefilter_dropped"] = [[c.candidate_id, why] for c, why in pf.dropped]
-        rv = review_and_debate(pf.kept, rationales, self.critic, self.judge)
+        primary, shadows = self._critics_for(key)
+        log["critic"] = primary
+        rv = review_and_debate(pf.kept, rationales, self.critics[primary], self.judge)
+        self._record_reviews(key, primary, "primary", rv.reviews)
+        for cm in shadows:  # recorded for compare.py; never changes what is simulated
+            shadow = ReviewOutcome()
+            reviews = self.critics[cm].review(pf.kept, rationales, shadow)
+            self._record_reviews(key, cm, "shadow", reviews)
+            log.setdefault("shadow_verdicts", {})[cm] = {cid: r.verdict
+                                                         for cid, r in reviews.items()}
         log["critic_dropped"] = [[c.candidate_id, why] for c, why in rv.dropped]
         log["revised"] = [c.candidate_id for c in rv.to_simulate if c.lever == "critic_revision"]
         log["outcomes"] = []
@@ -355,6 +517,15 @@ class ResearchRun:
             if self.sims_used >= self.budget.max_simulations:
                 break
             self._simulate(key, cand, log)
+
+    def _record_reviews(self, key: tuple, critic_model: str | None, role: str,
+                        reviews: dict) -> None:
+        for cid, r in reviews.items():
+            self.memory.put_critic_review(
+                run_id=self.run_id, candidate_id=cid, critic_model=critic_model, role=role,
+                verdict=r.verdict, source=r.source, generator_model=key[3],
+                payload={"issues": r.issues, "blocking": r.blocking,
+                         "revised": r.revised.expression if r.revised else None})
 
     def _simulate(self, key: tuple, cand: CandidateRecord, log: dict) -> None:
         outcome = self.pipeline.process(cand)
@@ -383,7 +554,7 @@ class ResearchRun:
         for key, plan in list(self.arms.items()):
             if key[2] != self.generator_config.prompt_version:
                 continue
-            new_key = (key[0], key[1], evo.prompt_version)
+            new_key = (key[0], key[1], evo.prompt_version, key[3])
             sources = deque(plan.sources)
             for ds, text in evo.hypotheses:
                 if ds is None or ds == key[0]:
@@ -410,13 +581,20 @@ class ResearchRun:
             "run_id": self.run_id,
             "stop_reason": self.stop_reason,
             "simulations_used": self.sims_used,
-            "model_calls": self.llm.calls,
-            "model": self.llm.model,
+            "model_calls": self.counter.calls,
+            "model_calls_by_model": dict(self.counter.by_model),
+            "models": {"generator": list(self.models.generator),
+                       "critic": list(self.critics) if self.agents.critic_model else [],
+                       "shadow_critics": self.models.shadow_critics,
+                       "prefilter": self.models.prefilter, "debate": self.models.debate,
+                       "repair": self.models.repair, "strategy": self.models.strategy},
             "prompt_versions": {"generator": self.generator_config.prompt_version,
                                 **PROMPT_VERSIONS},
             "warm_start_outcomes": self.warm_started,
             "pool_size": self.pipeline.pool.count(),
             "arms": arms,
+            "comparison": model_comparison(self.memory.candidate_outcomes(),
+                                           self.memory.critic_reviews()),
             "rounds": self.log,
         }
 

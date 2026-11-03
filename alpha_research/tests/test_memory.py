@@ -105,3 +105,18 @@ def test_candidate_outcomes_latest_decision_and_result(memory, candidate):
     assert [r["candidate"].candidate_id for r in rows] == ["a", "b"]
     assert rows[0]["decision"].decision == "accept" and rows[0]["result"].sharpe == 1.5
     assert rows[1]["decision"] is None and rows[1]["result"] is None
+
+
+def test_critic_reviews_append_only_and_read_back(memory):
+    memory.put_critic_review(run_id="r", candidate_id="a", critic_model="gemini-b", role="primary",
+                             verdict="drop", source="model", generator_model="claude-a",
+                             payload={"issues": ["x"]})
+    memory.put_critic_review(run_id="r", candidate_id="a", critic_model="claude-a", role="shadow",
+                             verdict="simulate", source="model", generator_model="claude-a")
+    rows = memory.critic_reviews()
+    assert [(r["critic_model"], r["role"], r["verdict"]) for r in rows] == \
+        [("gemini-b", "primary", "drop"), ("claude-a", "shadow", "simulate")]
+    assert rows[0]["payload"] == {"issues": ["x"]} and rows[1]["payload"] == {}
+    with pytest.raises(ValueError, match="primary or shadow"):
+        memory.put_critic_review(run_id="r", candidate_id="a", critic_model=None, role="judge",
+                                 verdict="drop", source="rules", generator_model=None)

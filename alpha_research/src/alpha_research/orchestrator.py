@@ -1,6 +1,7 @@
 """Research Director: Thompson sampling with floor quotas (spec section 13.1).
 
-Arms are (dataset, region, prompt_version) tuples. Each arm has a Beta(1, 1) prior on its
+Arms are hashable tuples: (dataset, region, prompt_version) in the Phase 2 driver, and
+(dataset, region, prompt_version, generator model) in the research loop. Each arm has a Beta(1, 1) prior on its
 pass rate. Novelty weighting is Phase 3 and not implemented.
 
 Allocation method:
@@ -21,7 +22,7 @@ from typing import Hashable, Iterable
 
 import numpy as np
 
-Arm = tuple  # (dataset, region, prompt_version)
+Arm = tuple  # (dataset, region, prompt_version[, generator model])
 
 
 @dataclass

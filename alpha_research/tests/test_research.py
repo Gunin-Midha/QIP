@@ -1,5 +1,6 @@
 """The closed research loop, end to end, with a routing fake model and a stub BRAIN client."""
 
+import dataclasses
 import json
 import re
 from collections import deque
@@ -11,17 +12,23 @@ from alpha_research.brain_client import FixtureBrainClient
 from alpha_research.config import ConfigError
 from alpha_research.fastexpr import FastExprSpec
 from alpha_research.generator import GenerationSettings, Source, load_generator_config
-from alpha_research.llm import ScriptedLLMClient
+from alpha_research.llm import ScriptedLLMClient, provider_of
 from alpha_research.research import (ArmPlan, Budget, BudgetedLLM, LLMBudgetExhausted,
-                                     ResearchRun, agents_config_from_dict, load_agents_config,
-                                     load_plan)
+                                     ModelsConfig, ResearchRun, agents_config_from_dict,
+                                     load_agents_config, load_plan)
 from alpha_research.simulator import VirtualClock
 
 from conftest import BRAIN_DIR, ROOT, TEST_CONFIG
 
 SPEC = FastExprSpec.load(ROOT / "config" / "fastexpr.yaml")
 GEN_CONFIG = load_generator_config(ROOT / "config" / "generator.yaml")
-AGENTS = load_agents_config(ROOT / "config" / "agents.yaml")
+MAIN_AGENTS = load_agents_config(ROOT / "config" / "agents.yaml")
+# one generator model and one critic from the other provider, no shadows: one arm per dataset
+ONE_MODEL = ModelsConfig(default="claude-test", generator=("claude-test",), critic=("gemini-test",),
+                         shadow_critics=False, prefilter="claude-test", debate="claude-test",
+                         repair="claude-test", strategy="claude-test")
+AGENTS = dataclasses.replace(MAIN_AGENTS, models=ONE_MODEL)
+ARM = ("pv1", "USA", "gen-v1", "claude-test")
 SETTINGS = {"region": "USA", "universe": "TOP3000", "delay": 1, "decay": 4,
             "neutralization": "SUBINDUSTRY", "truncation": 0.08,
             "start_date": "2019-01-01", "end_date": "2023-12-31"}
@@ -102,7 +109,7 @@ def make_run(memory, config, playbook, *, llm=None, brain=None, budget=None, age
     vc = VirtualClock()
     return ResearchRun(plan or plans(), agents, budget or Budget(max_simulations=8, per_round=4,
                                                                max_llm_calls=100),
-                       llm=llm or RouterLLM(), client=brain or StubBrain(), config=config,
+                       llm_factory=lambda model, r=llm or RouterLLM(): r, client=brain or StubBrain(), config=config,
                        playbook=playbook, spec=SPEC, generator_config=GEN_CONFIG, memory=memory,
                        seed=0, sleep=vc.sleep, clock=vc.clock, run_id="rs1")
 
@@ -129,12 +136,12 @@ def test_closed_loop_end_to_end(memory, config, playbook):
     # strategy evolution added an arm with a new prompt version and its guidance
     evo = next(r["evolution"] for r in report["rounds"] if "evolution" in r)
     assert evo["prompt_version"] == "gen-v1+evo1" and evo["source"] == "model"
-    assert "pv1/USA/gen-v1+evo1" in report["arms"]
-    new_key = ("pv1", "USA", "gen-v1+evo1")
+    assert "pv1/USA/gen-v1+evo1/claude-test" in report["arms"]
+    new_key = ("pv1", "USA", "gen-v1+evo1", "claude-test")
     assert run.arms[new_key].guidance == "avoid volume spikes without decay"
     assert "evolved idea" in [s.text for s in run.arms[new_key].sources]
     # the director learned from the outcomes
-    base = report["arms"]["pv1/USA/gen-v1"]
+    base = report["arms"]["pv1/USA/gen-v1/claude-test"]
     assert base["accepted"] >= 2 and base["accepted"] + base["not_accepted"] >= 3
     assert report["pool_size"] >= 2
     assert set(llm.calls) >= {"generator", "critic", "judge", "strategy"}
@@ -146,7 +153,7 @@ def test_guidance_reaches_the_generator_prompt(memory, config, playbook):
     run = make_run(memory, config, playbook, llm=llm,
                    budget=Budget(max_simulations=40, per_round=10, max_llm_calls=100))
     run.run(3)
-    gen = run.generators[("pv1", "USA", "gen-v1+evo1")]
+    gen = run.generators[("pv1", "USA", "gen-v1+evo1", "claude-test")]
     assert gen.config.prompt_version == "gen-v1+evo1"
     assert sum("avoid volume spikes without decay" in s for s in llm.systems) >= 1
     assert "avoid volume spikes" not in llm.systems[0]
@@ -177,7 +184,7 @@ def test_second_run_warm_starts_from_memory(memory, config, playbook):
     decided = sum(s.successes + s.failures for s in first.director.state.values())
     second = make_run(memory, config, playbook)
     assert second.warm_started == decided > 0
-    key = ("pv1", "USA", "gen-v1")
+    key = ARM
     assert second.director.state[key].successes == first.director.state[key].successes
 
 
@@ -186,10 +193,88 @@ def test_rules_only_agents(memory, config, playbook):
         "prefilter": {"near_duplicate_similarity": 0.9, "use_model": False, "min_model_score": None},
         "critic": {"use_model": False}, "debate": {"use_model": False}, "repair": {"use_model": False},
         "strategy": {"every_rounds": 0, "max_hypotheses": 3, "max_guidance_chars": 100},
-        "director": {"floor_share": 0.2}, "max_output": 1024}))
+        "director": {"floor_share": 0.2}, "max_output": 1024,
+        "models": {"default": "claude-test", "shadow_critics": False}}))
     llm = RouterLLM()
     report = make_run(memory, config, playbook, llm=llm, agents=agents_config_from_dict(raw)).run(2)
     assert set(llm.calls) == {"generator"} and report["simulations_used"] > 0
+
+
+TWO_MODELS = ModelsConfig(default="claude-a", generator=("claude-a", "gemini-b"),
+                          critic=("gemini-b", "claude-a"), shadow_critics=True,
+                          prefilter="claude-a", debate="claude-a", repair="claude-a",
+                          strategy="claude-a")
+
+
+def test_each_generator_model_is_an_arm_with_an_other_provider_critic(memory, config, playbook):
+    agents = dataclasses.replace(AGENTS, models=TWO_MODELS)
+    run = make_run(memory, config, playbook, agents=agents,
+                   budget=Budget(max_simulations=12, per_round=6, max_llm_calls=200))
+    report = run.run(2)
+    assert {"pv1/USA/gen-v1/claude-a", "pv1/USA/gen-v1/gemini-b"} <= set(report["arms"])
+    # both arms start from the same hypothesis: separate source queues
+    assert run.arms[("pv1", "USA", "gen-v1", "claude-a")].sources is not \
+        run.arms[("pv1", "USA", "gen-v1", "gemini-b")].sources
+    reviews = memory.critic_reviews()
+    primary = {(r["generator_model"], r["critic_model"]) for r in reviews if r["role"] == "primary"}
+    shadow = {(r["generator_model"], r["critic_model"]) for r in reviews if r["role"] == "shadow"}
+    assert primary == {("claude-a", "gemini-b"), ("gemini-b", "claude-a")}
+    assert shadow == {("claude-a", "claude-a"), ("gemini-b", "gemini-b")}
+    # every reviewed candidate has one primary and one shadow verdict
+    per_cid = {}
+    for r in reviews:
+        per_cid.setdefault(r["candidate_id"], []).append(r["role"])
+    assert all(sorted(roles) == ["primary", "shadow"] for roles in per_cid.values())
+    # candidates carry their generator's model; calls are counted per model
+    models = {r["candidate"].model for r in memory.candidate_outcomes()
+              if r["candidate"].parent_id is None}
+    assert models == {"claude-a", "gemini-b"}
+    assert set(report["model_calls_by_model"]) == {"claude-a", "gemini-b"}
+    assert sum(report["model_calls_by_model"].values()) == report["model_calls"]
+    assert set(report["comparison"]["generators"]) == {"claude-a", "gemini-b"}
+    assert set(report["comparison"]["critics"]) == {"claude-a", "gemini-b"}
+
+
+def test_shadow_critics_do_not_change_what_is_simulated(memory, config, playbook, tmp_path):
+    from alpha_research.memory import MemoryStore
+    submitted = []
+    for shadows, mem in ((False, memory), (True, MemoryStore(tmp_path / "shadow"))):
+        brain = StubBrain()
+        agents = dataclasses.replace(
+            AGENTS, models=dataclasses.replace(TWO_MODELS, shadow_critics=shadows))
+        make_run(mem, config, playbook, agents=agents, brain=brain,
+                 budget=Budget(max_simulations=8, per_round=4, max_llm_calls=200)).run(2)
+        submitted.append([c.expression for c in brain.submitted])
+        if shadows:
+            assert any(r["role"] == "shadow" for r in mem.critic_reviews())
+            mem.close()
+    assert submitted[0] == submitted[1] and submitted[0]
+
+
+def test_warm_start_credits_each_generator_arm(memory, config, playbook):
+    agents = dataclasses.replace(AGENTS, models=TWO_MODELS)
+    first = make_run(memory, config, playbook, agents=agents,
+                     budget=Budget(max_simulations=12, per_round=6, max_llm_calls=200))
+    first.run(1)
+    second = make_run(memory, config, playbook, agents=agents)
+    assert second.warm_started > 0
+    for key, s in first.director.state.items():
+        assert (second.director.state[key].successes, second.director.state[key].failures) == \
+            (s.successes, s.failures)
+
+
+def test_model_flag_replaces_the_default_only():
+    m = dataclasses.replace(TWO_MODELS, debate="gemini-b").with_default("claude-z")
+    assert m.default == "claude-z" and m.generator == ("claude-z", "gemini-b")
+    assert m.critic == ("gemini-b", "claude-z") and m.debate == "gemini-b"
+    assert m.repair == m.prefilter == m.strategy == "claude-z"
+
+
+def test_used_models_skip_agents_with_the_model_off():
+    agents = dataclasses.replace(AGENTS, models=dataclasses.replace(TWO_MODELS, repair="claude-r"),
+                                 repair_model=False)
+    assert "claude-r" not in agents.used_models()
+    assert set(agents.used_models()) == {"claude-a", "gemini-b"}
 
 
 def test_budgeted_llm_counts_and_stops():
@@ -204,8 +289,13 @@ def test_budgeted_llm_counts_and_stops():
 
 
 def test_main_agents_config_loads():
-    assert AGENTS.prefilter.near_duplicate_similarity == 0.9 and AGENTS.critic_model
-    assert AGENTS.strategy.every_rounds == 2 and AGENTS.floor_share == 0.2
+    a = MAIN_AGENTS
+    assert a.prefilter.near_duplicate_similarity == 0.9 and a.critic_model
+    assert a.strategy.every_rounds == 2 and a.floor_share == 0.2
+    # two generator models, each with a primary critic from the other provider
+    assert len(a.models.generator) == 2 and a.models.shadow_critics
+    for g in a.models.generator:
+        assert provider_of(a.models.primary_critic(g)) != provider_of(g)
 
 
 @pytest.mark.parametrize("patch, match", [
@@ -214,13 +304,22 @@ def test_main_agents_config_loads():
     ({"debate": {"use_model": "yes"}}, "true or false"),
     ({"director": {"floor_share": 1.5}}, "floor_share"),
     ({"max_output": 10}, "max_output"),
+    ({"models": None}, "missing section 'models'"),
+    ({"models": {"default": "claude-x", "shadow_critics": "yes"}}, "shadow_critics"),
+    ({"models": {"default": "claude-x", "shadow_critics": True, "generator": []}}, "models.generator"),
+    ({"models": {"default": "claude-x", "shadow_critics": True, "debate": 3}}, "models.debate"),
+    ({"models": {"default": "gpt-x", "shadow_critics": True}}, "unknown provider"),
+    # critic from the generator's own provider only: refused
+    ({"models": {"default": "claude-x", "shadow_critics": True,
+                 "generator": ["claude-x", "gemini-y"], "critic": ["claude-z"]}},
+     "needs a critic from a different provider"),
 ])
 def test_agents_config_errors(patch, match):
     import yaml
     raw = yaml.safe_load((ROOT / "config" / "agents.yaml").read_text())
     raw.update(patch)
     with pytest.raises(ConfigError, match=match):
-        agents_config_from_dict(raw)
+        agents_config_from_dict(raw).check_models()
 
 
 def write_plan(tmp_path, arms):
@@ -268,6 +367,7 @@ def test_cli_research_end_to_end(tmp_path, monkeypatch, capsys):
     for name in ("critic", "debate", "repair"):
         agents[name]["use_model"] = False
     agents["strategy"]["every_rounds"] = 0
+    agents["models"]["generator"] = ["claude-sonnet-5-5"]
     (tmp_path / "agents.yaml").write_text(yaml.safe_dump(agents))
     plan = write_plan(tmp_path, [{"dataset": "pv1", "settings": SETTINGS, "hypotheses": ["reversal"]}])
     script = tmp_path / "script.json"
@@ -287,7 +387,7 @@ def test_cli_research_end_to_end(tmp_path, monkeypatch, capsys):
     assert rc == 0, out
     data = json.loads(report.read_text())
     assert data["simulations_used"] == 2 and data["stop_reason"] == "simulation budget used up"
-    assert "stopped: simulation budget used up" in out and "pv1/USA/gen-v1: accepted 2" in out
+    assert "stopped: simulation budget used up" in out and "pv1/USA/gen-v1/claude-sonnet-5-5: accepted 2" in out
 
 
 def test_cli_research_needs_a_holdout(tmp_path):

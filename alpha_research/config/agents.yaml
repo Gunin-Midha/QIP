@@ -29,3 +29,21 @@ director:
   floor_share: 0.2                 # spec 13.1 default: share of each round reserved as floor slots
 
 max_output: 4096                   # output cap for one model call
+
+# Model per agent. The provider comes from the model id (claude-* or gemini-*; the key for
+# each is read in llm.py, see README). A null entry uses models.default; `cli research
+# --model M` replaces models.default wherever it is used. Check the gemini ids against Google's current
+# model list before a real run (they change often).
+models:
+  default: claude-sonnet-5-5
+  generator:                       # every generator model is its own Director arm
+    - claude-opus-5-5
+    - gemini-3.1-pro-preview
+  critic:                          # preference order; an arm's primary critic is the first one
+    - gemini-3.1-pro-preview       # from a different provider than the arm's generator
+    - claude-opus-5-5
+  shadow_critics: true             # the other critics review every batch too (recorded only)
+  prefilter: null
+  debate: null
+  repair: null
+  strategy: claude-opus-5-5

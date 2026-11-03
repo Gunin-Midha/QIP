@@ -8,6 +8,7 @@
     python -m alpha_research.cli brain auth | options | capture | operators | datafields
     python -m alpha_research.cli research --plan config/research_plan.example.yaml \
         --config <thresholds with holdout> --max-simulations 20 --max-llm-calls 60
+    python -m alpha_research.cli compare --data-dir data
 
 Exit codes: 0 success, 2 config error, 3 schema error, 4 no fixture for a candidate,
 5 model unavailable or unusable reply, 6 generate produced no valid candidate,
@@ -17,6 +18,7 @@ Exit codes: 0 success, 2 config error, 3 schema error, 4 no fixture for a candid
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import sys
@@ -29,6 +31,7 @@ from .brain_api import (EMAIL_ENV_VAR, SECRET_ENV_VAR, BrainApiError, RealBrainC
                         list_datafields, list_operators, load_brain_config, make_session,
                         simulation_options)
 from .brain_client import FixtureBrainClient, FixtureNotFoundError, SubmissionRejected
+from .compare import model_comparison
 from .config import ConfigError, load_config
 from .fastexpr import FastExprSpec
 from .generator import (AlphaGenerator, GenerationError, GenerationSettings, Source,
@@ -152,6 +155,16 @@ def _llm_client(args):
             raise ConfigError("script must be a JSON list of strings")
         return ScriptedLLMClient(replies)
     return make_real_client(args.model)
+
+
+def _llm_factory(args, models: list[str]):
+    """model id -> client. Scripted: one client answers for every model id. Real: one client
+    per model id, all built now so a missing key or package fails before BRAIN is called."""
+    if args.llm == "scripted":
+        scripted = _llm_client(args)
+        return lambda model: scripted
+    clients = {m: make_real_client(m) for m in models}
+    return lambda model: clients[model] if model in clients else make_real_client(model)
 
 
 def _generate(args) -> int:
@@ -299,12 +312,16 @@ def _research(args) -> int:
                     max_llm_calls=args.max_llm_calls)
     if min(budget.max_simulations, budget.per_round, budget.max_llm_calls) < 1:
         raise ConfigError("--max-simulations, --per-round and --max-llm-calls must be >= 1")
-    llm = _llm_client(args)
+    if args.model:
+        agents = dataclasses.replace(agents, models=agents.models.with_default(args.model))
+        agents.check_models()
+    llm_factory = _llm_factory(args, agents.used_models())  # before logging in to BRAIN
     brain_config = load_brain_config(args.brain_config)
     client = RealBrainClient(make_session(brain_config), brain_config, capture_dir=args.capture_dir)
     memory = MemoryStore(args.data_dir)
     try:
-        run = ResearchRun(plans, agents, budget, llm=llm, client=client, config=config,
+        run = ResearchRun(plans, agents, budget, llm_factory=llm_factory, client=client,
+                          config=config,
                           playbook=playbook, spec=spec, generator_config=gen_config,
                           memory=memory, datafields=datafields, seed=args.seed, out=sys.stdout)
         report = run.run(args.rounds)
@@ -313,9 +330,24 @@ def _research(args) -> int:
         memory.close()
     print(f"stopped: {report['stop_reason']} | simulations {report['simulations_used']} | "
           f"model calls {report['model_calls']} | pool {report['pool_size']} | report {path}")
+    print(f"  model calls by model: {report['model_calls_by_model']}")
     for arm, s in report["arms"].items():
         print(f"  {arm}: accepted {s['accepted']}, not accepted {s['not_accepted']}, "
               f"pass rate {s['posterior_pass_rate']}, repairs queued {s['repairs_queued']}")
+    return EXIT_OK
+
+
+def _compare(args) -> int:
+    """Generator and critic models side by side, from everything in memory."""
+    memory = MemoryStore(args.data_dir)
+    try:
+        table = model_comparison(memory.candidate_outcomes(), memory.critic_reviews())
+    finally:
+        memory.close()
+    text = json.dumps(table, indent=2)
+    if args.out:
+        Path(args.out).write_text(text + "\n")
+    print(text)
     return EXIT_OK
 
 
@@ -403,9 +435,15 @@ def build_parser() -> argparse.ArgumentParser:
     rs.add_argument("--brain-config", default="config/brain.yaml")
     rs.add_argument("--capture-dir", default=None)
     rs.add_argument("--llm", choices=["real", "scripted"], default="real")
-    rs.add_argument("--model", default=os.environ.get("ALPHA_RESEARCH_MODEL", DEFAULT_MODEL))
+    rs.add_argument("--model", default=os.environ.get("ALPHA_RESEARCH_MODEL"),
+                    help="replaces models.default in the agents config")
     rs.add_argument("--llm-script", help="JSON list of replies for --llm scripted (offline)")
     rs.set_defaults(func=_research)
+
+    cp = sub.add_parser("compare", help="compare generator and critic models from memory")
+    cp.add_argument("--data-dir", default=str(default_data_dir()))
+    cp.add_argument("--out", default=None, help="also write the table to this JSON file")
+    cp.set_defaults(func=_compare)
 
     pr = sub.add_parser("prompts", help="print the agents' system prompts with this config's thresholds")
     pr.add_argument("--agent", choices=["all", "prefilter", "critic", "judge", "repair", "strategy"],
