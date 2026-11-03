@@ -171,7 +171,7 @@ class AgentsConfig:
         for m in self.models.all_models():
             if provider_of(m) is None:
                 raise ConfigError(f"agents config: unknown provider for model {m!r} "
-                                  "(expected claude-* or gemini-*)")
+                                  "(expected claude-*, gemini-* or a hosted id such as groq:qwen/qwen3.8-27b)")
         if self.critic_model:
             for g in self.models.generator:
                 if self.models.primary_critic(g) is None:

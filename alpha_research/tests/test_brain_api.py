@@ -207,6 +207,7 @@ def test_live_capture_from_our_account_translates_to_website_values():
     assert (r.sub_universe_sharpe, r.sub_universe_cutoff) == (1.07, 0.63)
     assert r.weight_concentration is None  # CONCENTRATED_WEIGHT passed without a value
     assert r.self_correlation == 0.7003    # correlations/self max
+    assert "brain_period: 2019-01-01..2023-12-31" in r.notes   # BRAIN's default period
     assert r.checks["LOW_FITNESS"] is False and "SELF_CORRELATION" not in r.checks
     assert [y.year for y in r.yearly] == [2019, 2020, 2021, 2022, 2023]
     y2019 = r.yearly[0]

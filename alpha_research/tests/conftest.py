@@ -21,6 +21,16 @@ PLAYBOOK = ROOT / "config" / "repair_playbook.yaml"
 
 
 @pytest.fixture
+def no_holdout_config(tmp_path):
+    """The main config with the holdout cleared, for the 'holdout must be set' paths."""
+    raw = yaml.safe_load(MAIN_CONFIG.read_text())
+    raw["holdout"] = {"start_date": None, "end_date": None}
+    path = tmp_path / "thresholds_no_holdout.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    return path
+
+
+@pytest.fixture
 def raw_config():
     return copy.deepcopy(yaml.safe_load(TEST_CONFIG.read_text()))
 

@@ -212,7 +212,7 @@ The news12/EUR arm has the highest fixture pass rate, and by round 4 it gets mos
 
 Confirmed by the owner:
 1. The 2019–2023 screenshot yearly rows were supplied and stored in `screenshot_aggregate.json`.
-2. The main config keeps the holdout `null`. The test config uses a placeholder holdout of 2024-01-01 to 2025-12-31, plus placeholder risk limits of drawdown 0.15 and weight concentration 0.10.
+2. The main config's holdout was `null` until the owner chose BRAIN's default on 2026-11-03 (2024-01-01..2026-11-03). The test config uses a placeholder holdout of 2024-01-01 to 2025-12-31, plus placeholder risk limits of drawdown 0.15 and weight concentration 0.10.
 3. A definite failure beats pending.
 4. A domain error makes only that candidate invalid; a structural file error stops the CLI with exit code 3.
 
@@ -243,10 +243,10 @@ Made by the builder:
 | OQ-6 | Weak-year Sharpe floor and yearly spread | not configured |
 | OQ-7 | Minimum marginal pool Sharpe gain | not configured (correlation is still enforced) |
 | OQ-8 | OS/IS ratio floor | family flags return None |
-| OQ-9 | Holdout dates | the simulator refuses to run under the main config |
+| OQ-9 | Holdout dates | done 2026-11-03: 2024-01-01..2026-11-03, after BRAIN's default in-sample period |
 | OQ-10 | Operator list in `config/fastexpr.yaml` | done 2026-11-03: matches the account's 66 operators (removed ts_min, ts_max, ts_skewness, exp, regression_neut, vector_neut; added add, subtract, multiply, divide, and, or, not, the six comparison functions, bucket, kth_element, ts_step) |
 | OQ-11 | Expression complexity limits | not checked |
-| OQ-12 | How the holdout is enforced on BRAIN, which ignores candidate dates | the holdout check only covers candidate dates; BRAIN may simulate over the holdout |
+| OQ-12 | How the holdout is enforced on BRAIN, which ignores candidate dates | done 2026-11-03: BRAIN's default period ends 2023-12-31; `simulator.holdout_leak` makes any result whose BRAIN period overlaps the holdout `invalid` |
 | OQ-13 | Agent builder defaults: near-duplicate similarity 0.9, evolve every 2 rounds | used as shipped in `config/agents.yaml` |
 | OQ-14 | Raw data source for the Data Scientist | the Data Scientist is not in the research loop |
 
@@ -254,8 +254,8 @@ Made by the builder:
 
 ## 8. Suggested next steps
 
-1. Answer OQ-9 and OQ-4 so the main config can run end to end.
-2. ~~Run `cli brain capture` (OQ-2)~~ done. Decide OQ-12.
+1. ~~OQ-9~~ done. Answer OQ-4 (optional; null risk checks are skipped).
+2. ~~Run `cli brain capture` (OQ-2)~~ and ~~OQ-12~~ done.
 3. ~~Run `cli brain operators` (OQ-10)~~ done. Run `cli brain datafields` for a catalog, so generated alphas are checked against real fields.
 4. Run `cli research` on a small budget once OQ-2 and OQ-9/12 are settled (section 11).
 
@@ -368,7 +368,7 @@ candidate ──► POST /simulations ──► Location: .../simulations/<id>  
 - A 4xx on submit raises `SubmissionRejected` (new, in `brain_client.py`); the simulator records a `failed` result with the message instead of crashing.
 - A recordset that is missing or does not become ready in `recordset_max_wait_seconds` becomes `None` with a note. It never fails the whole result.
 - With `--capture-dir` (or `cli brain capture`) every raw body is written to disk. Credentials and cookies are never written.
-- Candidate start and end dates are not sent, because BRAIN has no such setting in the known API. The notes record the period BRAIN used (OQ-12).
+- Candidate start and end dates are not sent, because BRAIN has no such setting in the known API. The notes record the period BRAIN used as `brain_period: start..end`, and the simulator makes a result `invalid` if that period overlaps the holdout (OQ-12).
 - Nothing submits alphas for competition.
 
 **Other changes.**
@@ -514,3 +514,12 @@ The Pre-Filter and Critic also share a list of common pitfalls: look-ahead, no n
 - `test_memory` (1): `critic_reviews` is append-only and reads back.
 
 **Checks.** Full suite 461 passed (470 after the operator and universe update from our account on 2026-11-03). The definition-of-done greps find nothing.
+
+### Free models and Qwen (2026-11-03)
+
+The owner asked to use free API keys only, and to add Qwen.
+- First real Gemini call: `cli generate --model gemini-3.6-flash` (free tier) returned 3 valid candidates from 1 model call, none rejected.
+- Free availability on 2026-11-03: Gemini Flash models are free (Gemini 3.1 Pro is paid-only); Claude has no free tier; OpenRouter's live model list had 14 free models but no Qwen; Groq's free plan includes `qwen/qwen3.8-27b`.
+- `llm.ChatCompletionsLLMClient` calls a hosted chat-completions endpoint with `urllib`. `groq:<maker>/<model>` goes to Groq (`GROQ_API_KEY`), a plain `<maker>/<model>` to OpenRouter (`OPENROUTER_API_KEY`). The provider is the maker (`qwen`), not the host, so the cross-provider critic rule still means "a different model family". Hosted ids are routed first, so `google/gemini-x` goes to OpenRouter, not Google's API. Inline `<think>` blocks are stripped, since `extract_json` would otherwise pick up a JSON draft from the thinking. An HTTP 200 carrying an `error` object is treated as a failure. The first real Groq call failed with `HTTP 403` and no message: Cloudflare in front of Groq refuses urllib's default `User-Agent` (`error code: 1010`, reproduced without a key). Hosted calls now send `User-Agent: qip-alpha-research/0.1`, and a non-JSON error body is shown in the message. After the fix, `cli generate --model groq:qwen/qwen3.8-27b` returned 3 valid candidates from 1 call, none rejected.
+- `config/agents.yaml`: generators `gemini-3.6-flash` and `groq:qwen/qwen3.8-27b`, critics in the opposite order, shadow critics off (to save the free daily quota), strategy and default `gemini-3.6-flash`. Claude can be added back by listing a `claude-*` id.
+- Tests: hosted provider inference, request shape for both hosts, missing keys, seven error cases, thinking stripped, client selection. 487 passed; greps clean.

@@ -292,8 +292,10 @@ def test_main_agents_config_loads():
     a = MAIN_AGENTS
     assert a.prefilter.near_duplicate_similarity == 0.9 and a.critic_model
     assert a.strategy.every_rounds == 2 and a.floor_share == 0.2
-    # two generator models, each with a primary critic from the other provider
-    assert len(a.models.generator) == 2 and a.models.shadow_critics
+    # free models only (owner, 2026-11-03): Gemini and Qwen, each critiqued by the other;
+    # shadow critics off to save the free daily quota
+    assert {provider_of(g) for g in a.models.generator} == {"google", "qwen"}
+    assert not a.models.shadow_critics
     for g in a.models.generator:
         assert provider_of(a.models.primary_critic(g)) != provider_of(g)
 
@@ -390,9 +392,9 @@ def test_cli_research_end_to_end(tmp_path, monkeypatch, capsys):
     assert "stopped: simulation budget used up" in out and "pv1/USA/gen-v1/claude-sonnet-5-5: accepted 2" in out
 
 
-def test_cli_research_needs_a_holdout(tmp_path):
+def test_cli_research_needs_a_holdout(tmp_path, no_holdout_config):
     plan = write_plan(tmp_path, [{"dataset": "pv1", "settings": SETTINGS, "hypotheses": ["h"]}])
     rc = cli.main(["research", "--plan", str(plan), "--max-simulations", "1", "--max-llm-calls", "1",
-                   "--config", str(ROOT / "config" / "thresholds.yaml"),
+                   "--config", str(no_holdout_config),
                    "--data-dir", str(tmp_path / "d")])
     assert rc == cli.EXIT_CONFIG

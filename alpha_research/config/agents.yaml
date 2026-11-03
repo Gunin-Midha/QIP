@@ -30,20 +30,27 @@ director:
 
 max_output: 4096                   # output cap for one model call
 
-# Model per agent. The provider comes from the model id (claude-* or gemini-*; the key for
-# each is read in llm.py, see README). A null entry uses models.default; `cli research
-# --model M` replaces models.default wherever it is used. Check the gemini ids against Google's current
-# model list before a real run (they change often).
+# Model per agent. The provider comes from the model id (claude-*, gemini-* or a hosted
+# maker/model id; the key for each is read in llm.py, see README). A null entry uses
+# models.default; `cli research --model M` replaces models.default wherever it is used.
+# Check the ids against each host's current model list before a real run (they change often).
+#
+# Owner's choice (2026-11-03): free API keys only for now. gemini-3.6-flash is on Google's
+# free tier (first real call worked 2026-11-03); groq:qwen/qwen3.8-27b is on Groq's free
+# plan. Both have small daily limits, so shadow critics are off to save calls. To bring
+# Claude back later (paid): add claude-opus-5-5 to generator and critic, e.g. as default.
+# Hosted ids: groq:<maker>/<model> runs on Groq; a plain <maker>/<model> runs on OpenRouter
+# (its free models end in :free).
 models:
-  default: claude-sonnet-5-5
+  default: gemini-3.6-flash
   generator:                       # every generator model is its own Director arm
-    - claude-opus-5-5
-    - gemini-3.1-pro-preview
+    - gemini-3.6-flash
+    - groq:qwen/qwen3.8-27b
   critic:                          # preference order; an arm's primary critic is the first one
-    - gemini-3.1-pro-preview       # from a different provider than the arm's generator
-    - claude-opus-5-5
-  shadow_critics: true             # the other critics review every batch too (recorded only)
+    - groq:qwen/qwen3.8-27b        # from a different provider than the arm's generator
+    - gemini-3.6-flash
+  shadow_critics: false            # true = the other critics review every batch too (recorded only)
   prefilter: null
   debate: null
   repair: null
-  strategy: claude-opus-5-5
+  strategy: gemini-3.6-flash

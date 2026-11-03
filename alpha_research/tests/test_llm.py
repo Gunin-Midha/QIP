@@ -5,7 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 from alpha_research.llm import (AnthropicLLMClient, GeminiLLMClient, LLMUnavailable,
-                                ScriptedLLMClient, make_real_client, provider_of)
+                                ChatCompletionsLLMClient, ScriptedLLMClient, make_real_client,
+                                provider_of)
 
 
 def test_scripted_client_replays_in_order_and_records_calls():
@@ -93,6 +94,13 @@ def test_provider_of():
     assert provider_of("gemini-3.1-pro-preview") == "google"
     assert provider_of("scripted") == "scripted"
     assert provider_of("gpt-5") is None
+    # hosted ids belong to the model's maker, not to the host
+    assert provider_of("qwen/qwen3-8b:free") == "qwen"
+    assert provider_of("groq:qwen/qwen3.8-27b") == "qwen"
+    assert provider_of("nvidia/nemotron-3.5-lightning:free") == "nvidia"
+    assert provider_of("deepseek/deepseek-r1:free") == "deepseek"
+    assert provider_of("google/gemini-x") == "google"
+    assert provider_of("/x") is None and provider_of("qwen/") is None
 
 
 def gemini_reply(parts, finish="STOP"):
@@ -154,3 +162,77 @@ def test_make_real_client_picks_the_provider(monkeypatch):
         make_real_client("claude-x")
     with pytest.raises(LLMUnavailable, match="unknown provider"):
         make_real_client("gpt-5")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy")
+    monkeypatch.setenv("GROQ_API_KEY", "dummy")
+    assert make_real_client("qwen/qwen3-8b:free").host == "openrouter"
+    assert make_real_client("google/gemini-x").host == "openrouter"
+    assert make_real_client("groq:qwen/qwen3.8-27b").host == "groq"
+
+
+# ---------------------------------------------------------------- hosted models (Groq, OpenRouter)
+
+
+def hosted_reply(content, finish="stop"):
+    return 200, json.dumps({"choices": [{"message": {"role": "assistant", "content": content},
+                                         "finish_reason": finish}]}).encode()
+
+
+@pytest.mark.parametrize("model, env_var", [("qwen/qwen3-8b:free", "OPENROUTER_API_KEY"),
+                                            ("groq:qwen/qwen3.8-27b", "GROQ_API_KEY")])
+def test_hosted_without_a_key_is_unavailable(monkeypatch, model, env_var):
+    monkeypatch.delenv(env_var, raising=False)
+    with pytest.raises(LLMUnavailable, match=env_var):
+        ChatCompletionsLLMClient(model)
+
+
+@pytest.mark.parametrize("model, url, wire_model", [
+    ("qwen/qwen3-8b:free", "https://openrouter.ai/api/v1/chat/completions", "qwen/qwen3-8b:free"),
+    ("groq:qwen/qwen3.8-27b", "https://api.groq.com/openai/v1/chat/completions", "qwen/qwen3.8-27b"),
+])
+def test_hosted_call_shape(monkeypatch, model, url, wire_model):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy")
+    monkeypatch.setenv("GROQ_API_KEY", "dummy")
+    transport, seen = fake_transport(hosted_reply("hello"))
+    llm = ChatCompletionsLLMClient(model, transport=transport)
+    assert llm.complete("SYS", "USR", max_output=321) == "hello"
+    assert seen["url"] == url
+    assert seen["headers"]["Authorization"] == "Bearer dummy"
+    assert seen["headers"]["User-Agent"].startswith("qip-")  # Cloudflare blocks urllib's default
+    assert seen["body"] == {"model": wire_model,
+                            "messages": [{"role": "system", "content": "SYS"},
+                                         {"role": "user", "content": "USR"}],
+                            "max_tokens": 321}
+    assert llm.provider == "qwen" and llm.model == model
+
+
+def test_hosted_strips_inline_thinking(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "dummy")
+    reply = '<think>maybe {"draft": 1}</think>\n{"final": 2}'
+    transport, _ = fake_transport(hosted_reply(reply))
+    assert ChatCompletionsLLMClient("groq:qwen/qwen3.8-27b", transport=transport) \
+        .complete("s", "u").strip() == '{"final": 2}'
+    transport, _ = fake_transport(hosted_reply("<think>ran out of room", finish="length"))
+    with pytest.raises(LLMUnavailable, match="raise max_output"):
+        ChatCompletionsLLMClient("groq:qwen/qwen3.8-27b", transport=transport).complete("s", "u")
+
+
+def test_hosted_rejects_an_id_without_a_maker():
+    with pytest.raises(LLMUnavailable, match="not a hosted model id"):
+        ChatCompletionsLLMClient("groq:llama", api_key="dummy")
+
+
+@pytest.mark.parametrize("reply, match", [
+    ((429, json.dumps({"error": {"message": "rate limited"}}).encode()), "HTTP 429: rate limited"),
+    ((200, json.dumps({"error": {"message": "upstream down"}}).encode()), "upstream down"),
+    ((502, b""), "HTTP 502: no message"),
+    ((403, b"error code: 1010\n"), "HTTP 403: error code: 1010"),
+    ((200, json.dumps({"choices": []}).encode()), "no choices"),
+    (hosted_reply(None, finish="length"), "raise max_output"),
+    (hosted_reply("  "), "empty reply"),
+    (ConnectionError("down"), "down"),
+])
+def test_hosted_errors_are_unavailable(monkeypatch, reply, match):
+    monkeypatch.setenv("GROQ_API_KEY", "dummy")
+    transport, _ = fake_transport(reply)
+    with pytest.raises(LLMUnavailable, match=match):
+        ChatCompletionsLLMClient("groq:qwen/qwen3.8-27b", transport=transport).complete("s", "u")

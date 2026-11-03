@@ -52,10 +52,18 @@ Tests and `--llm scripted` need neither. Set only the keys for the providers you
 `config/agents.yaml` uses:
 
 ```bash
-pip install -e ".[llm]"             # Claude (claude-* model ids)
-export ANTHROPIC_API_KEY=...        # read by llm.py only; never written anywhere
-export GEMINI_API_KEY=...           # Gemini (gemini-* model ids); plain HTTPS, no extra package
+# Each key is read by llm.py only and never written anywhere. `read -s` keeps it off the
+# screen and out of shell history: run it, paste the key, press Enter.
+read -s GEMINI_API_KEY && export GEMINI_API_KEY          # gemini-* ids (free tier: Flash models)
+read -s GROQ_API_KEY && export GROQ_API_KEY              # groq:<maker>/<model> ids (free plan has Qwen)
+read -s OPENROUTER_API_KEY && export OPENROUTER_API_KEY  # plain <maker>/<model> ids (free ones end in :free)
+pip install -e ".[llm]"                                  # only for Claude (claude-* ids, paid)
+read -s ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY
 ```
+
+`config/agents.yaml` currently uses free models only: `gemini-3.6-flash` and
+`groq:qwen/qwen3.8-27b`, each critiquing the other. Keys come from aistudio.google.com
+(Gemini), console.groq.com (Groq) and openrouter.ai (OpenRouter).
 
 ## Run the tests
 
@@ -65,10 +73,11 @@ pytest -q
 
 ## Run the pipeline on the hand-written candidates
 
-`config/thresholds.yaml` leaves the holdout null (OQ-9), so the simulator refuses to run
-with it, as the spec requires. That command exits with code 2. Until the owner sets the
-holdout, use the test config. It sets placeholder holdout dates and two placeholder risk
-limits so the concentration and drawdown fixtures can fail:
+`config/thresholds.yaml` sets the holdout to 2024-01-01..2026-11-03, the time after
+BRAIN's default in-sample period on our account (OQ-9). A config whose holdout is null makes
+the simulator refuse to run (exit code 2), as the spec requires. The demo below uses the
+test config, which sets placeholder holdout dates and two placeholder risk limits so the
+concentration and drawdown fixtures can fail:
 
 ```bash
 python -m alpha_research.cli run \
@@ -184,17 +193,18 @@ only for stage `IS`. Checks that are neither PASS nor FAIL are left out. Long an
 PnL and the drawdown date are not in BRAIN's response and stay `None`. The test-period
 stats (`alpha.test`) are recorded in the notes, not gated.
 
-BRAIN does not take start and end dates; it simulates its own period, and the result notes
-record that period (OQ-12). It does accept a `testPeriod` setting (ISO duration such as
-`P1Y0M0D`) that holds out the end of its period, which is the likely way to enforce our
-holdout; it is not set until the owner decides. Fixed settings sent with every simulation (instrument type,
+BRAIN does not take start and end dates; it simulates its own period (2019-01-01 to
+2023-12-31 on our account). The result notes record it as `brain_period: start..end`, and
+the simulator marks a result `invalid` if that period overlaps the holdout, so a change in
+BRAIN's default period cannot leak the holdout (OQ-12). BRAIN's `testPeriod` setting is
+not used. Fixed settings sent with every simulation (instrument type,
 pasteurization, unit and NaN handling, language) live in `config/brain.yaml`.
 Simulations run one at a time (OQ-3). Alphas are never submitted for competition.
 
 ## Research loop: all agents connected
 
 ```bash
-export BRAIN_EMAIL=... BRAIN_PASSWORD=... ANTHROPIC_API_KEY=... GEMINI_API_KEY=...
+# BRAIN_EMAIL, BRAIN_PASSWORD and the model keys set as above
 python -m alpha_research.cli research --plan config/research_plan.example.yaml \
     --config <thresholds with a holdout> --max-simulations 20 --max-llm-calls 60 \
     --per-round 5 --rounds 4 --datafields captures/datafields_usa.json
@@ -338,16 +348,16 @@ screenshot values (aggregate plus yearly rows for 2019 to 2023).
 - **OQ-6 Weak-year floor and yearly Sharpe spread.** Policy choice.
 - **OQ-7 Minimum marginal pool Sharpe gain.** Policy choice.
 - **OQ-8 OS/IS ratio floor.** Policy choice.
-- **OQ-9 Holdout period.** The simulator refuses to run until it is set.
+- **OQ-9 Holdout period.** Done: 2024-01-01..2026-11-03, following BRAIN's default period.
+  Move the end date forward as time passes.
 - **OQ-10 Operator list.** Done (2026-11-03): `config/fastexpr.yaml` matches the 66
   operators `cli brain operators` lists for our account, with BRAIN's argument lists.
   Rerun it if the account level changes; the generator discards anything not listed.
 - **OQ-11 Expression complexity limits.** Depth, operator calls and length are `null` (not
   checked) in `config/generator.yaml` until the owner chooses them.
-- **OQ-12 Simulation period on BRAIN.** BRAIN ignores the candidate's start and end dates,
-  so the holdout check on candidate dates does not stop BRAIN from simulating over the
-  holdout. BRAIN's `testPeriod` setting holds out the end of its period. Decide whether to
-  use it (and how long) or another way to enforce the holdout on real runs.
+- **OQ-12 Simulation period on BRAIN.** Done: BRAIN's default period ends before the
+  holdout, and any result whose BRAIN period overlaps the holdout becomes `invalid`. Still
+  open for later: how to test alphas on the holdout itself.
 - **OQ-13 Agent defaults.** `config/agents.yaml` ships with builder defaults so the loop
   works: near-duplicate similarity 0.9 and Strategy Evolution every 2 rounds. Review them.
 - **OQ-14 Data Scientist input.** The datafield audit needs a dates × instruments matrix

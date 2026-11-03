@@ -27,10 +27,15 @@ auditor:
   os_is_ratio_floor: null         # OQ-8
   deflation_method: "expected_max_normal"   # documented in auditor.py
 
-# Holdout (must be set before any simulation runs)
+# Holdout (must be set before any simulation runs). Owner's choice (2026-11-03): follow
+# BRAIN's default. Our account simulates in-sample 2019-01-01..2023-12-31 and keeps the
+# time after that as its own hidden out-of-sample period, so the holdout starts the day
+# after BRAIN's in-sample ends. The end date is the day it was set; move it forward as
+# time passes. No testPeriod is sent (OQ-12). The simulator rejects any BRAIN result whose
+# simulated period overlaps this, in case BRAIN moves its default period.
 holdout:
-  start_date: null                # OQ-9
-  end_date: null
+  start_date: "2024-01-01"        # OQ-9
+  end_date: "2026-11-03"
 
 # Simulator
 simulator:

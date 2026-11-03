@@ -13,15 +13,24 @@ and never needs a network.
 * ``GeminiLLMClient`` calls Google's Gemini ``generateContent`` REST endpoint with the
   standard library (``urllib``), so it needs no extra package. The key is read from
   GEMINI_KEY_ENV_VAR and sent only in the ``x-goog-api-key`` header.
+* ``ChatCompletionsLLMClient`` calls a hosted chat-completions endpoint with ``urllib``
+  for open models (Qwen, DeepSeek, Nemotron...). Two hosts, chosen by the model id:
+  ``groq:<maker>/<model>`` goes to Groq (free plan includes ``groq:qwen/qwen3.8-27b``),
+  and a plain ``<maker>/<model>`` goes to OpenRouter (free variants end in ``:free``).
+  Each host's key is read from its own environment variable (HOSTS) and sent only in the
+  ``Authorization`` header.
 
 The provider is inferred from the model id (``provider_of``): ``claude-*`` is Anthropic,
-``gemini-*`` is Google. Agents compare providers by this name, never by client class.
+``gemini-*`` is Google, and a hosted id belongs to its maker (``groq:qwen/...`` is
+``qwen``), not to the host, because the critic rule is about who made the model. Agents
+compare providers by this name, never by client class.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -32,6 +41,18 @@ KEY_ENV_VAR = "ANTHROPIC_API_KEY"
 GEMINI_KEY_ENV_VAR = "GEMINI_API_KEY"
 GEMINI_ROOT = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_TIMEOUT_SECONDS = 300.0   # thinking models can take minutes on a long prompt
+HOSTED_TIMEOUT_SECONDS = 300.0
+# host -> (chat-completions URL, key environment variable). The default host serves
+# plain "<maker>/<model>" ids; other hosts are named as a "<host>:" prefix on the id.
+HOSTS = {
+    "openrouter": ("https://openrouter.ai/api/v1/chat/completions", "OPENROUTER_API_KEY"),
+    "groq": ("https://api.groq.com/openai/v1/chat/completions", "GROQ_API_KEY"),
+}
+DEFAULT_HOST = "openrouter"
+# Groq sits behind Cloudflare, which refuses urllib's default User-Agent (error code 1010)
+USER_AGENT = "qip-alpha-research/0.1"
+# reasoning models (e.g. Qwen on Groq) may put their thinking inline; it is not the reply
+_THINK_RE = re.compile(r"<think>.*?(</think>|$)", re.S)
 
 PROVIDER_PREFIXES = {"claude-": "anthropic", "gemini-": "google"}
 
@@ -40,10 +61,25 @@ def provider_of(model: str) -> str | None:
     """Provider for a model id, from its prefix. None when the prefix is unknown."""
     if model == "scripted":
         return "scripted"
+    if not isinstance(model, str):
+        return None
     for prefix, provider in PROVIDER_PREFIXES.items():
-        if isinstance(model, str) and model.startswith(prefix):
+        if model.startswith(prefix):
             return provider
-    return None
+    hosted = split_hosted(model)
+    return hosted[1].partition("/")[0].lower() if hosted else None
+
+
+def split_hosted(model: str) -> tuple[str, str] | None:
+    """``(host, id sent to that host)`` for a hosted id, else None. ``groq:qwen/x`` ->
+    ``("groq", "qwen/x")``; ``qwen/x:free`` -> ``("openrouter", "qwen/x:free")``."""
+    host, colon, rest = model.partition(":")
+    if colon and host in HOSTS:
+        model = rest
+    else:
+        host = DEFAULT_HOST
+    maker, slash, name = model.partition("/")
+    return (host, model) if slash and maker and name else None
 
 
 class LLMUnavailable(RuntimeError):
@@ -165,13 +201,72 @@ class GeminiLLMClient:
         return text
 
 
+class ChatCompletionsLLMClient:
+    """A hosted chat-completions endpoint (see HOSTS). ``provider`` is the model's maker,
+    ``host`` who serves it."""
+
+    def __init__(self, model: str, api_key: str | None = None, *,
+                 transport: Transport | None = None, timeout: float = HOSTED_TIMEOUT_SECONDS):
+        hosted = split_hosted(model)
+        if hosted is None:
+            raise LLMUnavailable(f"not a hosted model id: {model!r} (expected maker/model)")
+        self.host, self._wire_model = hosted
+        self._url, env_var = HOSTS[self.host]
+        key = api_key or os.environ.get(env_var)
+        if not key:
+            raise LLMUnavailable(f"{env_var} is not set; export it or use --llm scripted")
+        self.model = model
+        self.provider = provider_of(model)
+        self._key = key
+        self._transport = transport or _urllib_transport
+        self._timeout = timeout
+
+    def complete(self, system: str, user: str, *, max_output: int = 4096) -> str:
+        body = json.dumps({
+            "model": self._wire_model,
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": user}],
+            "max_tokens": max_output,
+        }).encode()
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self._key}",
+                   "User-Agent": USER_AGENT, "X-Title": "QIP alpha research"}
+        try:
+            status, raw = self._transport(self._url, body, headers, self._timeout)
+        except (OSError, TimeoutError) as exc:  # network failure -> clean exit
+            raise LLMUnavailable(f"model call failed: {type(exc).__name__}: {exc}") from exc
+        try:
+            data = json.loads(raw) if raw else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            data = {}
+        error = data.get("error") if isinstance(data, dict) else None
+        if status != 200 or error:  # a host can report an upstream error with HTTP 200
+            msg = error.get("message") if isinstance(error, dict) else None
+            if not msg and raw and not data:  # not JSON, e.g. a proxy's "error code: 1010"
+                msg = raw[:200].decode("utf-8", "replace").strip()
+            raise LLMUnavailable(f"model call failed: HTTP {status}: {msg or 'no message'}")
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not choices:
+            raise LLMUnavailable("model returned no choices")
+        first = choices[0] if isinstance(choices[0], dict) else {}
+        text = _THINK_RE.sub("", (first.get("message") or {}).get("content") or "")
+        if not text.strip():
+            finish = first.get("finish_reason")
+            hint = ("; reasoning used the whole output cap, raise max_output in "
+                    "config/agents.yaml" if finish == "length" else "")
+            raise LLMUnavailable(f"model returned an empty reply (finish_reason {finish}){hint}")
+        return text
+
+
 def make_real_client(model: str) -> LLMClient:
     """The real model client for a model id. Kept here so no other module has to name a
     provider."""
     provider = provider_of(model)
+    if split_hosted(model):  # before the others: google/... is a hosted id, not Gemini's API
+        return ChatCompletionsLLMClient(model)
     if provider == "anthropic":
         return AnthropicLLMClient(model)
     if provider == "google":
         return GeminiLLMClient(model)
     raise LLMUnavailable(f"unknown provider for model {model!r}: expected a name starting "
-                         f"with one of {sorted(PROVIDER_PREFIXES)}")
+                         f"with one of {sorted(PROVIDER_PREFIXES)} or a hosted id "
+                         "such as groq:qwen/qwen3.8-27b")

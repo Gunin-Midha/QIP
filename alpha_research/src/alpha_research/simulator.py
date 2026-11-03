@@ -117,6 +117,32 @@ def local_validation_errors(candidate: CandidateRecord, config: Config) -> list[
     return errors
 
 
+def brain_period(notes: list[str]) -> tuple[date, date] | None:
+    """The period BRAIN actually simulated, from the ``brain_period: start..end`` note the
+    real client adds (candidate dates are not sent to BRAIN). None when absent."""
+    for n in notes:
+        if n.startswith("brain_period: "):
+            start, _, end = n[len("brain_period: "):].partition("..")
+            try:
+                return date.fromisoformat(start.strip()), date.fromisoformat(end.strip())
+            except ValueError:
+                return None
+    return None
+
+
+def holdout_leak(result: ResultRecord, config: Config) -> str | None:
+    """Reason the result must not be used because BRAIN's simulated period overlaps the
+    holdout (OQ-12), else None."""
+    period = brain_period(result.notes)
+    holdout = config.holdout
+    if period is None or not holdout.configured:
+        return None
+    if _overlaps(period[0], period[1], holdout.start_date, holdout.end_date):
+        return (f"BRAIN simulated {period[0]}..{period[1]}, which overlaps holdout "
+                f"{holdout.start_date}..{holdout.end_date}")
+    return None
+
+
 # ---------------------------------------------------------------------------
 # normalization
 # ---------------------------------------------------------------------------
@@ -225,6 +251,10 @@ class Simulator:
             self.memory.put_pending(candidate.candidate_id, sim_id)
 
         result = self._poll_until_done(candidate.candidate_id, sim_id)
+        leak = holdout_leak(result, self.config) if result.status == "complete" else None
+        if leak:
+            result.status = "invalid"  # never decide on numbers that saw the holdout
+            result.notes.append(f"invalid: {leak}")
         if result.status in ("complete", "failed"):
             result.notes.extend(metric_validator.validate_result(result))
         return self._persist(result)

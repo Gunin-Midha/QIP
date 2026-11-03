@@ -86,8 +86,8 @@ def test_cli_success(tmp_path, capsys):
     assert "div_01 | reject | self_correlation" in capsys.readouterr().out
 
 
-def test_cli_config_error_when_holdout_unset(tmp_path):
-    rc = cli.main(["run", "--candidates", str(CANDIDATES_FILE), "--config", str(MAIN_CONFIG),
+def test_cli_config_error_when_holdout_unset(tmp_path, no_holdout_config):
+    rc = cli.main(["run", "--candidates", str(CANDIDATES_FILE), "--config", str(no_holdout_config),
                    "--playbook", str(PLAYBOOK), "--fixtures-dir", str(BRAIN_DIR),
                    "--data-dir", str(tmp_path / "d")])
     assert rc == cli.EXIT_CONFIG
@@ -112,10 +112,10 @@ def test_cli_real_client_without_credentials_exits_7(tmp_path, monkeypatch, caps
     assert "BRAIN_EMAIL" in capsys.readouterr().err
 
 
-def test_cli_real_client_checks_holdout_before_login(tmp_path, monkeypatch):
+def test_cli_real_client_checks_holdout_before_login(tmp_path, monkeypatch, no_holdout_config):
     monkeypatch.setenv(brain_api.EMAIL_ENV_VAR, "someone@example.com")
     monkeypatch.setenv(brain_api.SECRET_ENV_VAR, "not-used")
-    rc = cli.main(["run", "--candidates", str(CANDIDATES_FILE), "--config", str(MAIN_CONFIG),
+    rc = cli.main(["run", "--candidates", str(CANDIDATES_FILE), "--config", str(no_holdout_config),
                    "--playbook", str(PLAYBOOK), "--client", "real",
                    "--brain-config", str(ROOT / "config" / "brain.yaml"),
                    "--data-dir", str(tmp_path / "d")])

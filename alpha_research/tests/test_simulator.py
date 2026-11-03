@@ -95,6 +95,20 @@ def test_polls_until_complete_and_honours_retry_after(tmp_path, memory, config, 
     assert vc.sleeps == [7.0, 5.0]
 
 
+@pytest.mark.parametrize("period, status", [
+    ("2019-01-01..2023-12-31", "complete"),   # BRAIN's default on our account; before the holdout
+    ("2020-01-01..2024-06-30", "invalid"),    # BRAIN moved its period into the test holdout
+])
+def test_brain_period_overlapping_holdout_makes_result_invalid(tmp_path, memory, config,
+                                                               candidate, period, status):
+    d = write_fixture(tmp_path, "p", {"status": "complete", "sharpe": 1.4,
+                                      "notes": [f"brain_period: {period}"]})
+    sim, _ = make_sim(FixtureBrainClient(d, {"c1": "p"}), memory, config)
+    r = sim.run(candidate())
+    assert r.status == status
+    assert any("overlaps holdout" in n for n in r.notes) == (status == "invalid")
+
+
 def test_timeout_after_max_poll_seconds(tmp_path, memory, config, candidate):
     d = write_fixture(tmp_path, "slow", {"responses": [{"status": "running"}]})
     sim, vc = make_sim(FixtureBrainClient(d, {"c1": "slow"}), memory, config)

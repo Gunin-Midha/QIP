@@ -14,9 +14,10 @@ This is a WorldQuant BRAIN alpha research system for the IIT Madras Quant Guild 
 - **Phase 1 and Phase 2: DONE.**
 - **Phase 3a, Alpha Generator: DONE.** `generator.py`, `fastexpr.py`, `llm.py` and `cli generate`. 284 tests pass (164 from Phases 1-2, 120 new), none fail, none are skipped.
 - **Phase 3b, remaining agents + research loop: DONE.** `prefilter.py` (Cheap Pre-Filter), `critic.py` (Critic + Debate judge), `repair_agent.py` (levers that rewrite expressions), `strategy.py` (Strategy Evolution), `research.py` (closed loop, `cli research`), `prompts.py` (all agent prompts, versioned; `cli prompts` prints them). 433 tests pass. Not run against real BRAIN or the real model yet.
-- **Model per agent + Gemini + model comparison: DONE (2026-11-03).** `llm.GeminiLLMClient` (stdlib `urllib`), `models` section in `config/agents.yaml`, generator models as bandit arms, primary critic always from another provider, shadow critics, `critic_reviews` table, `compare.py`, `cli compare`. 461 tests pass. Not run against the real Gemini API yet.
+- **Model per agent + Gemini + model comparison: DONE (2026-11-03).** `llm.GeminiLLMClient` (stdlib `urllib`), `models` section in `config/agents.yaml`, generator models as bandit arms, primary critic always from another provider, shadow critics, `critic_reviews` table, `compare.py`, `cli compare`. 461 tests pass. **First real Gemini call 2026-11-03** (`cli generate --model gemini-3.6-flash`, free tier): 3 valid candidates, 0 rejected, 1 model call.
+- **Free models + Qwen (2026-11-03, owner: free API keys only for now):** `llm.ChatCompletionsLLMClient` (stdlib `urllib`) serves hosted open models: `groq:<maker>/<model>` on Groq (`GROQ_API_KEY`), plain `<maker>/<model>` on OpenRouter (`OPENROUTER_API_KEY`). `config/agents.yaml` now uses only free models: generators `gemini-3.6-flash` and `groq:qwen/qwen3.8-27b`, each the other's primary critic, shadow critics off, strategy/default Gemini Flash. Gemini 3.1 Pro is paid-only; Claude has no free tier; OpenRouter had no free Qwen on 2026-11-03 (its live list), so Qwen comes from Groq's free plan. Inline `<think>` blocks are stripped from hosted replies. Hosted calls send `User-Agent: qip-alpha-research/0.1`: Cloudflare in front of Groq answers urllib's default agent with `403 error code: 1010` (first real Qwen call hit this). After the fix, first real Qwen call (`cli generate --model groq:qwen/qwen3.8-27b`): 3 valid candidates, 0 rejected, 1 model call. 488 tests pass.
 - **Not built:** the Data Scientist is not in the loop (needs raw datafield matrices, OQ-14). Parallel simulations (OQ-3).
-- **Real BRAIN on our account (2026-11-03):** `brain auth`, `brain options` and `brain operators` work. `config/fastexpr.yaml` now matches the account's 66 operators exactly (OQ-10 done); the account allows region USA only, universes TOP3000/2000/1000/500/200/TOPSP500 (added to `schemas.UNIVERSES`). Repair prompt `repair-v3` (orthogonalize no longer names operators the account lacks). `brain datafields` gave 4,367 fields for USA/TOP3000/D1. `brain capture` ran one real simulation (acc_01: Sharpe 1.45, fitness 0.78); every mapped field matched, so OQ-2 is closed apart from the weight-concentration unit (BRAIN sends no value on a PASS). The capture is the regression fixture `tests/fixtures/brain_api_capture/` (author and alpha names redacted). `UNVERIFIED_NOTE` removed; margin bps rounded to 6 places. 471 tests pass.
+- **Real BRAIN on our account (2026-11-03):** `brain auth`, `brain options` and `brain operators` work. `config/fastexpr.yaml` now matches the account's 66 operators exactly (OQ-10 done); the account allows region USA only, universes TOP3000/2000/1000/500/200/TOPSP500 (added to `schemas.UNIVERSES`). Repair prompt `repair-v3` (orthogonalize no longer names operators the account lacks). `brain datafields` gave 4,367 fields for USA/TOP3000/D1. `brain capture` ran one real simulation (acc_01: Sharpe 1.45, fitness 0.78); every mapped field matched, so OQ-2 is closed apart from the weight-concentration unit (BRAIN sends no value on a PASS). The capture is the regression fixture `tests/fixtures/brain_api_capture/` (author and alpha names redacted). `UNVERIFIED_NOTE` removed; margin bps rounded to 6 places. Holdout set to BRAIN's default (OQ-9, OQ-12 done) with a guard against BRAIN period overlap. 474 tests pass.
 - **Real BRAIN client: BUILT and verified by one capture.** `brain_api.py`, `config/brain.yaml`, `cli run --client real`, `cli brain auth|options|capture|operators|datafields`. 342 tests pass. The API docs are behind a login, so the client follows BRAIN's own web app (its public JS bundle, read 2026-11-02) and the sample responses it ships, saved in `tests/fixtures/brain_api_samples/` (see SOURCE.md there; don't hand-edit).
 - Git repo: https://github.com/Gunin-Midha/QIP (branch `main`). The repo root is `QIP/`.
 
@@ -57,15 +58,15 @@ PYTHONPATH=src python3 -m alpha_research.cli run --client real --candidates F --
 
 - The environment is system Python 3.12.4 with pandas, numpy, scipy, pyyaml and pytest already installed. There is no venv.
 - The first import after a cold start can take a minute or two (bytecode compilation).
-- Running `cli run` with the default `config/thresholds.yaml` exits with code 2 **on purpose**: the holdout is null (OQ-9).
+- `config/thresholds.yaml` now has a holdout (owner's choice 2026-11-03: follow BRAIN's default): the holdout is 2024-01-01..2026-11-03, the time after BRAIN's default in-sample period (2019-01-01..2023-12-31 on our account). A config with a null holdout still makes `run` and `research` exit 2.
 - CLI exit codes: 0 ok, 2 config error, 3 schema error, 4 no fixture for a candidate, 5 model unavailable or unusable reply, 6 `generate` produced no valid candidate, 7 BRAIN login or API error.
 
 ## Hard rules (from BUILD_SPEC section 0, which still apply)
 
-1. Network code lives only in `llm.py` (the models: Anthropic SDK, and Gemini over standard-library `urllib`) and `brain_api.py` (BRAIN, standard-library `urllib` only). `llm.py` is the only module that may import a model provider SDK (optional, lazily imported) or name a provider; every other module depends on the `LLMClient` or `BrainClient` protocols. Tests never touch the network: they use `ScriptedLLMClient`, `FixtureBrainClient` or a fake transport for `brain_api`. Agents that use the model (Generator, Pre-Filter, Critic, Debate judge, Repair, Strategy) take an `LLMClient` and go through `generator.ask_json`; every model-written expression must pass `fastexpr.analyze` before it can reach BRAIN.
+1. Network code lives only in `llm.py` (the models: Anthropic SDK; Gemini, Groq and OpenRouter over standard-library `urllib`) and `brain_api.py` (BRAIN, standard-library `urllib` only). `llm.py` is the only module that may import a model provider SDK (optional, lazily imported) or name a provider; every other module depends on the `LLMClient` or `BrainClient` protocols. Tests never touch the network: they use `ScriptedLLMClient`, `FixtureBrainClient` or a fake transport for `brain_api`. Agents that use the model (Generator, Pre-Filter, Critic, Debate judge, Repair, Strategy) take an `LLMClient` and go through `generator.ask_json`; every model-written expression must pass `fastexpr.analyze` before it can reach BRAIN.
 2. Don't invent BRAIN response fields. Use only the fields in spec 3.2. If something is unclear, leave it null and add `TODO(open-question)`.
 3. Never hardcode a policy threshold. Thresholds live in `config/thresholds.yaml`. A `null` threshold means the check returns `passed=None` with note `"not configured"`. It never passes or fails silently.
-4. No credentials anywhere in the repo. The model keys are read from the `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` environment variables in `llm.py`, and the BRAIN login from `BRAIN_EMAIL` / `BRAIN_PASSWORD` in `brain_api.py`, and nowhere else. Captures (`captures/`, git-ignored) never contain credentials or cookies.
+4. No credentials anywhere in the repo. The model keys are read from the `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY` and `OPENROUTER_API_KEY` environment variables in `llm.py`, and the BRAIN login from `BRAIN_EMAIL` / `BRAIN_PASSWORD` in `brain_api.py`, and nowhere else. Captures (`captures/`, git-ignored) never contain credentials or cookies.
 5. A missing value is `None`, never `0`.
 6. Every component needs pytest tests, and a component isn't done until they pass.
 7. Use only the plain stack: dataclasses, pandas, numpy, scipy, sqlite3, pyyaml, pytest. No heavy frameworks, and no new required dependencies (which is why PnL is stored as CSV, not Parquet). The only addition is the optional `llm` extra (`anthropic`), needed only for the real model.
@@ -82,7 +83,7 @@ QIP/
     REPORT.md                   # detailed build report
     README.md                   # setup / run / open questions
     pyproject.toml              # pytest pythonpath = src
-    config/thresholds.yaml      # real config; OQ thresholds null, holdout null
+    config/thresholds.yaml      # real config; OQ thresholds null, holdout 2024-01-01..2026-11-03
     config/repair_playbook.yaml # turnover, concentration, self_correlation, sub_universe, drawdown
     config/fastexpr.yaml        # operator list matching our account (OQ-10), groups, base fields, constants
     config/generator.yaml       # generator limits; complexity limits null (OQ-11)
@@ -110,7 +111,7 @@ QIP/
       pipeline.py       # end-to-end wiring; load_candidate_file
       cli.py            # `run`, `bandit`, `generate`, `research` and `brain ...` subcommands
       fastexpr.py       # Phase 3a: Fast Expression lexer/parser, analyze() against config/fastexpr.yaml
-      llm.py            # Phase 3a: LLMClient protocol, ScriptedLLMClient, AnthropicLLMClient, GeminiLLMClient, provider_of (only provider code)
+      llm.py            # Phase 3a: LLMClient protocol, ScriptedLLMClient, AnthropicLLMClient, GeminiLLMClient, ChatCompletionsLLMClient (Groq/OpenRouter), provider_of (only provider code)
       generator.py      # Phase 3a: AlphaGenerator (hypothesis/paper -> validated CandidateRecords); ask_json
       prefilter.py      # Phase 3b: Cheap Pre-Filter (validator, duplicates, near duplicates, optional model score)
       critic.py         # Phase 3b: Critic (rules + model) and Debate judge; review_and_debate()
@@ -140,7 +141,7 @@ QIP/
 **Confirmed by the user:**
 - **Failure beats pending.** A definitely failed hard gate decides the outcome even when another gate is `None`, and so does a risk veto. Only when nothing failed does a `None` hard gate give `pending`.
 - **Invalid candidates.** A domain error in one candidate (unknown region, unbalanced parens, bad delay, holdout overlap) becomes a `status="invalid"` result and then `reject / incomplete`, and the run continues. A structural error in the candidate file (bad JSON, missing keys, wrong types) raises `SchemaError`, and the CLI exits with code 3.
-- **Holdout.** The main config keeps the holdout null; tests and the CLI demo use `tests/fixtures/thresholds_test.yaml`.
+- **Holdout.** Owner (2026-11-03): use BRAIN's default, so the main config's holdout is 2024-01-01..2026-11-03 (move the end date forward over time). Tests and the CLI demo still use `tests/fixtures/thresholds_test.yaml`; tests that need a null holdout use the `no_holdout_config` fixture.
 - **Screenshot yearly rows**, as supplied by the user (stored in percent in the fixture):
   2019: 1.40 / 23.05% / 0.73 / 6.21% / 3.33% / 5.39bps / 1437 / 1273
   2020: 0.11 / 26.99% / 0.02 / 0.80% / 7.04% / 0.59bps / 1387 / 1329
@@ -190,7 +191,7 @@ QIP/
 - `RealBrainClient.poll` returns `{"status": "running", "retry_after": s}` while running, then `translate()` output in the simulator's raw format with `units: "fraction"` (normalize skips the percent conversion) and a `notes` list (copied onto the result).
 - Mapping: `is.*` aggregates; margin × 10,000 → bps; sub-universe from the `LOW_SUB_UNIVERSE_SHARPE` check value/limit; weight concentration from the `CONCENTRATED_WEIGHT` check value; self-correlation from `correlations/self` `max`, else the `SELF_CORRELATION` check; PASS/FAIL checks only; daily PnL from the `daily-pnl` recordset, else by differencing the cumulative `pnl` recordset; yearly rows with stage `IS` only. `testPeriod`, `alpha.test` and `is.startDate` go into notes, not gates. Long/short PnL and drawdown date are not in BRAIN's response and stay None.
 - A missing or slow recordset becomes None plus a note, never a failed result. A 4xx on submit raises `SubmissionRejected` → `failed` result. 401 → one re-login; 429 → wait up to `rate_limit_max_wait_seconds`; 5xx/network → ConnectionError/TimeoutError (simulator retries).
-- Candidate start/end dates are not sent (OQ-12). Biometric login is not supported. Nothing submits alphas for competition.
+- Candidate start/end dates are not sent and no `testPeriod` is sent (OQ-12). `translate` adds a `brain_period: start..end` note from the alpha's settings; `simulator.holdout_leak` turns a complete result whose BRAIN period overlaps the holdout into `invalid` (then reject / incomplete), so a shift in BRAIN's default period can't leak the holdout. Biometric login is not supported. Nothing submits alphas for competition.
 - `cli run --client real` checks the holdout before logging in, and uses real time (no VirtualClock).
 
 **Agents and research loop (Phase 3b, builder choices):**
@@ -203,13 +204,13 @@ QIP/
 - Prompts: all agent prompts live in `prompts.py` (Generator's stay in `generator.py`, still `gen-v1`). Bump the agent's entry in `PROMPT_VERSIONS` when its text changes. Thresholds enter prompts only via `brain_context(config)`, never typed in. Every system prompt has `DATA_RULE`, `JSON_RULE` and the exact reply shape; `test_prompts` checks this. Every non-mechanical playbook lever needs an entry in `LEVER_INSTRUCTIONS`.
 - None of `config/agents.yaml` changes an accept/reject decision. Slots emptied by Pre-Filter/Critic are not refilled within the round; pending decisions are not re-run.
 
-**Model per agent (owner chose: Anthropic + Gemini, generator models as bandit arms, shadow critics):**
+**Model per agent (owner chose: several providers, generator models as bandit arms, shadow critics available; since 2026-11-03 free models only):**
 - `models` in `config/agents.yaml`: `default`, `generator` (list), `critic` (list, preference order), `shadow_critics`, and `prefilter`/`debate`/`repair`/`strategy` (null = default). `cli research --model M` replaces only `models.default`.
-- The provider comes from the model id prefix (`claude-*` = anthropic, `gemini-*` = google) via `llm.provider_of`. Config files never name a provider (this keeps the definition-of-done grep clean).
+- The provider comes from the model id via `llm.provider_of`: `claude-*` = anthropic, `gemini-*` = google, a hosted id `[groq:]<maker>/<model>` = its maker (`groq:qwen/...` = qwen), never the host, because the critic rule is about who made the model. `llm.split_hosted` picks the host (`groq:` prefix, else OpenRouter); hosted ids are routed before `gemini-`/`claude-` checks. Config files never name a provider (this keeps the definition-of-done grep clean).
 - Arms are `(dataset, region, prompt_version, generator model)`. Each generator-model arm has its own copy of the plan's sources. Warm start credits candidates to their arm's generator model via `compare.arm_models` (critic records, then lineage).
 - **The primary critic never shares a provider with the arm's generator** (the owner's requirement): it's the first listed critic from a different provider. `AgentsConfig.check_models()` refuses configs without one (exit 2). Shadow critics review the same batch and are stored in `critic_reviews` (append-only) but never change what is simulated.
 - One `CallCounter` is shared by every model's `BudgetedLLM`. The report adds `model_calls_by_model`, `models` and `comparison` (cumulative over memory).
-- The Gemini id `gemini-3.1-pro-preview` came from Google's docs on 2026-11-03; check it before a real run.
+- Model ids change often: check `gemini-3.6-flash` (aistudio.google.com/rate-limit) and `qwen/qwen3.8-27b` (Groq console) before a run. Free tiers have small daily limits (sources vary), so keep `--max-llm-calls` small.
 
 ## Open questions (owner must answer, never guess)
 
@@ -223,10 +224,10 @@ QIP/
 | OQ-6 | Weak-year floor and max yearly spread | `risk.*` |
 | OQ-7 | Min marginal pool Sharpe gain | `diversity.min_marginal_pool_sharpe_gain` |
 | OQ-8 | OS/IS ratio floor | `auditor.os_is_ratio_floor` |
-| OQ-9 | Holdout dates | `holdout.*`; the simulator raises ConfigError until set |
+| OQ-9 | DONE 2026-11-03: 2024-01-01..2026-11-03 (BRAIN's default; end date to be moved forward) | `holdout.*` |
 | OQ-10 | DONE 2026-11-03: list matches the account's 66 operators; rerun `brain operators` if the account level changes | `config/fastexpr.yaml` |
 | OQ-11 | Expression complexity limits (depth, operator calls, characters) | `config/generator.yaml` (null = not checked) |
-| OQ-12 | BRAIN ignores candidate dates, so how is the holdout enforced on real runs? BRAIN's `testPeriod` setting (e.g. `P1Y0M0D`) is the likely answer | `brain_api.DATES_NOTE`; `config/brain.yaml` settings; `simulator.local_validation_errors` only checks candidate dates |
+| OQ-12 | DONE 2026-11-03: rely on BRAIN's default period (ends 2023-12-31), no `testPeriod`; results whose BRAIN period overlaps the holdout become invalid. Open later: how to test alphas on the holdout itself | `simulator.holdout_leak`, `brain_api.translate` |
 | OQ-13 | Agent builder defaults: near-duplicate similarity 0.9, Strategy Evolution every 2 rounds | `config/agents.yaml` |
 | OQ-14 | Raw data source for the Data Scientist (BRAIN's API gives no raw matrices) | `data_scientist.py` is not in the research loop |
 
@@ -244,8 +245,8 @@ Two more TODOs exist: the full universe list (`schemas.py`) and the deflated-Sha
 
 ## Natural next steps (only when the user asks)
 
-1. Owner sets OQ-9 (holdout) and the OQ-4 limits in `config/thresholds.yaml`.
-2. ~~`cli brain capture` (OQ-2)~~ done 2026-11-03. Owner decides OQ-12.
+1. ~~OQ-9 holdout~~ done. Owner sets the OQ-4 limits in `config/thresholds.yaml` (optional: null checks are skipped, not pending).
+2. ~~`cli brain capture` (OQ-2)~~ and ~~OQ-12~~ done 2026-11-03.
 3. ~~`cli brain operators` (OQ-10)~~ done. Owner runs `cli brain datafields` so the Generator can validate operators and fields.
 4. First real `cli research` run on a small budget after steps 1-3; then tune OQ-13 from its report.
 5. Parallel simulations once the account's concurrent limit is known (OQ-3); refill emptied slots within a round; re-run pending decisions.

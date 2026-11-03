@@ -67,7 +67,7 @@ EMAIL_ENV_VAR = "BRAIN_EMAIL"
 SECRET_ENV_VAR = "BRAIN_PASSWORD"
 ACCEPT = "application/json;version=2.0"
 DATES_NOTE = ("brain_dates: candidate start/end dates are not sent; BRAIN simulates its own "
-              "period (OQ-12)")
+              "period, which the simulator checks against the holdout (OQ-12)")
 DATAFIELD_PAGE_SIZE = 50
 
 _DONE_STATUSES = {"COMPLETE", "WARNING"}
@@ -477,6 +477,9 @@ def translate(simulation: dict, alpha: dict | None, yearly: dict | None = None,
                      f"fitness {test.get('fitness')} (not gated)")
     if is_.get("startDate"):
         notes.append(f"brain_is_start: {is_['startDate']}")
+    if settings.get("startDate") and settings.get("endDate"):
+        # read by simulator.brain_period, which checks it against the holdout
+        notes.append(f"brain_period: {settings['startDate']}..{settings['endDate']}")
 
     return {
         "status": "complete",

@@ -11,12 +11,17 @@ def test_main_config_loads_with_nulls():
     assert cfg.risk.max_drawdown is None
     assert cfg.diversity.min_marginal_pool_sharpe_gain is None
     assert cfg.simulator.max_concurrent == 1
-    assert not cfg.holdout.configured
 
 
-def test_main_config_requires_holdout_before_simulation():
+def test_main_config_holdout_follows_brain_default():
+    # BRAIN's in-sample on our account ends 2023-12-31; the holdout starts the day after
+    h = load_config(MAIN_CONFIG).require_holdout()
+    assert str(h.start_date) == "2024-01-01" and h.end_date > h.start_date
+
+
+def test_config_without_holdout_refuses_simulation(no_holdout_config):
     with pytest.raises(ConfigError):
-        load_config(MAIN_CONFIG).require_holdout()
+        load_config(no_holdout_config).require_holdout()
 
 
 def test_test_config_has_holdout():
