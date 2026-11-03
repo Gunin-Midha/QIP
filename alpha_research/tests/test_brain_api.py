@@ -171,7 +171,7 @@ def test_translate_maps_known_fields_and_keeps_fractions():
     assert raw["checks"] == {"LOW_SHARPE": True, "HIGH_TURNOVER": True,
                              "CONCENTRATED_WEIGHT": False, "LOW_SUB_UNIVERSE_SHARPE": True}
     assert any("SELF_CORRELATION='PENDING'" in n for n in raw["notes"])
-    assert brain_api.UNVERIFIED_NOTE in raw["notes"] and brain_api.DATES_NOTE in raw["notes"]
+    assert brain_api.DATES_NOTE in raw["notes"]
 
 
 def test_translate_then_normalize_gives_screenshot_values():
@@ -185,7 +185,36 @@ def test_translate_then_normalize_gives_screenshot_values():
         (3.59, 0.2564, 3.79, 0.2851, 0.0511)
     assert y2022.margin_bps == pytest.approx(22.24)
     assert (y2022.long_count, y2022.short_count) == (1654, 1318)
-    assert brain_api.UNVERIFIED_NOTE in r.notes
+
+
+
+CAPTURE_DIR = FIXTURES / "brain_api_capture"
+
+
+def _capture(name):
+    return json.loads((CAPTURE_DIR / f"{name}.json").read_text())
+
+
+def test_live_capture_from_our_account_translates_to_website_values():
+    # tests/fixtures/brain_api_capture: the real responses that confirmed the mapping (OQ-2)
+    raw = translate(_capture("simulation"), _capture("alpha"), _capture("yearly_stats"), None,
+                    _capture("self_correlation"), daily_pnl=_capture("daily_pnl"))
+    r = normalize(raw, "acc_01", "4F54UN7zk5c096r1apjYjsvk")
+    assert r.status == "complete"
+    assert (r.sharpe, r.fitness, r.turnover, r.returns, r.max_drawdown) == \
+        (1.45, 0.78, 0.4007, 0.1174, 0.0676)
+    assert r.margin_bps == 5.86
+    assert (r.sub_universe_sharpe, r.sub_universe_cutoff) == (1.07, 0.63)
+    assert r.weight_concentration is None  # CONCENTRATED_WEIGHT passed without a value
+    assert r.self_correlation == 0.7003    # correlations/self max
+    assert r.checks["LOW_FITNESS"] is False and "SELF_CORRELATION" not in r.checks
+    assert [y.year for y in r.yearly] == [2019, 2020, 2021, 2022, 2023]
+    y2019 = r.yearly[0]
+    assert (y2019.sharpe, y2019.turnover, y2019.margin_bps, y2019.long_count) == \
+        (2.2, 0.3942, 4.56, 1532)
+    # daily-pnl holds daily values, not cumulative: they add up to is.pnl (5,809,502)
+    assert len(r.daily_pnl) == 1236
+    assert r.daily_pnl.sum() == pytest.approx(5_809_502, rel=0.005)
 
 
 def test_cumulative_pnl_is_differenced():

@@ -42,6 +42,11 @@ def test_candidate_domain_rules(candidate, field, value):
         c.validate()
 
 
+@pytest.mark.parametrize("universe", ["TOP2000", "TOPSP500"])
+def test_universes_from_brain_options_are_valid(candidate, universe):
+    candidate(universe=universe).validate()
+
+
 def test_candidate_roundtrip(candidate):
     c = candidate(parent_id="p", generation=2, lever="increase_decay")
     assert CandidateRecord.from_dict(c.to_dict()) == c

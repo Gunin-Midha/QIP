@@ -236,7 +236,7 @@ Made by the builder:
 | ID | Question | Effect until answered |
 |---|---|---|
 | OQ-1 | BRAIN's margin definition (it reports about half the naive value) | margin is recorded, not gated |
-| OQ-2 | A raw BRAIN response sample | `RealBrainClient` is built from the publicly known API shape; every result is marked unverified until a capture confirms the mapping (section 10) |
+| OQ-2 | A raw BRAIN response sample | confirmed by a live capture on 2026-11-03 (`tests/fixtures/brain_api_capture/`); only the weight-concentration unit is open (section 10) |
 | OQ-3 | Concurrent simulation limit | single-threaded, `max_concurrent: 1` |
 | OQ-4 | Max drawdown and weight concentration limits | checks not configured |
 | OQ-5 | Leg-balance ratio and Sharpe floor after removing the top PnL days | not configured |
@@ -244,7 +244,7 @@ Made by the builder:
 | OQ-7 | Minimum marginal pool Sharpe gain | not configured (correlation is still enforced) |
 | OQ-8 | OS/IS ratio floor | family flags return None |
 | OQ-9 | Holdout dates | the simulator refuses to run under the main config |
-| OQ-10 | Operator seed list in `config/fastexpr.yaml` | unverified; the generator only uses listed operators |
+| OQ-10 | Operator list in `config/fastexpr.yaml` | done 2026-11-03: matches the account's 66 operators (removed ts_min, ts_max, ts_skewness, exp, regression_neut, vector_neut; added add, subtract, multiply, divide, and, or, not, the six comparison functions, bucket, kth_element, ts_step) |
 | OQ-11 | Expression complexity limits | not checked |
 | OQ-12 | How the holdout is enforced on BRAIN, which ignores candidate dates | the holdout check only covers candidate dates; BRAIN may simulate over the holdout |
 | OQ-13 | Agent builder defaults: near-duplicate similarity 0.9, evolve every 2 rounds | used as shipped in `config/agents.yaml` |
@@ -255,8 +255,8 @@ Made by the builder:
 ## 8. Suggested next steps
 
 1. Answer OQ-9 and OQ-4 so the main config can run end to end.
-2. Run `cli brain capture` on one candidate and confirm the field mapping in `brain_api.translate` (OQ-2). Decide OQ-12.
-3. Run `cli brain operators` to verify the operator seed list (OQ-10) and `cli brain datafields` for a catalog, so generated alphas are checked against real fields.
+2. ~~Run `cli brain capture` (OQ-2)~~ done. Decide OQ-12.
+3. ~~Run `cli brain operators` (OQ-10)~~ done. Run `cli brain datafields` for a catalog, so generated alphas are checked against real fields.
 4. Run `cli research` on a small budget once OQ-2 and OQ-9/12 are settled (section 11).
 
 ---
@@ -293,7 +293,7 @@ hypothesis ───────────────────────
 | Module | Role |
 |---|---|
 | `fastexpr.py` | Lexer and recursive-descent parser. `analyze()` returns errors, warnings, operators used, fields used, depth and call count, and never raises on bad input. Supports calls with keyword arguments, `+ - * /`, comparisons, `&&`, `||`, strings, and `name = expr;` statements. Reports everything else (such as `?:` or indexing) as an error. |
-| `config/fastexpr.yaml` | The operator list, written as signatures such as `ts_rank(x, d, constant=0)`. Arity is derived from the signature, so there is one source of truth. Also groups, base fields and constants. A seed list (OQ-10). |
+| `config/fastexpr.yaml` | The operator list, written as signatures such as `ts_rank(x, d, constant=0)`. Arity is derived from the signature, so there is one source of truth. Also groups, base fields and constants. Matches our account's operators (OQ-10). |
 | `llm.py` | `LLMClient` protocol, `ScriptedLLMClient` for tests and offline runs, `AnthropicLLMClient` for the real model (optional SDK, key from the environment). The only file that names a provider. |
 | `generator.py` | `AlphaGenerator`, prompts, JSON extraction, repair round, de-duplication, `GenerationResult.to_report()`, `load_datafields`, `load_generator_config`. |
 | `config/generator.yaml` | prompt version, repair rounds, paper length cap, hypotheses per paper, datafields shown, output cap. Complexity limits are null (OQ-11). |
@@ -326,7 +326,7 @@ hypothesis ───────────────────────
 
 **What it is.** `brain_api.py` replaces the `RealBrainClient` stub, at the owner's request. It is the only module that talks to BRAIN, and it uses only the standard library (`urllib`, `http.cookiejar`), so there is no new dependency.
 
-**Status: matches BRAIN's web app; not yet run on our account.** The API documentation is behind a login. The first version followed the API shape used by community client code. It was then checked against BRAIN's own web app, by reading the public JavaScript bundle of platform.worldquantbrain.com (section 10.1). Every translated result still carries a `brain_mapping_unverified` note until one live capture from our account confirms it.
+**Status: matches BRAIN's web app and a live capture from our account (2026-11-03).** The API documentation is behind a login. The first version followed the API shape used by community client code. It was then checked against BRAIN's own web app, by reading the public JavaScript bundle of platform.worldquantbrain.com (section 10.1). A live capture from our account then matched every mapped field (sharpe, fitness, fractions, margin in bps, sub-universe, self-correlation from `correlations/self` max, yearly rows, daily PnL as daily values); it is the fixture `tests/fixtures/brain_api_capture/`, and the `brain_mapping_unverified` note was removed.
 
 **Flow.**
 
@@ -354,7 +354,7 @@ candidate ──► POST /simulations ──► Location: .../simulations/<id>  
 | turnover, returns, max_drawdown | `is.turnover`, `is.returns`, `is.drawdown` | already fractions (`units: fraction`) |
 | margin_bps | `is.margin` | × 10,000 |
 | sub_universe_sharpe / cutoff | `LOW_SUB_UNIVERSE_SHARPE` check value / limit | none |
-| weight_concentration | `CONCENTRATED_WEIGHT` check value | unit unknown (OQ-2) |
+| weight_concentration | `CONCENTRATED_WEIGHT` check value | unit unknown (OQ-2); a PASS carries no value, so it is None |
 | self_correlation | `correlations/self` `max`, else `SELF_CORRELATION` check value | none |
 | checks | `is.checks[]` PASS → true, FAIL → false | PENDING / WARNING left out, noted |
 | yearly | `yearly-stats` rows with stage `IS` | other stages excluded, noted |
@@ -485,3 +485,32 @@ The Pre-Filter and Critic also share a list of common pitfalls: look-ahead, no n
 - `cli prompts` works.
 
 **Checks.** Full suite 433 passed. The definition-of-done greps find nothing.
+
+## 12. A model per agent, Gemini, and model comparison
+
+**Why.** All agents used to share one model. A Critic built on the same model as the Generator tends to miss the same mistakes, and the owner wanted to compare models agent by agent. The owner chose: Anthropic plus Google Gemini, generator models compared as bandit arms, and critic models compared as shadows.
+
+**What was built.**
+- `llm.py`: `GeminiLLMClient` calls Gemini's `generateContent` REST endpoint with `urllib` (no new dependency; the key comes from `GEMINI_API_KEY`, sent only in the `x-goog-api-key` header). `provider_of(model)` infers the provider from the id (`claude-*`, `gemini-*`), and `make_real_client` picks the client. Thought parts are skipped. An HTTP error, a blocked prompt or an empty reply raises `LLMUnavailable`; the empty-reply message says to raise `max_output` when thinking used the whole output cap.
+- `config/agents.yaml` has a new `models` section: `default`, `generator` (list), `critic` (list, in preference order), `shadow_critics`, and `prefilter` / `debate` / `repair` / `strategy` (null means the default). `--model` replaces the default only.
+- `research.py`:
+  - Arms are now `(dataset, region, prompt_version, generator model)`. Each generator-model arm gets its own copy of the plan's sources, so the models see the same hypotheses in the same order.
+  - The primary critic for an arm is the first listed critic from a different provider. `check_models()` refuses a config where a generator has no such critic, or a model id has an unknown provider.
+  - Shadow critics review the same batch after the primary; they never change what is simulated.
+  - One `CallCounter` is shared by every model's `BudgetedLLM`, so `--max-llm-calls` still covers everything, and the report adds `model_calls_by_model`.
+- `memory.py`: an append-only `critic_reviews` table (`put_critic_review`, `critic_reviews()`) holds every verdict, primary and shadow, with the arm's generator model.
+- `compare.py`: per-generator-model accept rates, and per-critic-model verdict counts, rule fallbacks, agreement with the primary, cleared-accept rate and flag precision. Every candidate is credited to its arm's generator model through the critic records and lineage, so repair children and critic revisions count for the arm they came from. The research report has a `comparison` section, and `cli compare` prints the same tables across all runs in memory.
+
+**Decisions taken during the build.**
+- The provider is read from the model id prefix, so config files never name a provider and the definition-of-done grep stays clean.
+- Critics are scored only on candidates whose own expression was simulated and decided. Pending decisions are left out. A primary's drops never reach BRAIN, so its false drops show up only through shadows.
+- The Debate judge, Repair, Pre-Filter and Strategy agents each take one model. No provider rule is enforced on them.
+- The Gemini model id in the config (`gemini-3.1-pro-preview`) comes from Google's documentation as of 2026-11-03, which listed several current ids. Check it before a real run.
+
+**Tests added (28).**
+- `test_llm` (10): provider inference, the Gemini request shape, thought parts skipped, six error cases, client selection.
+- `test_research` (11): two generator models become two arms with other-provider primary critics and shadows recorded; shadows don't change what is simulated; warm start credits each generator arm; `--model` replaces only the default; `used_models`; six config errors including the same-provider critic.
+- `test_compare` (6): arm attribution through lineage and critic revisions, both comparison tables, rule fallbacks, `cli compare`.
+- `test_memory` (1): `critic_reviews` is append-only and reads back.
+
+**Checks.** Full suite 461 passed (470 after the operator and universe update from our account on 2026-11-03). The definition-of-done greps find nothing.

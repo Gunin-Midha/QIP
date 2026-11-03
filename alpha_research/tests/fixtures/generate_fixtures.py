@@ -164,7 +164,7 @@ def main() -> None:
     # ---- 3 sub-universe failures (playbook entry -> repair) -------------------------
     sub_fails = [
         ("sub_01", "rank(ts_delta(est_eps, 60))", "analyst4", "analyst", 0.50, 0.73),
-        ("sub_02", "rank(-ts_skewness(returns, 60))", "pv1", "price_volume", 0.40, 0.81),
+        ("sub_02", "rank(-ts_std_dev(returns, 60))", "pv1", "price_volume", 0.40, 0.81),
         ("sub_03", "rank(news_buzz)", "news12", "sentiment", 0.65, 0.78),
     ]
     for cid, expr, ds, fam, sub, cutoff in sub_fails:

@@ -411,7 +411,7 @@
     "prompt_version": null,
     "model": null,
     "candidate_id": "sub_02",
-    "expression": "rank(-ts_skewness(returns, 60))",
+    "expression": "rank(-ts_std_dev(returns, 60))",
     "dataset": "pv1",
     "family": "price_volume",
     "hypothesis": null,

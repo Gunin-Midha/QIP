@@ -113,6 +113,21 @@ def test_variadic_operators(spec):
     assert not analyze("max(close)", spec).ok
 
 
+def test_operators_from_brain_account_list(spec):
+    # added after `cli brain operators` on our account (OQ-10)
+    for expr in ["add(close, open, vwap)", "subtract(close, open, filter=true)",
+                 "if_else(greater(close, open), 1, -1)", "and(less(close, open), not(is_nan(volume)))",
+                 "kth_element(close, 5, 2)", "rank(close) * ts_step(1)", "ts_backfill(close, 20)",
+                 "bucket(rank(cap), range=\"0.1, 1, 0.1\", skipBoth=False)"]:
+        assert analyze(expr, spec).ok, expr
+
+
+@pytest.mark.parametrize("op", ["ts_max", "ts_min", "ts_skewness", "exp", "regression_neut",
+                                "vector_neut"])
+def test_operators_not_on_brain_account_are_rejected(spec, op):
+    assert op not in spec.operators
+
+
 # ---------------------------------------------------------------- syntax errors
 
 @pytest.mark.parametrize("expr, fragment", [

@@ -15,8 +15,8 @@ Generated text is untrusted. ``analyze`` therefore never raises on bad input; it
 the problems in ``Analysis.errors`` so the generator can feed them back to the model.
 Only a malformed spec file raises (``ConfigError``).
 
-TODO(open-question) OQ-10: the operator list in config/fastexpr.yaml is a seed list that
-the owner has to verify against BRAIN's operator reference.
+The operator list in config/fastexpr.yaml was checked against our account's operators
+with ``cli brain operators`` (OQ-10).
 """
 
 from __future__ import annotations

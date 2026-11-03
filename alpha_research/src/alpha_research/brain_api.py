@@ -8,9 +8,8 @@ style objects, so no test touches the network. Only the standard library is used
 Source of the API shape: BRAIN's own web app (platform.worldquantbrain.com), inspected on
 2026-11-02. The endpoints, headers and poll handling below are the ones its bundled
 JavaScript uses, and tests/fixtures/brain_api_samples/ holds the sample responses its editor
-walkthrough ships with. TODO(open-question) OQ-2: still not checked against a live
-response from our account; every translated result carries UNVERIFIED_NOTE until a
-``cli brain capture`` confirms it.
+walkthrough ships with. The mapping was then confirmed against a live capture from our
+account on 2026-11-03 (OQ-2), saved in tests/fixtures/brain_api_capture/.
 
 Endpoints used (relative to API_ROOT; every request sends Accept: application/json;version=2.0):
 
@@ -67,8 +66,6 @@ API_ROOT = "https://api.worldquantbrain.com"
 EMAIL_ENV_VAR = "BRAIN_EMAIL"
 SECRET_ENV_VAR = "BRAIN_PASSWORD"
 ACCEPT = "application/json;version=2.0"
-UNVERIFIED_NOTE = ("brain_mapping_unverified: mapping follows BRAIN's web-app sample responses, "
-                   "not yet a live response from our account (OQ-2)")
 DATES_NOTE = ("brain_dates: candidate start/end dates are not sent; BRAIN simulates its own "
               "period (OQ-12)")
 DATAFIELD_PAGE_SIZE = 50
@@ -358,7 +355,7 @@ def _num(value, key: str, notes: list[str]) -> float | None:
 
 
 def _bps(value: float | None) -> float | None:
-    return None if value is None else value * 10_000
+    return None if value is None else round(value * 10_000, 6)  # drop float noise (4.5600000000000005)
 
 
 def _int(value) -> int | None:
@@ -442,7 +439,7 @@ def translate(simulation: dict, alpha: dict | None, yearly: dict | None = None,
     Anything missing stays None; BRAIN checks that are neither PASS nor FAIL are left out
     of ``checks`` (missing is not false) and listed in notes."""
     simulation = simulation or {}
-    notes = [UNVERIFIED_NOTE, DATES_NOTE]
+    notes = [DATES_NOTE]
     failure = _failure_message(simulation)
     if failure is not None or not alpha:
         return {"status": "failed",
@@ -494,7 +491,8 @@ def translate(simulation: dict, alpha: dict | None, yearly: dict | None = None,
         "sub_universe_sharpe": check_field("LOW_SUB_UNIVERSE_SHARPE", "value"),
         "sub_universe_cutoff": check_field("LOW_SUB_UNIVERSE_SHARPE", "limit"),
         # TODO(open-question) OQ-2: unit of CONCENTRATED_WEIGHT is unclear (sample: value
-        # 0.2, limit 1). Stored as given.
+        # 0.2, limit 1). Stored as given. Our live capture had a PASS with no value at all,
+        # so on a pass this is None (risk check "not evaluated"); BRAIN's PASS/FAIL is in checks.
         "weight_concentration": check_field("CONCENTRATED_WEIGHT", "value"),
         "self_correlation": self_correlation,
         "long_pnl": None,           # TODO(open-question) OQ-2: no long/short PnL in BRAIN's sample

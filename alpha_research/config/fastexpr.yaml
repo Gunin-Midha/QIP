@@ -1,10 +1,11 @@
 # Fast Expression language spec used by fastexpr.py to validate generated alphas.
 #
-# SEED LIST, NOT AN OFFICIAL REFERENCE (OQ-10). The owner must check every entry against
-# the operator reference on the BRAIN account and add or remove entries. The validator is
-# strict on purpose: an operator missing from this file makes the generator discard the
-# expression, and an operator that is listed here but does not exist on BRAIN would only
-# fail later, at simulation time. Correct the list here, never in code.
+# Checked against our account's operator list (`cli brain operators`, 66 operators,
+# 2026-11-03; OQ-10). Every operator here exists on BRAIN for this account, with the
+# argument list from BRAIN's own definitions. Rerun `cli brain operators` if the account
+# level changes, since BRAIN shows different operators at different levels. The validator
+# is strict on purpose: an operator missing from this file makes the generator discard the
+# expression. Correct the list here, never in code.
 #
 # Each operator is written as its signature. Arguments written as name=default are
 # optional. A trailing "..." means any number of further arguments. Arity is derived from
@@ -22,29 +23,26 @@ operators:
   - ts_corr(x, y, d)
   - ts_covariance(y, x, d)
   - ts_decay_linear(x, d, dense=false)
-  - ts_min(x, d)
-  - ts_max(x, d)
   - ts_arg_max(x, d)
   - ts_arg_min(x, d)
   - ts_product(x, d)
   - ts_av_diff(x, d)
-  - ts_backfill(x, d, k=1, ignore="NAN")
+  - ts_backfill(x, lookback, k=1)
   - ts_scale(x, d, constant=0)
   - ts_quantile(x, d, driver=gaussian)
   - ts_regression(y, x, d, lag=0, rettype=0)
   - ts_count_nans(x, d)
-  - ts_skewness(x, d)
+  - ts_step(d)
+  - kth_element(x, d, k, ignore="NaN")
   - days_from_last_change(x)
   - last_diff_value(x, d)
   # cross sectional
   - rank(x, rate=2)
   - zscore(x)
-  - scale(x, scale=1, longscale=0, shortscale=0)
+  - scale(x, scale=1, longscale=1, shortscale=1)
   - normalize(x, useStd=false, limit=0.0)
   - winsorize(x, std=4)
   - quantile(x, driver=gaussian, sigma=1.0)
-  - regression_neut(y, x)
-  - vector_neut(x, y)
   # group
   - group_neutralize(x, group)
   - group_rank(x, group)
@@ -52,11 +50,18 @@ operators:
   - group_scale(x, group)
   - group_mean(x, weight, group)
   - group_backfill(x, group, d, std=4.0)
+  # bucket takes one of range="start, end, step" or buckets="2,5,6" (quoted); the defaults
+  # below are placeholders because a signature default cannot contain a comma
+  - bucket(x, range=none, buckets=none, skipBoth=false, NaNGroup=false)
+  # arithmetic (the infix forms + - * / do the same)
+  - add(x, y, ...)
+  - subtract(x, y, filter=false)
+  - multiply(x, y, ...)
+  - divide(x, y)
   # math and logic
   - abs(x)
   - sign(x)
   - log(x)
-  - exp(x)
   - sqrt(x)
   - reverse(x)
   - inverse(x)
@@ -65,6 +70,15 @@ operators:
   - min(a, b, ...)
   - max(a, b, ...)
   - if_else(cond, a, b)
+  - and(a, b)
+  - or(a, b)
+  - not(x)
+  - equal(a, b)
+  - not_equal(a, b)
+  - greater(a, b)
+  - greater_equal(a, b)
+  - less(a, b)
+  - less_equal(a, b)
   - trade_when(trigger, alpha, exit)
   - is_nan(x)
   - densify(x)
@@ -81,4 +95,5 @@ groups: [sector, industry, subindustry, market, exchange, country]
 base_fields: [close, open, high, low, volume, vwap, returns, cap, adv20]
 
 # Bare words that are values, not datafields.
-constants: ["nan", "true", "false", "gaussian", "uniform", "cauchy"]
+# BRAIN's own docs write both true/false and True/False.
+constants: ["nan", "true", "false", "True", "False", "gaussian", "uniform", "cauchy"]

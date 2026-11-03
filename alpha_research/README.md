@@ -5,8 +5,8 @@ This is the multi-agent alpha research system: the rule-based backbone, the LLM 
 loop that connects them, and a real BRAIN API client. Only two modules reach the
 network: `llm.py` (the model) and `brain_api.py` (BRAIN). Tests and fixture runs use a
 fixture-backed BRAIN client and never touch the network. The real client follows the API
-as BRAIN's own web app uses it; it has not yet been run against our account (OQ-2, see
-"Real BRAIN client" below).
+as BRAIN's own web app uses it, and was confirmed against a live capture from our account
+on 2026-11-03 (OQ-2, see "Real BRAIN client" below).
 
 | Module | Role in the architecture |
 |---|---|
@@ -47,12 +47,14 @@ pip install -e ".[test]"
 
 Without installing, prefix commands with `PYTHONPATH=src`.
 
-The real model needs the optional extra and a key in the environment. Tests and
-`--llm scripted` need neither:
+The real models need keys in the environment, and Claude also needs the optional extra.
+Tests and `--llm scripted` need neither. Set only the keys for the providers your
+`config/agents.yaml` uses:
 
 ```bash
-pip install -e ".[llm]"
+pip install -e ".[llm]"             # Claude (claude-* model ids)
 export ANTHROPIC_API_KEY=...        # read by llm.py only; never written anywhere
+export GEMINI_API_KEY=...           # Gemini (gemini-* model ids); plain HTTPS, no extra package
 ```
 
 ## Run the tests
@@ -157,11 +159,11 @@ python -m alpha_research.cli run --client real --candidates generated/batch1.jso
 was built by reading the public JavaScript of platform.worldquantbrain.com: its endpoint
 paths, its `Accept: application/json;version=2.0` header, how it polls simulations, and the
 sample responses its editor walkthrough ships with. Those samples are kept in
-`tests/fixtures/brain_api_samples/` and the tests translate them. What is still missing is
-one live response from our account, so every result carries a `brain_mapping_unverified`
-note. Run `brain capture` on one candidate, compare the raw files in `captures/<sim id>/`
-with `translated.json` and `result.json`, fix `brain_api.translate` if anything is off, then
-close OQ-2. `captures/` is git-ignored.
+`tests/fixtures/brain_api_samples/` and the tests translate them. A live capture from our
+account (2026-11-03) matched the mapping; it is kept, redacted, in
+`tests/fixtures/brain_api_capture/` and a test translates it. If BRAIN's format changes, run
+`brain capture` again and compare `captures/<sim id>/` with `translated.json`.
+`captures/` is git-ignored.
 
 How it works: `submit` posts the candidate's settings and expression to `/simulations` and
 keeps the simulation id from the `Location` header. `poll` reports `running` while BRAIN
@@ -192,7 +194,7 @@ Simulations run one at a time (OQ-3). Alphas are never submitted for competition
 ## Research loop: all agents connected
 
 ```bash
-export BRAIN_EMAIL=... BRAIN_PASSWORD=... ANTHROPIC_API_KEY=...
+export BRAIN_EMAIL=... BRAIN_PASSWORD=... ANTHROPIC_API_KEY=... GEMINI_API_KEY=...
 python -m alpha_research.cli research --plan config/research_plan.example.yaml \
     --config <thresholds with a holdout> --max-simulations 20 --max-llm-calls 60 \
     --per-round 5 --rounds 4 --datafields captures/datafields_usa.json
@@ -201,7 +203,8 @@ python -m alpha_research.cli research --plan config/research_plan.example.yaml \
 Each round:
 
 1. **Research Director** splits `--per-round` simulation slots across the arms
-   (dataset × region × prompt version) by Thompson sampling, with a floor for every arm.
+   (dataset × region × prompt version × generator model) by Thompson sampling, with a
+   floor for every arm.
    It starts from the outcomes already in memory, so a second run continues the first.
 2. **Repair queue first**: repaired children waiting for the arm take its slots.
 3. **Alpha Generator** fills the remaining slots from the arm's next hypothesis or paper
@@ -212,7 +215,10 @@ Each round:
 5. **Critic** checks rules (a non-positive window, which reads the future, always blocks;
    a missing cross-sectional normalization is flagged), then the model reviews the batch:
    simulate, revise or drop. **Debate judge** rules on the contested ones, weighing the
-   Generator's rationale against the Critic. A revision becomes a child candidate.
+   Generator's rationale against the Critic. A revision becomes a child candidate. The
+   deciding (primary) Critic always comes from a different provider than the arm's
+   Generator; the other critic models review the same batch as **shadows** (recorded, never
+   acted on).
 6. **Pipeline** simulates on BRAIN and decides (gates, risk, diversity, pool, memory). The
    Director learns from each accept, reject or repair.
 7. **Repair Agent** turns each `repair` decision into a child with the next playbook lever
@@ -233,10 +239,37 @@ evolve every 2 rounds) are OQ-13. None of these settings changes an accept or re
 decision. A research plan lists arms with a dataset label, simulation settings,
 hypotheses and paper text files; see `config/research_plan.example.yaml`.
 
-**The model behind the agents.** Every agent that uses a model gets the same `LLMClient`
-from `llm.py`. With `--llm real` (the default) that is Claude, through `ANTHROPIC_API_KEY`
-and `--model`. `config/agents.yaml` switches the model off per agent, which leaves the rule
-checks.
+**The models behind the agents.** Each agent has its own model, set in the `models`
+section of `config/agents.yaml`. The provider comes from the model id: `claude-*` is
+Anthropic, `gemini-*` is Google (Gemini's REST API over the standard library). A null
+entry uses `models.default`, and `--model M` replaces `models.default`. `use_model: false`
+still switches an agent to rules only. All models share one `--max-llm-calls` budget, and
+the report lists calls per model.
+
+- **Generators are compared by the bandit.** Every model in `models.generator` is its own
+  arm, with its own copy of the plan's hypotheses, so the models work through the same
+  ideas and the Director moves slots toward the one that gets accepted more.
+- **Generator and Critic never share a provider.** The primary critic for an arm is the
+  first entry in `models.critic` whose provider differs from the arm's generator, so they
+  don't share blind spots. A config where some generator has no such critic is refused
+  (exit 2).
+- **Critics are compared as shadows.** With `shadow_critics: true` every other critic model
+  reviews the same batch. All verdicts go to memory (`critic_reviews`), but only the
+  primary's decides. Critics are scored on simulated candidates: how often a "simulate"
+  verdict was accepted, and how often a "revise"/"drop" flag was right. A candidate the
+  primary dropped never reaches BRAIN, so false drops can only be measured through
+  shadows. Shadows cost one extra model call per batch per extra critic.
+- **Check the Gemini ids** in `config/agents.yaml` against Google's current model list
+  (https://ai.google.dev/gemini-api/docs/models) before a real run. With thinking models,
+  thinking counts against the output cap; if a reply comes back empty with
+  `MAX_TOKENS`, raise `max_output`.
+
+The report has a `comparison` section, and `cli compare` prints the same tables from
+memory across every run so far:
+
+```bash
+python -m alpha_research.cli compare --data-dir data [--out comparison.json]
+```
 
 **Prompts.** All agent prompts are in `src/alpha_research/prompts.py` (the Generator's stay in
 `generator.py`). Each agent has a version in `PROMPT_VERSIONS`; bump it when you change its
@@ -295,9 +328,9 @@ screenshot values (aggregate plus yearly rows for 2019 to 2023).
 
 - **OQ-1 Margin definition.** BRAIN's reported margin is about half the naive
   `returns / (turnover * 252)`. Margin is recorded alongside the naive value and is not gated.
-- **OQ-2 Real BRAIN response format.** `RealBrainClient` follows BRAIN's own web app and
-  its sample responses. Confirm with one `cli brain capture` from our account, including
-  the unit of `weight_concentration` and the shape of the `daily-pnl` recordset.
+- **OQ-2 Real BRAIN response format.** Confirmed by a live capture (2026-11-03); `daily-pnl`
+  holds daily values. Still open: the unit of `weight_concentration`, because BRAIN's
+  `CONCENTRATED_WEIGHT` check carries no value when it passes.
 - **OQ-3 Concurrent simulation limit.** Account-specific. `max_concurrent` is 1 and no
   threading is implemented.
 - **OQ-4 Drawdown and concentration limits.** Policy choice.
@@ -306,9 +339,9 @@ screenshot values (aggregate plus yearly rows for 2019 to 2023).
 - **OQ-7 Minimum marginal pool Sharpe gain.** Policy choice.
 - **OQ-8 OS/IS ratio floor.** Policy choice.
 - **OQ-9 Holdout period.** The simulator refuses to run until it is set.
-- **OQ-10 Operator list.** `config/fastexpr.yaml` is a seed list. Check every operator and
-  argument count against BRAIN's operator reference. The generator discards anything not
-  listed, so a missing operator limits what it can write.
+- **OQ-10 Operator list.** Done (2026-11-03): `config/fastexpr.yaml` matches the 66
+  operators `cli brain operators` lists for our account, with BRAIN's argument lists.
+  Rerun it if the account level changes; the generator discards anything not listed.
 - **OQ-11 Expression complexity limits.** Depth, operator calls and length are `null` (not
   checked) in `config/generator.yaml` until the owner chooses them.
 - **OQ-12 Simulation period on BRAIN.** BRAIN ignores the candidate's start and end dates,

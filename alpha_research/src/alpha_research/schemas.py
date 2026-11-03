@@ -27,9 +27,9 @@ class SchemaError(ValueError):
 
 
 REGIONS = {"USA", "EUR", "ASI", "CHN", "JPN", "GLB"}
-# TODO(open-question): the spec lists these universes as examples only. Extend per region
-# once the owner confirms the full list available on the account.
-UNIVERSES = {"TOP3000", "TOP1000", "TOP500", "TOP200"}
+# Universes our account offers for USA (`cli brain options`, 2026-11-03). Only USA is
+# enabled on the account, so other regions' universes are not listed yet.
+UNIVERSES = {"TOP3000", "TOP2000", "TOP1000", "TOP500", "TOP200", "TOPSP500"}
 NEUTRALIZATIONS = {"NONE", "MARKET", "SECTOR", "INDUSTRY", "SUBINDUSTRY"}
 RESULT_STATUSES = {"complete", "failed", "timeout", "invalid"}
 DECISIONS = {"accept", "repair", "reject", "pending"}

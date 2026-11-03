@@ -26,7 +26,7 @@ PROMPT_VERSIONS = {
     "prefilter": "prefilter-v2",
     "critic": "critic-v2",
     "judge": "judge-v2",
-    "repair": "repair-v2",
+    "repair": "repair-v3",
     "strategy": "strategy-v2",
 }
 
@@ -234,7 +234,7 @@ LEVER_INSTRUCTIONS = {
     "orthogonalize_against_pool": (
         "The alpha is too correlated with alphas already in the pool (listed in <pool>). Remove "
         "the shared component while keeping the idea: for example neutralize against the "
-        "pool's common driver with regression_neut or vector_neut, apply group_neutralize "
+        "pool's common driver by keeping the residual of ts_regression(alpha, driver, d), apply group_neutralize "
         "with a finer group, or swap the input that the pool alphas share for a related "
         "field that carries the same idea."),
     "restrict_to_liquid_fields": (
