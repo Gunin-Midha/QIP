@@ -119,7 +119,8 @@ def main() -> None:
         cands.append(cand(cid, expr, ds, fam, hyp, fid, "accept", "none",
                           region="EUR" if ds == "news12" else "USA"))
 
-    # ---- 5 sharpe failures (no playbook entry -> reject) ----------------------------
+    # ---- 5 sharpe failures: near misses (|sharpe| >= 0.6 x 1.25, repair.near_miss_share in
+    # thresholds_test.yaml) go to repair, far misses are rejected ------------------------
     sharpe_fails = [
         ("shp_01", "rank(ts_delta(close, 20))", "pv1", "price_volume", 1.10, 20.0, 9.0),
         ("shp_02", "rank(cashflow_op / enterprise_value)", "fundamental6", "fundamentals", 0.95, 8.0, 7.0),
@@ -130,7 +131,8 @@ def main() -> None:
     for cid, expr, ds, fam, s, t, r in sharpe_fails:
         fid = f"sim_{cid}"
         fixtures[fid] = metrics(s, t, r)
-        cands.append(cand(cid, expr, ds, fam, None, fid, "reject", "sharpe",
+        cands.append(cand(cid, expr, ds, fam, None, fid,
+                          "repair" if abs(s) >= 0.6 * 1.25 else "reject", "sharpe",
                           region="EUR" if ds == "news12" else "USA"))
 
     # ---- 5 turnover failures (playbook has turnover -> repair) ----------------------

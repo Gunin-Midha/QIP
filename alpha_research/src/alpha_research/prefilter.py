@@ -24,9 +24,9 @@ from dataclasses import dataclass, field
 from typing import Collection
 
 from .fastexpr import (Assign, Binary, Call, ComplexityLimits, FastExprError, FastExprSpec,
-                       Name, Num, Str, Unary, analyze, parse)
+                       Name, Num, Str, Unary, analyze, catalog, parse)
 from .generator import GenerationError, ask_json
-from .llm import LLMClient
+from .llm import LLMClient, ModelDown
 from .memory import MemoryStore
 from .prompts import prefilter_system, prefilter_user
 from .schemas import CandidateRecord, experiment_hash
@@ -104,7 +104,7 @@ class PreFilter:
         self.spec = spec
         self.memory = memory
         self.llm = llm
-        self.datafields = None if datafields is None else set(datafields)
+        self.datafields = catalog(datafields)  # {id: type}: types check vec_* use
         self.limits = limits
         self.max_output = max_output
 
@@ -165,6 +165,9 @@ class PreFilter:
                                     prefilter_user(cands), max_output=self.max_output)
         except GenerationError as exc:
             out.llm_calls += 2
+            out.notes.append(f"model scoring skipped: {exc}")
+            return
+        except ModelDown as exc:
             out.notes.append(f"model scoring skipped: {exc}")
             return
         out.llm_calls += calls

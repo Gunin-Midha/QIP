@@ -47,6 +47,8 @@ def test_wrapping_levers(candidate):
     assert apply("rank_transform", candidate(expression="close - open")).expression == "rank(close - open)"
     with pytest.raises(LeverNotApplicable, match="already a rank"):
         apply("rank_transform", c)
+    with pytest.raises(LeverNotApplicable, match="already a rank"):  # rank(-rank(x)) = -rank(x)
+        apply("rank_transform", candidate(expression="-rank(ts_delta(close, 5))"))
     with pytest.raises(LeverNotApplicable, match="not in the operator list"):
         apply("wrap_in_smoothing", c, operator="no_such_op", window=5)
 
@@ -82,12 +84,16 @@ def test_repair_exhausted(memory, candidate):
     pb = Playbook({"turnover": [Lever("increase_decay", {"to": 8})]})
     out = RepairAgent(pb, SPEC, memory).repair(candidate(decay=8), decision("c1", "turnover"))
     assert out.child is None and "repair exhausted" in out.notes[-1]
-    assert "increase_decay: not applicable" in out.notes[0]
+    assert out.notes[0] == "lever order: increase_decay 0.5"
+    assert "increase_decay: not applicable" in out.notes[1]
 
 
-def test_model_lever_without_model_is_skipped(memory, playbook, candidate):
-    out = RepairAgent(playbook, SPEC, memory).repair(candidate(), decision("c1", "self_correlation"))
-    assert out.child is None and "needs the model" in out.notes[0]
+ORTHO = Playbook({"self_correlation": [Lever("orthogonalize_against_pool")]})
+
+
+def test_model_lever_without_model_is_skipped(memory, candidate):
+    out = RepairAgent(ORTHO, SPEC, memory).repair(candidate(), decision("c1", "self_correlation"))
+    assert out.child is None and any("needs the model" in n for n in out.notes)
 
 
 def test_model_lever_with_valid_reply(memory, playbook, candidate):
@@ -108,8 +114,8 @@ def test_model_lever_with_valid_reply(memory, playbook, candidate):
     ({"expression": "rank(-ts_delta(close, 5))"}, "unchanged"),
     ({"explanation": "no expression"}, "no expression"),
 ])
-def test_model_lever_bad_replies(memory, playbook, candidate, reply, match):
-    agent = RepairAgent(playbook, SPEC, memory, llm=ScriptedLLMClient([json.dumps(reply)]))
+def test_model_lever_bad_replies(memory, candidate, reply, match):
+    agent = RepairAgent(ORTHO, SPEC, memory, llm=ScriptedLLMClient([json.dumps(reply)]))
     out = agent.repair(candidate(), decision("c1", "self_correlation"))
     assert out.child is None and any(match in n for n in out.notes)
 

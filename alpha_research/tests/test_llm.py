@@ -6,7 +6,7 @@ import pytest
 
 from alpha_research.llm import (AnthropicLLMClient, GeminiLLMClient, LLMUnavailable,
                                 ChatCompletionsLLMClient, ScriptedLLMClient, make_real_client,
-                                provider_of, rate_limit_wait)
+                                list_models, provider_of, rate_limit_wait, split_hosted)
 
 
 def test_scripted_client_replays_in_order_and_records_calls():
@@ -151,7 +151,7 @@ def test_gemini_errors_are_unavailable(monkeypatch, reply, match):
     monkeypatch.setenv("GEMINI_API_KEY", "dummy")
     transport, _ = fake_transport(reply)
     with pytest.raises(LLMUnavailable, match=match):
-        GeminiLLMClient("gemini-x", transport=transport).complete("s", "u")
+        GeminiLLMClient("gemini-x", transport=transport, sleep=lambda s: None).complete("s", "u")
 
 
 def test_make_real_client_picks_the_provider(monkeypatch):
@@ -218,7 +218,52 @@ def test_hosted_strips_inline_thinking(monkeypatch):
 
 def test_hosted_rejects_an_id_without_a_maker():
     with pytest.raises(LLMUnavailable, match="not a hosted model id"):
-        ChatCompletionsLLMClient("groq:llama", api_key="dummy")
+        ChatCompletionsLLMClient("groq:mystery-model", api_key="dummy")
+
+
+def test_new_hosts_and_bare_ids():
+    assert split_hosted("groq:gpt-oss-120b") == ("groq", "openai/gpt-oss-120b")
+    assert split_hosted("github:gpt-4.1-mini") == ("github", "openai/gpt-4.1-mini")
+    assert split_hosted("groq:llama-3.3-70b-versatile") == ("groq", "llama-3.3-70b-versatile")
+    assert split_hosted("nvidia:meta/llama-3.3-70b-instruct") == \
+        ("nvidia", "meta/llama-3.3-70b-instruct")
+    assert split_hosted("gpt-oss-120b") is None          # a bare name needs a host
+    assert provider_of("groq:gpt-oss-120b") == "openai"
+    assert provider_of("nvidia:meta/llama-3.3-70b-instruct") == "meta"
+    assert provider_of("groq:llama-3.3-70b-versatile") == "meta"
+    assert provider_of("nvidia:deepseek-ai/deepseek-v3.2") == "deepseek"
+    assert provider_of("meta-llama/llama-4-scout:free") == "meta"
+    assert provider_of("gpt-5") is None
+
+
+def test_nvidia_client_sends_the_namespaced_id():
+    seen = {}
+
+    def transport(url, body, headers, timeout):
+        seen.update(url=url, body=json.loads(body), auth=headers["Authorization"])
+        return 200, json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode()
+
+    c = ChatCompletionsLLMClient("nvidia:gpt-oss-120b", api_key="k", transport=transport)
+    assert c.complete("s", "u") == "ok"
+    assert seen["url"].startswith("https://integrate.api.nvidia.com/")
+    assert seen["body"]["model"] == "openai/gpt-oss-120b" and seen["auth"] == "Bearer k"
+
+
+def test_list_models():
+    seen = {}
+
+    def transport(url, body, headers, timeout):
+        seen.update(url=url, body=body)
+        return 200, json.dumps({"data": [{"id": "b/x"}, {"id": "a/y"}, {"nope": 1}]}).encode()
+
+    assert list_models("nvidia", api_key="k", transport=transport) == ["a/y", "b/x"]
+    assert seen == {"url": "https://integrate.api.nvidia.com/v1/models", "body": None}
+    gh = lambda url, body, headers, timeout: (200, json.dumps([{"id": "openai/gpt-x"}]).encode())
+    assert list_models("github", api_key="k", transport=gh) == ["openai/gpt-x"]
+    with pytest.raises(LLMUnavailable, match="HTTP 401"):
+        list_models("groq", api_key="k", transport=lambda *a: (401, b"no"))
+    with pytest.raises(LLMUnavailable, match="unknown host"):
+        list_models("mars", api_key="k")
 
 
 @pytest.mark.parametrize("reply, match", [
@@ -235,7 +280,8 @@ def test_hosted_errors_are_unavailable(monkeypatch, reply, match):
     monkeypatch.setenv("GROQ_API_KEY", "dummy")
     transport, _ = fake_transport(reply)
     with pytest.raises(LLMUnavailable, match=match):
-        ChatCompletionsLLMClient("groq:qwen/qwen3.8-27b", transport=transport).complete("s", "u")
+        ChatCompletionsLLMClient("groq:qwen/qwen3.8-27b", transport=transport,
+                                 sleep=lambda s: None).complete("s", "u")
 
 
 # ---------------------------------------------------------------- rate limits: wait and retry
@@ -310,3 +356,36 @@ def test_rate_limit_retries_run_out(monkeypatch):
     with pytest.raises(LLMUnavailable, match="try again in 7.954s"):
         llm.complete("s", "u")
     assert len(calls) == 4 and len(slept) == 3   # RATE_LIMIT_RETRIES = 3
+
+
+GEMINI_503 = (503, json.dumps({"error": {"code": 503, "message": "This model is currently "
+                                         "experiencing high demand."}}).encode())
+
+
+def test_temporary_server_errors_are_retried_with_growing_waits(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "dummy")
+    transport, calls = sequence_transport(GEMINI_503, GEMINI_503, gemini_reply([{"text": "ok"}]))
+    slept = []
+    llm = GeminiLLMClient("gemini-x", transport=transport, sleep=slept.append)
+    assert llm.complete("s", "u") == "ok"
+    assert slept == [10.0, 30.0] and len(calls) == 3
+
+
+def test_server_error_retries_run_out(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "dummy")
+    transport, calls = sequence_transport((502, b""))
+    slept = []
+    llm = ChatCompletionsLLMClient("groq:qwen/qwen3.8-27b", transport=transport, sleep=slept.append)
+    with pytest.raises(LLMUnavailable, match="HTTP 502"):
+        llm.complete("s", "u")
+    assert slept == [10.0, 30.0, 60.0] and len(calls) == 4
+
+
+def test_client_errors_are_not_retried(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "dummy")
+    transport, calls = sequence_transport((403, b"error code: 1010\n"))
+    slept = []
+    llm = ChatCompletionsLLMClient("groq:qwen/qwen3.8-27b", transport=transport, sleep=slept.append)
+    with pytest.raises(LLMUnavailable, match="HTTP 403"):
+        llm.complete("s", "u")
+    assert slept == [] and len(calls) == 1

@@ -5,7 +5,7 @@ import yaml
 
 from alpha_research.config import ConfigError
 from alpha_research.fastexpr import (ComplexityLimits, FastExprError, FastExprSpec, analyze,
-                                     parse)
+                                     catalog, parse)
 
 from conftest import CANDIDATES_FILE, ROOT
 
@@ -223,6 +223,29 @@ def test_no_catalog_gives_a_warning_not_an_error(spec):
 def test_catalog_suggests_close_matches(spec):
     a = analyze("rank(book_valu)", spec, datafields=["book_value"])
     assert any("book_value" in e for e in a.errors)
+
+
+# BRAIN's errors in run rs20261104163055: these reached BRAIN and failed there
+@pytest.mark.parametrize("expr, fragment", [
+    ("group_rank(winsorize(close - open, 4), subindustry)",
+     "winsorize: optional arguments must be written by name (std=...)"),
+    ("rank(ts_backfill(vwap, 60, 1))", "ts_backfill: optional arguments must be written by name (k=...)"),
+])
+def test_optional_arguments_must_be_named(spec, expr, fragment):
+    assert any(fragment in e for e in analyze(expr, spec).errors)
+    named = expr.replace(", 4)", ", std=4)").replace("60, 1)", "60, k=1)")
+    assert analyze(named, spec).ok, named
+
+
+def test_event_fields_only_inside_vec_operators(spec):
+    cat = catalog(["pe_news", "assets"], {"pe_news": {"type": "VECTOR"}, "assets": {"type": "MATRIX"}})
+    assert cat == {"pe_news": "VECTOR", "assets": "MATRIX"}
+    bad = analyze("rank(-ts_delta(pe_news, 30))", spec, datafields=cat)
+    assert any("'pe_news' is an event (vector) field" in e for e in bad.errors)
+    assert analyze("rank(-ts_delta(vec_avg(pe_news), 30))", spec, datafields=cat).ok
+    assert analyze("x = vec_sum(pe_news); rank(x / assets)", spec, datafields=cat).ok
+    # a catalog without types cannot check this, so it passes as before
+    assert analyze("rank(-ts_delta(pe_news, 30))", spec, datafields=["pe_news"]).ok
 
 
 # ---------------------------------------------------------------- complexity limits

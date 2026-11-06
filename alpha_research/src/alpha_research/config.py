@@ -15,6 +15,7 @@ from typing import Any
 import yaml
 
 NOT_CONFIGURED = "not configured"
+TRIALS_SCOPES = ("lineage", "dataset", "all")
 
 
 class ConfigError(ValueError):
@@ -28,6 +29,7 @@ class GatesConfig:
     turnover_min: float | None
     turnover_max: float | None
     self_correlation_max: float | None
+    use_brain_checks: bool = False   # BRAIN's PASS/FAIL checks as hard gates (evaluator.py)
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,12 @@ class DiversityConfig:
 class AuditorConfig:
     os_is_ratio_floor: float | None
     deflation_method: str
+    # an accept is rejected when its Sharpe, deflated for the number of simulations in its
+    # repair lineage (auditor.py), is not above this; null = not checked
+    min_deflated_sharpe: float | None = None
+    # which simulations count as trials against an accept: "lineage" (its repair family),
+    # "dataset" (every simulation on the same dataset) or "all"
+    trials_scope: str = "dataset"
 
 
 @dataclass(frozen=True)
@@ -74,6 +82,18 @@ class SimulatorConfig:
     max_concurrent: int = 1
 
 
+# failure classes whose repair can be limited to near misses, and the gate each one reads
+NEAR_MISS_CLASSES = ("sharpe", "fitness")
+
+
+@dataclass(frozen=True)
+class RepairPolicy:
+    # failure class -> share of the gate threshold the failed value must reach (by absolute
+    # value, so a sign flip can rescue a negative Sharpe) for the candidate to go to repair
+    # instead of reject. A class not listed (or a null share) has no such limit.
+    near_miss_share: dict = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class Config:
     gates: GatesConfig
@@ -83,6 +103,7 @@ class Config:
     holdout: HoldoutConfig
     simulator: SimulatorConfig
     source: str = field(default="<dict>", compare=False)
+    repair: RepairPolicy = field(default_factory=RepairPolicy)
 
     def require_holdout(self) -> HoldoutConfig:
         if not self.holdout.configured:
@@ -140,6 +161,14 @@ def _int(sec: dict, section: str, key: str, *, lo: int, nullable: bool) -> int |
     return v
 
 
+def _opt_bool(sec: dict, section: str, key: str) -> bool:
+    """Optional true/false key; missing means false (configs written before the key)."""
+    v = sec.get(key, False)
+    if not isinstance(v, bool):
+        raise ConfigError(f"{section}.{key} must be true or false")
+    return v
+
+
 def _date(sec: dict, section: str, key: str) -> date | None:
     v = _key(sec, section, key)
     if v is None:
@@ -165,6 +194,7 @@ def config_from_dict(raw: Any, source: str = "<dict>") -> Config:
         turnover_min=_num(g, "gates", "turnover_min", lo=0.0, hi=1.0),
         turnover_max=_num(g, "gates", "turnover_max", lo=0.0, hi=1.0),
         self_correlation_max=_num(g, "gates", "self_correlation_max", lo=-1.0, hi=1.0),
+        use_brain_checks=_opt_bool(g, "gates", "use_brain_checks"),
     )
     if (gates.turnover_min is not None and gates.turnover_max is not None
             and gates.turnover_min > gates.turnover_max):
@@ -207,7 +237,12 @@ def config_from_dict(raw: Any, source: str = "<dict>") -> Config:
     auditor = AuditorConfig(
         os_is_ratio_floor=_num(a, "auditor", "os_is_ratio_floor"),
         deflation_method=method,
+        min_deflated_sharpe=_num(a, "auditor", "min_deflated_sharpe")
+        if "min_deflated_sharpe" in a else None,
+        trials_scope=a.get("trials_scope", "dataset"),
     )
+    if auditor.trials_scope not in TRIALS_SCOPES:
+        raise ConfigError(f"auditor.trials_scope must be one of {list(TRIALS_SCOPES)}")
 
     h = _section(raw, "holdout")
     holdout = HoldoutConfig(_date(h, "holdout", "start_date"), _date(h, "holdout", "end_date"))
@@ -226,7 +261,23 @@ def config_from_dict(raw: Any, source: str = "<dict>") -> Config:
         if "max_concurrent" in s else 1,
     )
 
-    return Config(gates, risk, diversity, auditor, holdout, simulator, source=source)
+    # optional section: configs written before it existed keep working (no near-miss limit)
+    rp = raw.get("repair") or {}
+    if not isinstance(rp, dict):
+        raise ConfigError("section 'repair' must be a mapping")
+    shares = rp.get("near_miss_share") or {}
+    if not isinstance(shares, dict):
+        raise ConfigError("repair.near_miss_share must be a mapping of failure class to share")
+    near_miss = {}
+    for cls in shares:
+        if cls not in NEAR_MISS_CLASSES:
+            raise ConfigError(f"repair.near_miss_share: {cls!r} not in {list(NEAR_MISS_CLASSES)}")
+        v = _num(shares, "repair.near_miss_share", cls, lo=0.0, hi=1.0)
+        if v is not None:
+            near_miss[cls] = v
+
+    return Config(gates, risk, diversity, auditor, holdout, simulator, source=source,
+                  repair=RepairPolicy(near_miss))
 
 
 def load_config(path: str | Path) -> Config:

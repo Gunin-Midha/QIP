@@ -6,6 +6,14 @@ every called operator must be listed with a matching argument count, every bare 
 must be a variable defined earlier in the same expression, a group, a constant, a base
 field or (when a catalog is supplied) a datafield from the catalog.
 
+Two rules follow BRAIN's own simulation errors (run rs20261104163055, 5 of 19 simulations
+lost): an optional argument (``name=default`` in the signature) must be written by name,
+since ``winsorize(x, 4)`` gives "Invalid number of inputs : 2, should be exactly 1"; and an
+event (VECTOR) datafield may appear only as the argument of a ``vec_*`` operator, since
+``ts_delta(<vector field>, 30)`` gives "Operator ts_delta does not support event inputs".
+Field types come from the catalog (``catalog(ids, meta)``); without types the second rule
+is not checked.
+
 Supported syntax: calls with positional and keyword arguments, ``+ - * /``, unary minus,
 comparisons (``< > <= >= == !=``), ``&&`` and ``||``, numbers, quoted strings, and
 ``name = expr;`` statements before the final expression. Anything else is reported as an
@@ -25,7 +33,7 @@ import difflib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Collection
+from typing import Collection, Mapping
 
 import yaml
 
@@ -307,6 +315,7 @@ class OperatorSpec:
     signature: str
     min_args: int
     max_args: int | None  # None = any number of further arguments
+    optional: tuple[str, ...] = ()  # names of the name=default arguments
 
 
 def _parse_signature(sig: str) -> OperatorSpec:
@@ -331,7 +340,9 @@ def _parse_signature(sig: str) -> OperatorSpec:
             optional_seen = True
         elif optional_seen:
             raise ConfigError(f"fastexpr: required argument after optional one in {sig!r}")
-    return OperatorSpec(name, sig.strip(), len(required), None if variadic else len(items))
+    optional = tuple(p.split("=")[0].strip() for p in items if "=" in p)
+    return OperatorSpec(name, sig.strip(), len(required), None if variadic else len(items),
+                        optional)
 
 
 @dataclass(frozen=True)
@@ -424,10 +435,29 @@ def _suggest(name: str, known: Collection[str]) -> str:
     return f" (did you mean {' or '.join(repr(c) for c in close)}?)" if close else ""
 
 
+EVENT_TYPE = "VECTOR"  # BRAIN's type for event datafields
+VEC_PREFIX = "vec_"    # operators that turn an event field into one value per day
+
+
+def catalog(datafields: Collection[str] | Mapping[str, str | None] | None,
+            meta: Mapping[str, dict] | None = None) -> dict[str, str | None] | None:
+    """Datafield catalog as {id: BRAIN type or None}. A mapping is taken as it is; a plain
+    collection of ids gets its types from ``meta`` (``generator.load_datafield_meta``)."""
+    if datafields is None:
+        return None
+    if isinstance(datafields, Mapping):
+        return dict(datafields)
+    meta = meta or {}
+    return {f: (meta.get(f) or {}).get("type") for f in datafields}
+
+
 class _Walker:
-    def __init__(self, spec: FastExprSpec, datafields: Collection[str] | None):
+    def __init__(self, spec: FastExprSpec,
+                 datafields: Collection[str] | Mapping[str, str | None] | None):
         self.spec = spec
         self.datafields = None if datafields is None else set(datafields)
+        self.events = ({f for f, t in datafields.items() if t == EVENT_TYPE}
+                       if isinstance(datafields, Mapping) else set())
         self.variables: set[str] = set()
         self.errors: list[str] = []
         self.warnings: list[str] = []
@@ -439,11 +469,11 @@ class _Walker:
         if msg not in self.errors:
             self.errors.append(msg)
 
-    def visit(self, node) -> None:
+    def visit(self, node, in_vec: bool = False) -> None:
         if isinstance(node, (Num, Str)):
             return
         if isinstance(node, Name):
-            self.name(node.name)
+            self.name(node.name, in_vec)
         elif isinstance(node, Unary):
             self.visit(node.operand)
         elif isinstance(node, Binary):
@@ -452,10 +482,13 @@ class _Walker:
         elif isinstance(node, Call):
             self.call(node)
 
-    def name(self, n: str) -> None:
+    def name(self, n: str, in_vec: bool = False) -> None:
         s = self.spec
         if n in self.variables or n in s.groups or n in s.constants:
             return
+        if n in self.events and not in_vec:
+            self.err(f"datafield {n!r} is an event (vector) field: use it only inside "
+                     f"vec_avg({n}) or vec_sum({n}), then apply other operators to that")
         if n in s.base_fields:
             self.fields.add(n)
         elif self.datafields is not None:
@@ -482,16 +515,22 @@ class _Walker:
                         f"at least {op.min_args}" if op.max_args is None else
                         f"{op.min_args} to {op.max_args}")
                 self.err(f"{node.name} takes {want} arguments, got {n} (signature: {op.signature})")
+            elif op.max_args is not None and len(node.args) > op.min_args:
+                named = ", ".join(f"{k}=..." for k in op.optional[:len(node.args) - op.min_args])
+                self.err(f"{node.name}: optional arguments must be written by name "
+                         f"({named}); signature: {op.signature}")
+        vec = node.name.startswith(VEC_PREFIX)
         for a in node.args:
-            self.visit(a)
+            self.visit(a, vec)
         for _, v in node.kwargs:
             self.visit(v)
 
 
 def analyze(expression: str, spec: FastExprSpec, *,
-            datafields: Collection[str] | None = None,
+            datafields: Collection[str] | Mapping[str, str | None] | None = None,
             limits: ComplexityLimits | None = None) -> Analysis:
-    """Check one expression. Never raises on bad input; problems go in ``errors``."""
+    """Check one expression. Never raises on bad input; problems go in ``errors``.
+    ``datafields`` with types (``catalog``) also checks that event fields sit in vec_*."""
     try:
         stmts = parse(expression)
     except FastExprError as exc:

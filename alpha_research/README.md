@@ -21,7 +21,8 @@ on 2026-11-03 (OQ-2, see "Real BRAIN client" below).
 | `diversity.py`, `pool.py` | Diversity Agent and the Alpha Pool |
 | `auditor.py` | Overfitting Auditor: variant counts, deflated Sharpe, OS/IS tracking |
 | `memory.py` | Memory Agent: append-only SQLite store |
-| `repair.py` | Repair Agent playbook (lever lookup only; levers are not applied yet) |
+| `repair.py` | Repair Agent playbook (lever lookup only; `repair_agent.py` applies them) |
+| `lever_stats.py` | lever learning: what each repair lever fixed so far (from memory) ranks the levers |
 | `orchestrator.py` | Research Director: Thompson sampling with floor quotas |
 | `research_loop.py` | Research Loop Agent: experiment ids, duplicates, lineage, queue, routing |
 | `pipeline.py`, `cli.py` | deterministic end-to-end wiring |
@@ -57,15 +58,33 @@ Tests and `--llm scripted` need neither. Set only the keys for the providers you
 # Each key is read by llm.py only and never written anywhere. `read -s` keeps it off the
 # screen and out of shell history: run it, paste the key, press Enter.
 read -s GEMINI_API_KEY && export GEMINI_API_KEY          # gemini-* ids (free tier: Flash models)
-read -s GROQ_API_KEY && export GROQ_API_KEY              # groq:<maker>/<model> ids (free plan has Qwen)
+read -s GROQ_API_KEY && export GROQ_API_KEY              # groq:... ids (free plan: Qwen, gpt-oss)
+read -s NVIDIA_API_KEY && export NVIDIA_API_KEY          # nvidia:... ids (build.nvidia.com: Llama, DeepSeek)
+read -s GITHUB_MODELS_TOKEN && export GITHUB_MODELS_TOKEN  # github:... ids (optional: hosted GPT models, ~50 calls/day)
 read -s OPENROUTER_API_KEY && export OPENROUTER_API_KEY  # plain <maker>/<model> ids (free ones end in :free)
 pip install -e ".[llm]"                                  # only for Claude (claude-* ids, paid)
 read -s ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY
 ```
 
-`config/agents.yaml` currently uses free models only: `gemini-3.6-flash` and
-`groq:qwen/qwen3.8-27b`, each critiquing the other. Keys come from aistudio.google.com
-(Gemini), console.groq.com (Groq) and openrouter.ai (OpenRouter).
+`config/agents.yaml` uses free models only (no Mistral, owner 2026-11-04): generators
+`gemini-3.6-flash`, `groq:qwen/qwen3.8-27b`, `groq:gpt-oss-120b` (the open-weight GPT
+model; ChatGPT's own API has no free tier), `nvidia:deepseek-ai/deepseek-v4.1-flash` and
+`nvidia:meta/llama-3.2-90b-vision-instruct`. Each arm's critic is the first listed model from
+another maker; Llama on NVIDIA is the default for the agents that run every round, so
+Gemini's 20 calls a day go to its own arm. Keys come from aistudio.google.com (Gemini),
+console.groq.com (Groq), build.nvidia.com (NVIDIA), github.com/settings/tokens (a
+fine-grained token with the Models read permission) and openrouter.ai (OpenRouter).
+
+Model ids change. Before a run:
+
+```bash
+PYTHONPATH=src python3 -m alpha_research.cli models --host nvidia --filter deepseek   # what a host serves
+PYTHONPATH=src python3 -m alpha_research.cli models --check   # one tiny call to every configured model
+```
+
+A hosted id is `<host>:<maker>/<model>`, or `<host>:<model>` when the name says the maker
+(`groq:gpt-oss-120b`, `groq:llama-3.3-70b-versatile`; `llm.BARE_MODEL_MAKERS`). A model
+that fails during a run is dropped for the rest of it, so a wrong id costs one call.
 
 ## Run the tests
 
@@ -218,7 +237,12 @@ Each round:
    (dataset × region × prompt version × generator model) by Thompson sampling, with a
    floor for every arm.
    It starts from the outcomes already in memory, so a second run continues the first.
-2. **Repair queue first**: repaired children waiting for the arm take its slots.
+2. **Repair queue first**: queued repair children from any arm take up to
+   `repair.max_share_per_round` (0.5) of the round's slots before the Director allocates
+   the rest, so a repair is never stranded in an arm that gets no slot. Then children
+   waiting for an arm take that arm's slots. At the start of a run, every `repair`
+   decision in memory whose child never reached BRAIN (the run stopped, or no slot) is
+   repaired again (`repair.resume_from_memory`).
 3. **Alpha Generator** fills the remaining slots from the arm's next hypothesis or paper
    (the plan's sources are used in turn).
 4. **Cheap Pre-Filter** drops invalid expressions, experiments already simulated, and near
@@ -233,8 +257,9 @@ Each round:
    acted on).
 6. **Pipeline** simulates on BRAIN and decides (gates, risk, diversity, pool, memory). The
    Director learns from each accept, reject or repair.
-7. **Repair Agent** turns each `repair` decision into a child with the next playbook lever
-   (`config/repair_playbook.yaml`), queued for the same arm.
+7. **Repair Agent** turns each `repair` decision into a child with one playbook lever
+   (`config/repair_playbook.yaml`), queued for the same arm. The lever order is learned
+   (see "Repair levers that learn" below).
 8. Every `strategy.every_rounds` rounds, **Strategy Evolution** summarizes memory, writes
    guidance for the Generator and proposes new hypotheses. They are released as a new
    prompt version (`gen-v1+evo1`, ...) on new arms, so the Director measures whether the
@@ -306,12 +331,103 @@ python -m alpha_research.cli prompts --agent critic --config config/thresholds.y
 | Pre-Filter | a 0-10 score per candidate against a fixed rubric, with a one-line reason |
 | Critic | issues by category (lookahead, sign, normalization, scale, turnover, ...), a verdict, a minimal revised expression, the test it expects to fail |
 | Debate judge | a ruling per contested candidate, decided on one question: does the criticism make the simulation fail or uninformative? |
-| Repair | exactly one lever applied, keeping the idea, with lever-specific instructions (orthogonalize, liquid fields, winsorize) |
+| Repair | exactly one lever applied, keeping the idea, with lever-specific instructions (orthogonalize, liquid fields, model_repair), every class the alpha fails, and past repairs of the class that worked |
 | Strategy | 3-6 evidence-based guidance bullets and new hypotheses, each with a direction and why it is new |
 
 Known limits: slots that the Pre-Filter or Critic empty are not refilled in the same round.
 `pending` decisions are not re-run. The Data Scientist agent is not in the loop, because it
 needs raw datafield matrices that BRAIN's API does not provide (see open questions).
+
+## Repair levers that learn
+
+The playbook lists levers per failure class. 13 are mechanical rewrites (no model):
+`increase_decay`, `tighten_truncation`, `lengthen_ts_window`, `wrap_in_smoothing`, `hump`,
+`rank_transform`, `volatility_scale`, `flip_sign` (negative Sharpe only),
+`set_neutralization` (to a finer group), `backfill_fields` (`ts_backfill` on every catalog
+field), `liquidity_tilt` (`expr * rank(adv20)`), `winsorize` and `change_universe`. The
+model levers are `orthogonalize_against_pool`, `restrict_to_liquid_fields` and, last in
+every class, `model_repair`, where the model proposes its own fix and may change decay or
+neutralization.
+
+Sharpe and fitness failures now go to repair too, but only near misses:
+`repair.near_miss_share` in `config/thresholds.yaml` (Sharpe |value| >= 0.6 x threshold,
+fitness >= 0.5 x; OQ-15). Far misses are still rejected.
+
+The order is learned. `lever_stats.py` reads every parent -> child pair in memory (nothing
+new is stored) and scores each repair: 1 if the target failure is fixed (or the child is
+accepted), 0.5 if it moved toward passing, 0 otherwise, minus 0.5 if the child broke a test
+the parent passed. A child also counts, at `secondary_weight` (0.5), for every other class its parent failed
+(so a lever aimed at sub-universe that clears concentration on the way gets credit), and a
+combination `combo:a+b+c` credits each part with a third of that weight. Per (failure
+class, lever) this updates a Beta posterior. A combination with positive evidence for a
+class becomes a lever the agent can choose for that class: its parts are applied in order
+with their playbook steps, and parts already in place are skipped. Levers are
+tried best first, and a lever that also addresses another class the alpha fails (including
+BRAIN's own failed checks, such as `CONCENTRATED_WEIGHT`) gets extra weight. With no
+evidence the playbook order is used. Settings: the `repair` section of `config/agents.yaml`
+(`order: learned | thompson | playbook`). Repairs that worked are also shown to the repair
+model as examples, so `model_repair` learns in context.
+
+```bash
+python -m alpha_research.cli repair --data-dir data --candidate-id <id> [--candidate-id <id2>] \
+    --datafields captures/datafields_usa_top3000_d1.json --out candidates/rescue.json
+python -m alpha_research.cli run --client real --candidates candidates/rescue.json --config config/thresholds.yaml
+python -m alpha_research.cli levers --data-dir data     # what each lever has fixed so far
+```
+
+`cli repair` writes one child per applicable mechanical lever (every failing class, best
+ranked first; experiments already in memory are skipped), with `parent_id` and `lever`
+set, so the results of a hand rescue become evidence for the learner too.
+
+## Pipeline guards: BRAIN checks, overfitting, repair budgets, diversity (2026-11-04)
+
+- **BRAIN's checks decide.** With `gates.use_brain_checks: true` every PASS/FAIL check BRAIN
+  reports becomes a hard gate `brain:<CHECK>`. A failed CONCENTRATED_WEIGHT is a definite
+  concentration failure even though our own limit (OQ-4) stays null; we set no limits of
+  our own for what BRAIN tests.
+- **Overfitting guard at accept.** The accepted alpha's Sharpe is deflated for the number
+  of trials (`auditor.trials_scope`: `dataset` by default = every simulation on its
+  dataset; `lineage` or `all`) and must stay above `auditor.min_deflated_sharpe` (0.0),
+  else `reject / other`. With 5 years of data this bites only with many trials, so the
+  repair budget and an out-of-sample test (OQ-12) remain the main guards.
+- **Distance to accept** = the sum of each failing class's normalized shortfall (an
+  unmeasured failure adds `repair.unmeasured_failure_penalty`). The learner's reward is half
+  "did the target class get fixed" and half "did the whole alpha get closer".
+- **Repair budget per original idea** (`config/agents.yaml` `repair`): `max_depth` 2,
+  `max_trials_per_root` 4, `patience` 2 (stop after two children that do not get closer),
+  and at most `max_resume` 3 lost repairs resumed per run, closest to accept first.
+  `cli repair` obeys it too (`--ignore-budget` to override; extra simulations still count
+  as trials).
+- **Diversity.** The Director gives no arm more than `director.max_arm_share` (0.4) of a
+  round while others are below it. The generator lists 120 fields: 70% most relevant
+  (crowding breaks ties) and 30% drawn across the other datasets, each annotated with
+  coverage, how many BRAIN alphas use it, and vector/group type, as hints, not limits
+  (`gen-v2`). Strategy Evolution sees per-dataset trial counts, the least-tried datasets and
+  the fixes that worked; its prompt (`strategy-v3`) requires at least half the new
+  hypotheses on least-tried datasets and at most one building on an accepted alpha, and a
+  hypothesis on a dataset no arm covers goes to every arm. The Critic flags neutralization
+  NONE (advisory, never blocking).
+
+## Model failover and repair fixes (2026-11-04, after run `rs20261104073248`)
+
+- **A failed model is dropped, not fatal.** A model call that still fails after the
+  client's retries (a free tier's daily quota, an outage) marks that model down for the
+  rest of the run (`llm.ModelDown`, report `models_down`). Its generator arms get no more
+  slots; critics switch to the next critic from another provider, else to rules only; the
+  judge, Pre-Filter, Repair and Strategy agents switch to the next model that is up, else to
+  their rules. The run stops only when every generator model is down.
+- **Repair children skip the Critic's model and the judge.** They get the rule checks only,
+  so what BRAIN measures is exactly what the lever changed.
+- **Lever order rules:** `flip_sign` first (applies only to negative Sharpe), `model_repair`
+  last (the catch-all); everything between is ordered by the learned scores.
+
+## Validator and round fixes (2026-11-04, after run `rs20261104163055`)
+
+- `fastexpr.analyze` requires optional arguments by name (`winsorize(x, std=4)`, `ts_backfill(x, 60, k=1)`) and, with a typed catalog (`fastexpr.catalog(ids, meta)`), allows an event (VECTOR) field only inside `vec_avg`/`vec_sum`. Both were BRAIN errors in that run (5 of 19 simulations).
+- `rank_transform` treats `-rank(x)` as already ranked.
+- Slots of a generator model that goes down mid-round, and (for `director.refill_passes` extra passes) slots emptied by the Generator, Pre-Filter or Critic, go back to the Director in the same round.
+- A Strategy hypothesis on a catalog dataset no arm covers gets its own arms; a candidate's `dataset` follows its fields (`generator.signal_dataset`).
+- Critic and judge (`critic-v3`, `judge-v3`) revise fixable defects instead of dropping them.
 
 ## Regenerating fixtures
 
@@ -326,7 +442,8 @@ screenshot values (aggregate plus yearly rows for 2019 to 2023).
 ## Decision rules worth knowing
 
 - A hard gate that definitely failed beats one that cannot be evaluated. For example,
-  Sharpe 1.10 with self-correlation not yet computed gives `reject / sharpe`, not `pending`.
+  Sharpe 0.50 with self-correlation not yet computed gives `reject / sharpe`, not `pending`
+  (Sharpe 1.10 gives `repair / sharpe`: a near miss).
   A risk veto also beats `pending`.
 - Domain errors in a single candidate (unknown region, unbalanced parentheses, holdout
   overlap) become a `status="invalid"` result and then `reject / incomplete`, and the run
@@ -362,6 +479,13 @@ screenshot values (aggregate plus yearly rows for 2019 to 2023).
   open for later: how to test alphas on the holdout itself.
 - **OQ-13 Agent defaults.** `config/agents.yaml` ships with builder defaults so the loop
   works: near-duplicate similarity 0.9 and Strategy Evolution every 2 rounds. Review them.
+- **OQ-15 Repair near misses.** Builder defaults (2026-11-04): Sharpe and fitness failures go
+  to repair when |value| >= 0.6 / 0.5 of the threshold (`repair.near_miss_share` in
+  `config/thresholds.yaml`). Review them, and the lever-learning settings in the `repair`
+  section of `config/agents.yaml`.
+- **OQ-16 Overfitting and repair budget defaults.** `auditor.min_deflated_sharpe` 0.0 with
+  `trials_scope: dataset`; repair `max_depth` 2, `max_trials_per_root` 4, `patience` 2;
+  `director.max_arm_share` 0.4; generator `datafield_exploration_share` 0.3. Review them.
 - **OQ-14 Data Scientist input.** The datafield audit needs a dates × instruments matrix
   per field. BRAIN's API (as far as the web app shows) does not provide raw data, so decide
   the source: BRAIN's per-field statistics, an outside data source, or probe simulations.

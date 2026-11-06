@@ -1,11 +1,12 @@
 # Alpha Generator settings (Phase 3). Technical limits have values. Policy limits are
 # null (= not configured, the check is skipped) until the owner decides (OQ-11).
 generator:
-  prompt_version: gen-v1       # written to CandidateRecord.prompt_version; bump when prompts change
+  prompt_version: gen-v2       # written to CandidateRecord.prompt_version; bump when prompts change
   max_repair_rounds: 1         # times rejected expressions are sent back to the model for a fix
   max_paper_chars: 120000      # longer papers are cut to this many characters (null = no cut)
   max_hypotheses_per_paper: 5  # hypotheses extracted from one paper
-  max_datafields_in_prompt: 300  # most relevant catalog fields listed in the prompt
+  max_datafields_in_prompt: 120  # catalog fields listed in the prompt (was 300; a shorter prompt fits Groq's free per-minute limit)
+  datafield_exploration_share: 0.3  # of those, drawn across all datasets, not by relevance (diversity)
   max_output: 4096             # output cap for one model call
 
   # Complexity limits for generated expressions (OQ-11, policy choice)

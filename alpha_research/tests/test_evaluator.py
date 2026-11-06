@@ -28,9 +28,27 @@ def test_gate_order(config):
                      "weight_concentration", "drawdown"]
 
 
-def test_sharpe_failure_rejects(config, playbook):
-    d = evaluate(passing(sharpe=1.10), config, playbook)
+def test_sharpe_far_miss_rejects(config, playbook):
+    d = evaluate(passing(sharpe=0.50), config, playbook)
     assert (d.decision, d.failure_class) == ("reject", "sharpe")
+    assert any("too far from 1.25 to repair" in r for r in d.reasons)
+
+
+@pytest.mark.parametrize("sharpe", [1.10, 0.75, -0.90])
+def test_sharpe_near_miss_repairs(config, playbook, sharpe):
+    # near_miss_share.sharpe = 0.6 -> |sharpe| >= 0.75 goes to repair (a sign flip for -0.90)
+    d = evaluate(passing(sharpe=sharpe), config, playbook)
+    assert (d.decision, d.failure_class) == ("repair", "sharpe")
+
+
+def test_fitness_near_miss(config, playbook):
+    assert evaluate(passing(fitness=0.73), config, playbook).decision == "repair"
+    assert evaluate(passing(fitness=0.40), config, playbook).decision == "reject"
+
+
+def test_no_near_miss_limit_repairs_every_failure(make_config, playbook):
+    config = make_config(repair__near_miss_share={})
+    assert evaluate(passing(sharpe=0.10), config, playbook).decision == "repair"
 
 
 def test_turnover_failure_repairs(config, playbook):
@@ -69,8 +87,10 @@ def test_self_correlation_none_is_pending(config, playbook):
 
 
 def test_definite_failure_beats_pending(config, playbook):
-    d = evaluate(passing(sharpe=1.0, self_correlation=None), config, playbook)
+    d = evaluate(passing(sharpe=0.5, self_correlation=None), config, playbook)
     assert (d.decision, d.failure_class) == ("reject", "sharpe")
+    d = evaluate(passing(sharpe=1.0, self_correlation=None), config, playbook)
+    assert (d.decision, d.failure_class) == ("repair", "sharpe")   # near miss
 
 
 def test_timeout_rejects_incomplete(config, playbook):

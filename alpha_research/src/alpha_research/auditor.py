@@ -21,6 +21,21 @@ Portfolio Management. TODO(citation): confirm the exact reference used in the wr
 This is an approximation: it treats variants as independent, although variants in one
 family are usually correlated, so N overstates the effective number of trials. The
 write-up should say so.
+
+Accept-time guard (``check_accept``, owner 2026-11-04: "ensure no overfitting"). N is the
+number of simulations that count as trials against the accepted alpha, by
+``auditor.trials_scope``:
+  lineage  its repair family: the original candidate and every descendant that reached
+           BRAIN (``research_loop.lineage_members``); catches over-repairing one idea
+  dataset  every simulation on the same dataset (default); also catches searching one
+           dataset with many generated ideas, so hammering one dataset raises its bar,
+           which keeps the search spread out
+  all      every simulation in memory (most conservative)
+Invalid results do not count. T comes from the daily PnL (trading days / 252), else from
+the yearly rows. The accept stands only if the deflated Sharpe is above
+``auditor.min_deflated_sharpe``; null = not checked. With five years of data the
+deflation is modest until N is large (Sharpe 1.3 needs about 40 trials to fall below 0),
+so the repair budget and an out-of-sample test (OQ-12) remain the main guards.
 """
 
 from __future__ import annotations
@@ -29,8 +44,12 @@ import math
 
 from scipy.stats import norm
 
-from .config import Config
+from .config import NOT_CONFIGURED, Config
 from .memory import MemoryStore
+from .research_loop import lineage_members, lineage_root, simulated
+from .schemas import GateResult, ResultRecord
+
+TRADING_DAYS = 252
 
 EULER_GAMMA = 0.5772
 UNKNOWN_FAMILY = "__unknown__"
@@ -70,6 +89,39 @@ class Auditor:
     def deflate(self, sharpe: float, family: str | None, years: float) -> float:
         return deflated_sharpe(sharpe, max(self.variant_count(family), 1), years)
 
+    def lineage_trials(self, candidate_id: str) -> int:
+        """Simulations in the candidate's repair lineage, the candidate included."""
+        return self.trials(candidate_id, "lineage")
+
+    def trials(self, candidate_id: str, scope: str | None = None) -> int:
+        """Simulations that count as trials against the candidate (module doc)."""
+        scope = scope or self.config.auditor.trials_scope
+        outcomes = self.memory.candidate_outcomes()
+        cands = {r["candidate"].candidate_id: r["candidate"] for r in outcomes}
+        if scope == "lineage":
+            rows = lineage_members(outcomes, lineage_root(candidate_id, cands))
+        elif scope == "dataset":
+            ds = cands[candidate_id].dataset if candidate_id in cands else None
+            rows = [r for r in outcomes if r["candidate"].dataset == ds]
+        else:
+            rows = outcomes
+        return max(1, sum(1 for r in rows if simulated(r)))
+
+    def check_accept(self, candidate_id: str, result: ResultRecord) -> GateResult:
+        floor = self.config.auditor.min_deflated_sharpe
+        scope = self.config.auditor.trials_scope
+        n = self.trials(candidate_id)
+        years = backtest_years(result)
+        if floor is None:
+            return GateResult("deflated_sharpe", None, None, None, NOT_CONFIGURED)
+        if result.sharpe is None or years is None:
+            return GateResult("deflated_sharpe", None, None, floor,
+                              "Sharpe or backtest length missing")
+        d = deflated_sharpe(result.sharpe, n, years)
+        return GateResult("deflated_sharpe", d > floor, round(d, 4), floor,
+                          f"Sharpe {result.sharpe} deflated for {n} simulation(s) "
+                          f"(scope {scope}) over {years:.2f} years")
+
     def record_os_is(self, alpha_id: str, family: str | None, is_sharpe: float | None,
                      os_sharpe: float | None) -> float | None:
         self.memory.record_os_is(alpha_id, family or UNKNOWN_FAMILY, is_sharpe, os_sharpe)
@@ -95,3 +147,12 @@ def os_is_ratio(is_sharpe: float | None, os_sharpe: float | None) -> float | Non
     if is_sharpe is None or os_sharpe is None or is_sharpe <= 0:
         return None
     return os_sharpe / is_sharpe
+
+
+def backtest_years(result: ResultRecord) -> float | None:
+    if result.daily_pnl is not None and len(result.daily_pnl) > 1:
+        return len(result.daily_pnl) / TRADING_DAYS
+    if result.yearly:
+        return float(len(result.yearly))
+    return None
+

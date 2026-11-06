@@ -310,6 +310,27 @@ def test_catalog_rejects_unknown_fields(spec, settings, cfg):
     assert "unknown datafield 'made_up_field'" in res.rejected[0].errors[0]
 
 
+def test_catalog_types_reject_bare_event_fields(spec, settings, cfg):
+    meta = {"pe_news": {"type": "VECTOR", "dataset": "news12"}}
+    llm = ScriptedLLMClient([alphas("rank(ts_delta(pe_news, 30))", "rank(ts_delta(vec_avg(pe_news), 30))")])
+    res = make(llm, spec, settings, replace(cfg, max_repair_rounds=0), datafields=["pe_news"],
+               field_meta=meta).generate(Source("hypothesis", HYP), 2, batch_id="b")
+    assert [c.expression for c in res.candidates] == ["rank(ts_delta(vec_avg(pe_news), 30))"]
+    assert "event (vector) field" in res.rejected[0].errors[0]
+
+
+def test_candidate_dataset_follows_its_fields(spec, settings, cfg):
+    meta = {"pe_news": {"type": "MATRIX", "dataset": "news12"},
+            "eps": {"type": "MATRIX", "dataset": "analyst4"},
+            "vol_x": {"type": "MATRIX", "dataset": "pv1"}}
+    llm = ScriptedLLMClient([alphas("rank(pe_news / close)", "rank(eps - vol_x)", "rank(close)")])
+    res = make(llm, spec, settings, cfg, datafields=list(meta), field_meta=meta).generate(
+        Source("hypothesis", HYP), 3, batch_id="b")
+    # base fields (close) do not count; a tie keeps the arm's dataset (pv1)
+    assert [c.dataset for c in res.candidates] == ["news12", "pv1", "pv1"]
+    assert "dataset news12 (from its fields; the arm's is pv1)" in res.warnings["b_001"]
+
+
 def test_without_a_catalog_unknown_fields_pass_with_a_warning(spec, settings, cfg):
     res = make(ScriptedLLMClient([alphas("rank(book_value)")]), spec, settings, cfg).generate(
         Source("hypothesis", HYP), 1, batch_id="b")
@@ -319,7 +340,7 @@ def test_without_a_catalog_unknown_fields_pass_with_a_warning(spec, settings, cf
 
 def test_system_prompt_lists_rules_operators_and_relevant_fields(spec, cfg):
     catalog = ["zzz_other", "book_value", "yyy_other", "free_cash_flow", "aaa_other"]
-    small = replace(cfg, max_datafields_in_prompt=2)
+    small = replace(cfg, max_datafields_in_prompt=2, datafield_exploration_share=0.0)
     prompt = build_system_prompt(spec, catalog, "book value and cash flow", small)
     assert "ts_delta(x, d)" in prompt and "subindustry" in prompt
     assert "Never use future data" in prompt
@@ -327,6 +348,34 @@ def test_system_prompt_lists_rules_operators_and_relevant_fields(spec, cfg):
     assert "zzz_other" not in prompt and "2 of 5 shown" in prompt
     nocat = build_system_prompt(spec, None, "", cfg)
     assert "No datafield catalog was supplied" in nocat
+
+
+def test_exploration_fields_span_other_datasets_and_carry_hints(spec, cfg):
+    from alpha_research.generator import select_datafields
+    catalog = [f"{ds}_f{i}" for ds in ("opt", "fnd", "news", "anl") for i in range(10)]
+    meta = {f: {"dataset": f.split("_")[0], "coverage": 0.5, "alpha_count": 7} for f in catalog}
+    rel, exp = select_datafields(catalog, "opt options", 12, 0.5, meta)
+    assert len(rel) == 6 and all(f.startswith("opt_") for f in rel)
+    assert len(exp) == 6 and not set(exp) & set(rel)
+    assert {f.split("_")[0] for f in exp} >= {"fnd", "news", "anl"}   # breadth, not one dataset
+    assert select_datafields(catalog, "opt options", 12, 0.5, meta) == (rel, exp)   # stable
+    meta["fnd_f1"]["type"] = "SYMBOL"
+    meta["news_f2"]["type"] = "VECTOR"
+    _, exp2 = select_datafields(catalog, "opt options", 39, 1.0, meta)   # every eligible field
+    assert "fnd_f1" not in exp2 and "news_f2" in exp2
+    from alpha_research.generator import _annotate
+    assert _annotate("news_f2", meta) == "news_f2 [vector: wrap in vec_avg or vec_sum, cov 50%, 7 alphas]"
+    prompt = build_system_prompt(spec, catalog, "opt options",
+                                 replace(cfg, max_datafields_in_prompt=12,
+                                         datafield_exploration_share=0.5), meta=meta)
+    assert "opt_f0 [cov 50%, 7 alphas]" in prompt and "From across the other datasets" in prompt
+    assert "Hints, not limits" in prompt
+
+
+def test_crowding_breaks_relevance_ties():
+    from alpha_research.generator import _rank_datafields
+    meta = {"book_a": {"alpha_count": 900}, "book_b": {"alpha_count": 3}}
+    assert _rank_datafields(["book_a", "book_b"], "book", 1, meta) == ["book_b"]
 
 
 # ------------------------------------------------------------------ outputs and loaders

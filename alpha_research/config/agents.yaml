@@ -19,6 +19,20 @@ debate:
 
 repair:
   use_model: true                  # for levers with no mechanical rewrite (orthogonalize, ...)
+  # Lever learning (lever_stats.py). Builder defaults 2026-11-04; none changes a decision.
+  order: learned                   # learned (posterior mean from memory) | thompson | playbook
+  secondary_weight: 0.5            # weight of a lever's record for the alpha's other failing classes
+  prior: [1, 1]                    # Beta prior per (failure class, lever)
+  examples_in_prompt: 3            # past repairs that worked, shown to the repair model
+  resume_from_memory: true         # at start, re-repair parents whose child was never simulated
+  max_resume: 3                    # ... at most this many, closest to accept first
+  max_share_per_round: 0.5         # queued repairs take up to this share of a round's slots first
+  # Lineage budget (owner 2026-11-04: repairs must not concentrate on the few near misses;
+  # every repair simulation also counts against the alpha in the overfitting check)
+  max_depth: 2                     # repair generations below the original candidate
+  max_trials_per_root: 4           # repair simulations per original candidate
+  patience: 2                      # stop a lineage after this many children that do not get closer
+  unmeasured_failure_penalty: 0.5  # distance to accept added by a failure with no value
 
 strategy:
   every_rounds: 2                  # OQ-13: evolve after every 2nd round; 0 = never
@@ -27,30 +41,45 @@ strategy:
 
 director:
   floor_share: 0.2                 # spec 13.1 default: share of each round reserved as floor slots
+  max_arm_share: 0.4               # no arm gets more than this share of a round while others are below it
+  refill_passes: 1                 # slots emptied by Pre-Filter/Critic drops go back to the Director this many extra times per round (slots of a model that went down always do)
 
 max_output: 4096                   # output cap for one model call
 
 # Model per agent. The provider comes from the model id (claude-*, gemini-* or a hosted
-# maker/model id; the key for each is read in llm.py, see README). A null entry uses
-# models.default; `cli research --model M` replaces models.default wherever it is used.
-# Check the ids against each host's current model list before a real run (they change often).
+# id; the key for each is read in llm.py, see README). A null entry uses models.default;
+# `cli research --model M` replaces models.default wherever it is used.
 #
-# Owner's choice (2026-11-03): free API keys only for now. gemini-3.6-flash is on Google's
-# free tier (first real call worked 2026-11-03); groq:qwen/qwen3.8-27b is on Groq's free
-# plan. Both have small daily limits, so shadow critics are off to save calls. To bring
-# Claude back later (paid): add claude-opus-5-5 to generator and critic, e.g. as default.
-# Hosted ids: groq:<maker>/<model> runs on Groq; a plain <maker>/<model> runs on OpenRouter
-# (its free models end in :free).
+# Owner's choice: free API keys only (2026-11-03); no Mistral, add GPT, Llama and DeepSeek
+# (2026-11-04). Hosted ids: <host>:<maker>/<model>, or <host>:<model> when the name says the
+# maker (groq:gpt-oss-120b). Hosts: groq, nvidia (build.nvidia.com), github (GitHub Models:
+# the hosted GPT models, ~50 calls/day) and OpenRouter for a plain <maker>/<model>; each
+# host's key variable is listed in README.
+# Ids change often: before a run, `cli models --host nvidia --filter deepseek` lists what a
+# host serves and `cli models --check` sends one tiny call to every model below. A model
+# that fails during a run is dropped for the rest of it (research.py), so one bad id or
+# spent quota does not stop the run.
+# Load is spread so Gemini's 20 calls/day go only to its own generator arm and the
+# last-resort critic: the agents that run every round and Strategy use gpt-oss on Groq
+# (about 1,000 calls/day). NVIDIA (Llama, DeepSeek) is left out: on 2026-11-04 its chat
+# endpoint answered nothing in 120 s, even to plain curl, while its model list worked. To
+# retry later, add nvidia:meta/llama-3.2-90b-vision-instruct and
+# nvidia:deepseek-ai/deepseek-v4.1-flash back and run `cli models --check`.
 models:
-  default: gemini-3.6-flash
+  default: groq:gpt-oss-120b
   generator:                       # every generator model is its own Director arm
     - gemini-3.6-flash
     - groq:qwen/qwen3.8-27b
+    - groq:gpt-oss-120b            # the open-weight GPT model (ChatGPT's own API has no free tier)
+    - nvidia/nemotron-3-ultra-550b-a55b:free   # OpenRouter (~50 free calls/day for all its
+                                               # free models): generator only, owner 2026-11-04;
+                                               # stands in while no free host serves Llama/DeepSeek
   critic:                          # preference order; an arm's primary critic is the first one
-    - groq:qwen/qwen3.8-27b        # from a different provider than the arm's generator
+    - groq:gpt-oss-120b            # from a different provider than the arm's generator that
+    - groq:qwen/qwen3.8-27b        # is not down
     - gemini-3.6-flash
   shadow_critics: false            # true = the other critics review every batch too (recorded only)
   prefilter: null
   debate: null
   repair: null
-  strategy: gemini-3.6-flash
+  strategy: groq:gpt-oss-120b

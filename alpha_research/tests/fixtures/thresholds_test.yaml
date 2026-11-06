@@ -7,6 +7,7 @@ gates:
   turnover_min: 0.01
   turnover_max: 0.70
   self_correlation_max: 0.70
+  use_brain_checks: true    # every PASS/FAIL check BRAIN reports is a hard gate (owner, 2026-11-04)
 
 risk:
   max_drawdown: 0.15              # test placeholder (OQ-4)
@@ -25,10 +26,25 @@ diversity:
 auditor:
   os_is_ratio_floor: null
   deflation_method: "expected_max_normal"
+  # Overfitting guard (owner 2026-11-04: ensure no overfitting; values are builder defaults,
+  # OQ-16). An accept is rejected unless its Sharpe, deflated for the number of trials
+  # (auditor.py), stays above min_deflated_sharpe. trials_scope: lineage (its repair
+  # family) | dataset (every simulation on its dataset) | all.
+  min_deflated_sharpe: 0.0
+  trials_scope: dataset
 
 holdout:
   start_date: 2024-01-01          # test placeholder (OQ-9)
   end_date: 2025-12-31
+
+# Repair (OQ-15, builder defaults 2026-11-04; owner to review). A failed Sharpe or fitness
+# gate goes to the Repair Agent only when the failed value reaches this share of the gate's
+# threshold, by absolute value (so -0.9 counts as close: a sign flip can rescue it). Further
+# away it is rejected, so repairs are spent on near misses. null = no limit.
+repair:
+  near_miss_share:
+    sharpe: 0.6     # Sharpe |value| >= 0.6 x sharpe_min (0.75 with sharpe_min 1.25)
+    fitness: 0.5    # fitness |value| >= 0.5 x fitness_min
 
 simulator:
   max_poll_seconds: 600

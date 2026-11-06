@@ -532,7 +532,7 @@ Run `rs20261103171304`: `cli research` with the example plan, `--max-simulations
 - `group_rank(ts_delta(cash_flow_from_operations / max(assets, 1), 252), subindustry)`: Sharpe -0.76, so reject / sharpe. Qwen had noted "expected to fail: sharpe" but did not block it.
 - The run stopped on Groq's free limit of 7,000 input tokens per minute: the generator prompt is about 3,350 tokens, about 2,400 of them the 300 listed datafields. 2 simulations and 7 model calls used.
 - Built after this run: the Gemini and hosted clients now wait and retry on HTTP 429 when the host says how long (`try again in 7.954s`, `1m30s`, `450ms`, or Gemini's `retryDelay`), if the wait is at most 60 s, up to 3 times, logging each wait (`llm.rate_limit_wait`, `_post_json`). A longer wait (a daily quota) or a 429 with no wait still stops the run. Retries are inside one `complete` call, so the budget counts one call. Tests: parsing, retry then success for Groq and Gemini, no sleep for long or unknown waits, retries running out.
-- Still proposed, not built: pause a rate-limited model instead of stopping the run; `max_datafields_in_prompt` 300 to about 80; more free hosts (Mistral; NVIDIA NIM as a second Qwen host). Owner question: should a candidate that also fails Sharpe or fitness still go to repair for a higher-priority failure class?
+- Still proposed, not built: ~~pause a rate-limited model instead of stopping the run~~ (done 2026-11-04, model failover); `max_datafields_in_prompt` 300 to about 80; more free hosts (Mistral; NVIDIA NIM as a second Qwen host). Owner question: should a candidate that also fails Sharpe or fitness still go to repair for a higher-priority failure class?
 - `SETUP.md` at the repo root explains how teammates set the system up on their own laptops.
 
 ### Second research run (2026-11-03)
@@ -543,3 +543,99 @@ Run `rs20261103175655`, same command, after the 429 wait-and-retry. It reached t
 - Best candidate: `rank(ts_corr(returns, cash_flow_from_operations / assets, 21)) * sign(cash_flow_from_operations / assets)`, Sharpe 1.14, fitness 1.36, sub-universe 0.12 against 0.49, drawdown 30%. Gemini's critic proposed wrapping it in `rank`; the Debate judge kept the original. Rulings are not in the report.
 - `rank(ts_delta(cash_flow_from_operations, 21) / assets)` with neutralization NONE: returns 38%, drawdown 67%, fitness 1.45 above Sharpe 0.83, which points to a market or concentration bet. It was rejected for Sharpe; with `risk.max_drawdown` null (OQ-4) the drawdown itself was not checked.
 - All hypotheses came from the example plan, so every idea was a reversal or cash-flow variant.
+
+### Research plan v1 and third run (2026-11-04)
+
+`config/research_plan.v1.yaml` replaces the example plan's reversal and cash-flow ideas with less crowded data and documented signals: options (call-put implied-volatility spread, rising put fear, put/call volume), analyst estimates (EPS revisions, forward earnings yield) and risk/links (idiosyncratic volatility, customer momentum, earnings-news sentiment). Every field the hypotheses name exists in our catalog; neutralization is SUBINDUSTRY or INDUSTRY.
+
+Run `rs20261103184506` (`--max-simulations 18 --max-llm-calls 60 --per-round 6 --rounds 3`) stopped after 2 simulations when Gemini returned HTTP 503 ("high demand"), which the 429 retry does not cover. Both simulated alphas came from the IV-spread hypothesis:
+- `spread = divide(subtract(implied_volatility_call_60, implied_volatility_put_60), add(implied_volatility_mean_60, 0.001)); group_zscore(ts_decay_linear(spread, 10), subindustry)`: Sharpe 2.20, fitness 1.43, turnover 21.5%, self-correlation 0.31, drawdown 4.2%, yearly Sharpe 0.95 / 1.91 / 3.19 / 2.98 / 1.55. Failed sub-universe (0.55 against 0.95) and BRAIN's CONCENTRATED_WEIGHT check (0.1538). Decision repair / sub_universe; the repair call hit the 503, so no child was queued.
+- `group_rank(ts_mean(implied_volatility_call_30 - implied_volatility_put_30, 5), subindustry)`: Sharpe 1.64, fitness 0.73, sub-universe 0.37 against 0.71. Reject / fitness.
+
+Paused to-do, in order: retry HTTP 500/502/503/504 with growing waits; rescue the first alpha by hand with `cli run --client real` (backfilled IV fields and `rank` for concentration; a liquidity tilt or TOP1000 for sub-universe); set `risk.weight_concentration_max`.
+
+### Why the close alphas were not repaired, and the learning Repair Agent (2026-11-04)
+
+Diagnosis from memory (10 real simulations over three runs). No repair child ever reached BRAIN:
+- Run 1: the reversal alpha's orthogonalized child was queued, then the run stopped on Groq's rate limit. The queue lived in memory only, so the child was lost.
+- Run 2: a child was queued, but the Director gave every round-2 slot to another arm (floors round to 0 at 3 slots over 4 arms), so it never ran.
+- Run 3: the IV-spread alpha (Sharpe 2.20) went to repair / sub_universe. That class had one lever, a model lever (`restrict_to_liquid_fields`), and the model call hit Gemini's 503.
+- The other two near misses never reached the Repair Agent. The playbook had no `sharpe` or `fitness` entry, so Qwen's cash-flow alpha (Sharpe 1.14 against 1.25) and the 30-day IV sibling (fitness 0.73 against 1.0) were rejected outright.
+- Concentration was invisible: BRAIN failed CONCENTRATED_WEIGHT (0.154) on the IV alpha, but `risk.weight_concentration_max` is null (OQ-4), and the agent only looked at the single highest-priority class.
+- Nothing learned: the lever order was fixed, and no lever's past results were used.
+
+Built:
+- Model clients retry HTTP 500/502/503/504 after 10 s, 30 s and 60 s (`llm.SERVER_ERROR_WAITS_SECONDS`).
+- `repair.near_miss_share` (thresholds.yaml, OQ-15): Sharpe and fitness failures go to repair when |value| >= 0.6 / 0.5 of the threshold. Three fixture candidates (shp_01, shp_02, shp_04) moved from reject to repair.
+- Six new mechanical levers: `flip_sign`, `set_neutralization`, `backfill_fields`, `liquidity_tilt`, `winsorize` (now mechanical) and `change_universe`. There is also a `model_repair` lever at the end of every class. The playbook now covers sharpe, fitness, turnover, concentration, self_correlation, sub_universe and drawdown with 4 to 6 levers each.
+- `lever_stats.py`: lever evidence from parent -> child pairs in memory (reward 1 fixed / 0.5 improved / 0, minus 0.5 for collateral failures), a Beta posterior per (class, lever), and a ranking that adds weight for the alpha's other failing classes, including BRAIN's own failed checks. Past successful repairs go into the repair prompt (`repair-v4`).
+- Research loop: queued repairs take up to half of each round's slots first. Repair decisions whose child never ran are re-repaired at the start of a run. The report has `resumed_repairs` and `lever_stats`.
+- `cli repair` (one child per applicable lever, for hand rescues) and `cli levers` (the learned table).
+
+Hand rescue, ready to run: `candidates/rescue_20261104.json`, 10 single-lever or combination children of the three alphas. IV spread: backfill, liquidity tilt, TOP1000, and backfill+rank+tilt. 30-day IV: decay 10, window 10, and window 20+tilt. Cash flow: SUBINDUSTRY, INDUSTRY, and SUBINDUSTRY+backfill. Their results will be the first evidence for the learner.
+
+### Hand rescue, round 1 results and learner fixes (2026-11-04)
+
+`candidates/rescue_20261104.json` on real BRAIN, 10 simulations, 1 accept:
+- IV spread. Backfill: Sharpe 2.03, fitness 1.67, turnover 12%, CONCENTRATED_WEIGHT passes, sub-universe 0.54 against 0.88. Liquidity tilt: 2.08 / 1.50, sub-universe 0.66 against 0.90, concentration still fails. TOP1000: sub-universe passes but Sharpe 0.99. **Backfill + rank + tilt: accepted** with Sharpe 1.38, fitness 1.01, sub-universe 0.81 against 0.60, self-correlation 0.26 and drawdown 4.4%; it is in the pool. The accept is thin: fitness is barely over 1.0, yearly Sharpe is 1.84 / 3.26 / 1.05 / 0.72 / 0.74, and BRAIN's self-correlation is pending until submission. BRAIN's sub-universe cutoff is about 0.43 x the alpha's own Sharpe, so part of the pass came from the lower Sharpe.
+- 30-day IV sibling. Decay 10: fitness 0.89 with Sharpe 1.66. Window 10: 0.78. Window 20 + tilt: Sharpe 1.14. Sub-universe still fails on all three.
+- Cash-flow alpha. Neutralization SUBINDUSTRY / INDUSTRY / SUBINDUSTRY+backfill: Sharpe 0.23 to 0.39. The original was a long market bet (800 long / 120 short) and is dropped.
+
+Learner gaps found, now fixed:
+- Combinations taught the playbook nothing. Each part of `combo:a+b+c` is now credited with weight 1/3, and a combination with positive evidence for a class becomes a choosable lever for that class (parts already in place are skipped).
+- Side effects were not credited. A child now also counts, at `secondary_weight`, for every other class its parent failed. Backfill now gets credit for clearing concentration.
+
+Round 2 (`candidates/rescue_20261104_round2.json`, 5 candidates, children of the best round-1 children):
+- IV backfill + tilt by adv20 without rank, and IV backfill + tilt by cap.
+- Sibling decay 10 + ts_mean 10, decay 10 + ts_decay_linear smoothing, and decay 15.
+
+### Rescue round 2 and pipeline guards (2026-11-04)
+
+Round 2 (5 simulations, children of the best round-1 children): no accepts. IV backfill × rank(adv20): Sharpe 1.86, fitness 1.62, sub-universe 0.59 against 0.81. IV backfill × rank(cap): 1.70 / 1.18 / 0.48 against 0.74. Sibling decay 10 + window 10: sub-universe passes (0.68 against 0.67) but fitness 0.92. Sibling decay 10 + smoothing, and decay 15: fitness 1.09, sub-universe 0.63 / 0.57 against 0.73 / 0.76. Every child passed BRAIN's concentration check. The IV family moves between fitness and sub-universe; its edge sits in small names. Totals: 25 simulations, 1 accept; failures sharpe 11, sub_universe 7, fitness 4, self_correlation 2.
+
+Owner direction: improve the pipeline, not individual alphas; use BRAIN's checks only; ensure no overfitting; keep the search diverse. Built:
+- BRAIN's PASS/FAIL checks as hard gates (`gates.use_brain_checks`).
+- An accept-time deflated-Sharpe gate (`auditor.min_deflated_sharpe` 0.0, `trials_scope` dataset). The pool alpha passes it: 1.38 deflates to 0.51 / 0.28 / 0.12 with lineage / dataset / all trials.
+- Distance to accept, used for the learner's reward (half class fix, half overall progress), for resume order, and for a per-lineage repair budget (depth 2, 4 repair simulations, patience 2). Under it, all 9 open IV-family repairs are closed (budget used or depth reached); only the two old reversal repairs from runs 1-2 remain open, and they are on gen-v1 arms, so they are not resumed.
+- Diversity:
+  - the Director caps one arm at 40% of a round;
+  - the generator field list keeps the most relevant fields and adds a 30% exploration sample across datasets, annotated with coverage and crowding (`gen-v2`; skips SYMBOL/UNIVERSE fields);
+  - Strategy Evolution (`strategy-v3`) gets least-tried datasets and the fixes that worked, with rules against narrowing;
+  - the Critic flags neutralization NONE (advisory).
+
+### Fourth research run and fixes (2026-11-04, `rs20261104073248`)
+
+First closed-loop run under the pipeline guards: 14 simulations, 34 model calls (Gemini 22, Qwen 12), no accept. Fresh ideas: 9; 7 failed Sharpe far from the bar (Sharpe -0.37 to 0.21) and were rejected. Near misses all came from the option8 IV-spread idea again (fitness 0.71, 0.59; Sharpe 1.44, 1.61) and their repairs improved fitness only to 0.76 and 0.81, then the depth limit closed the family. The run stopped on Gemini's free-tier daily limit of 20 requests, with Qwen still working and 6 simulations left.
+
+The run showed three faults, now fixed:
+- **`model_repair` ranked first.** Every class lists it, so on an alpha failing several checks it collected the secondary bonus from its prior alone and outranked levers with better evidence (scores 0.88-1.0 against 0.41-0.44 posterior). `rank_levers` now places it last by rule, the catch-all after the mechanical levers.
+- **`flip_sign` was not tried on negative Sharpe.** Two near misses had Sharpe -1.05 and -1.18; increase_decay and model_repair came first, and the model rewrite reached Sharpe 0.41. `flip_sign` is now placed first by rule (it applies only when Sharpe < 0). On a copy of memory, `cli repair` now proposes the flip first for both.
+- **The Critic rewrote repair children** (`..._r1_c1`), so a simulation measured the lever plus the Critic's change, and the learner credited the lever with both. Repair children now get the Critic's rule checks only (a blocking issue still drops them); no model review, no judge, no shadow critics.
+
+And the stop: **a failed model no longer stops the run.** `BudgetedLLM` marks a model whose call fails after the client's retries as down for the rest of the run (`llm.ModelDown`), and later calls to it fail at once without spending budget. Its generator arms get no more slots (`Orchestrator.allocate(only=...)`; their queued repairs still run); the primary critic becomes the next critic from another provider that is up, else the rules-only Critic; the judge, Pre-Filter, Repair and Strategy agents use `FallbackLLM` (their own model, then the generator models, then the rest) and fall back to their rules if all are down. The run stops only when every generator model is down. The report has `models_down`.
+
+Note for the next runs: Gemini's free tier allows 20 requests a day, and its 503 "high demand" answers were frequent. Once Gemini is down, the Gemini arms stop and Qwen's arms are reviewed by the rules-only Critic (the critic must come from another provider), so the run keeps going but with a weaker review until a third free provider is added.
+
+### More free models: GPT, Llama, DeepSeek (2026-11-04)
+
+Owner: no Mistral; add ChatGPT, Llama and DeepSeek, so one host's quota cannot stall the loop. ChatGPT's own API has no free tier, so the GPT model is `gpt-oss-120b` (the open-weight GPT model) on Groq's free plan, which the existing Groq key covers; GitHub Models (hosted GPT models, about 50 calls a day with a GitHub token) is wired as an optional host. Llama and DeepSeek come from NVIDIA's free API (build.nvidia.com, about 40 calls a minute). Both new hosts speak the same chat-completions format, so each is one `llm.HOSTS` entry. A hosted id may leave out the maker when the name says it (`groq:gpt-oss-120b`); `llm.BARE_MODEL_MAKERS` gives the provider and the namespace the host expects, which also keeps the provider's name out of config files. `cli models` lists a host's models or checks every configured model with one tiny call. The roster now has five makers, so every arm keeps a critic from another maker even when two are down, and the agents that run every round default to Llama on NVIDIA instead of Gemini. Ids checked against NVIDIA's list on 2026-11-04 (`cli models`): its catalog has no Llama 3.3 70B, so Llama is `meta/llama-3.2-90b-vision-instruct` (text works); DeepSeek is `deepseek-ai/deepseek-v4.1-flash`.
+
+Update the same day: `cli models --check` passed for Qwen and gpt-oss on Groq, but both NVIDIA models timed out, and so did a plain curl call to NVIDIA's chat endpoint (0 bytes in 120 s), while its model list answered. The stall is on NVIDIA's free endpoint, not in our client, so the NVIDIA models are out of the config for now and gpt-oss on Groq is the default for the agents that run every round. Groq's free plan has no Llama chat model. Llama and DeepSeek wait for a free host that answers (next to try: OpenRouter's free models).
+
+OpenRouter's free list (2026-11-04) has no Llama or DeepSeek either. Owner chose a stand-in: `nvidia/nemotron-3-ultra-550b-a55b:free` as a fourth generator maker, generator only (OpenRouter's free models share about 50 calls a day, too few for an agent that runs every round). Llama and DeepSeek go back in when NVIDIA's chat endpoint answers.
+
+
+### Fifth research run and fixes (2026-11-04, `rs20261104163055`)
+
+First closed-loop run to finish every round: 4 rounds, 19 simulations, 41 model calls (gpt-oss 25, Qwen 9, Nemotron 6, Gemini 1). Gemini's daily quota was used up all run; failover kept the run going on the other three generators. No accept. Near misses: three resumed repairs (IV spread Sharpe 1.12 / fitness 0.72; analyst EPS revision after the sign flip 1.05 / 0.47; customer momentum 1.18 with self-correlation 0.73), all then closed by the repair depth limit. Nine new ideas, all far misses (Sharpe -0.42 to 0.27, best gpt-oss's news P/E change at 0.90 with turnover 83%, queued for repair).
+
+Why some models looked weak with the same prompts: samples of 5-14 per model, and the models were not tested on equal terms (Gemini's lead is one IV family found while the plan's ideas were still unused; the later models got the harder, explored-out arms); gpt-oss lost 4 of 9 ideas to BRAIN errors the validator let through (below); Nemotron chose decay 30-60 on slow fields; no generator sees past results; no temperature is set, so each host's default applies; and the Director learns from accepts only, so with 0 accepts it cannot tell a Sharpe 1.6 idea from a 0.1 one. Proposals (not built): show each generator its arm's best and worst results, one temperature for every model, a Director reward by distance to accept, model comparison within a dataset.
+
+Fixed:
+1. **Validator gaps (5 of 19 simulations were BRAIN errors).** `fastexpr.analyze` now requires optional arguments by name (`winsorize(x, 4)` and `ts_backfill(x, 60, 1)` gave "Invalid number of inputs : 2, should be exactly 1") and allows an event (VECTOR) field only inside `vec_*` (`ts_delta(<vector field>, 30)` gave "does not support event inputs"). Field types come from the catalog (`fastexpr.catalog(ids, meta)`), passed to the Generator, Pre-Filter, Critic and Repair Agent. Replayed over every expression in memory: all 5 failures caught, no complete simulation flagged.
+2. **`rank_transform` ignored a leading minus**: `-rank(x)` became `rank(-rank(x))`, the same alpha (identical results). It now counts as already ranked.
+3. **Slots of a model found down mid-round were lost** (3 to Gemini in round 3). They now go back to the Director within the round for live arms; refill batches get their own ids (`...a<i>f<n>`).
+4. **Ideas were credited to the wrong dataset.** Strategy's hypotheses on a dataset no arm covered went to every arm, so news12 ideas ran and were stored as analyst4/model51 (and Strategy's per-dataset counts never saw news12 as tried). A hypothesis on a catalog dataset no arm covers now gets its own arms (one per generator model, settings of the existing arms); a candidate's `dataset` is the dataset most of its non-base fields come from (`generator.signal_dataset`, the arm's on a tie), with a warning when it differs.
+5. **The Critic dropped fixable ideas** (two gpt-oss ideas for a missing `ts_backfill`). `critic-v3` / `judge-v3`: drop only for a look-ahead or an untestable idea; a fixable defect is revise (or simulate). Slots emptied by the Generator, Pre-Filter or Critic go back to the Director for `director.refill_passes` extra passes per round (config/agents.yaml: 1).
+
+559 tests pass.

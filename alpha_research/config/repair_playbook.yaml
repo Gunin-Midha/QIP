@@ -1,7 +1,44 @@
-# Levers per failure class, tried in order (one per repair). repair_agent.py applies them:
-# increase_decay, tighten_truncation, lengthen_ts_window, wrap_in_smoothing, hump,
-# rank_transform and volatility_scale are mechanical rewrites; any other lever is handed
-# to the model and its answer must pass the Fast Expression validator.
+# Levers per failure class (one per repair). repair_agent.py applies them. Mechanical
+# rewrites (no model): increase_decay, tighten_truncation, lengthen_ts_window,
+# wrap_in_smoothing, hump, rank_transform, volatility_scale, flip_sign, set_neutralization,
+# backfill_fields, liquidity_tilt, winsorize, change_universe. Any other lever is handed to
+# the model and its answer must pass the Fast Expression validator.
+#
+# The order below is the starting prior only (builder's choice 2026-11-04, from the first
+# three research runs). lever_stats.py reorders the levers from what each one did in past
+# repairs (memory), and puts a lever first when it also addresses another class the alpha
+# fails. `model_repair` is always tried last and `flip_sign` always first (rank_levers pins
+# them, whatever the scores): once the mechanical ideas are used up, the model proposes its
+# own fix, shown the past repairs of that class that worked.
+#
+# sharpe and fitness are repaired only for near misses (repair.near_miss_share in
+# config/thresholds.yaml); far misses are rejected.
+sharpe:
+  - lever: flip_sign                # only when BRAIN's Sharpe is negative
+    step: {}
+  - lever: set_neutralization       # e.g. NONE -> SUBINDUSTRY: removes market/sector bets
+    step: {to: SUBINDUSTRY}
+  - lever: backfill_fields          # sparse fundamentals/options: more names carry a value
+    step: {lookback: 63}
+  - lever: rank_transform
+    step: {}
+  - lever: increase_decay
+    step: {to: 8}
+  - lever: model_repair
+    step: {}
+fitness:                            # fitness = Sharpe * sqrt(|returns| / max(turnover, 12.5%))
+  - lever: increase_decay           # cut turnover toward 12.5% while keeping returns
+    step: {to: 10}
+  - lever: lengthen_ts_window
+    step: {factor: 2}
+  - lever: wrap_in_smoothing
+    step: {operator: ts_decay_linear, window: 10}
+  - lever: set_neutralization
+    step: {to: SUBINDUSTRY}
+  - lever: hump
+    step: {threshold: 0.01}
+  - lever: model_repair
+    step: {}
 turnover:
   - lever: increase_decay
     step: {from: 3, to: 8}
@@ -11,19 +48,47 @@ turnover:
     step: {operator: ts_mean, window: 5}
   - lever: hump
     step: {threshold: 0.01}
+  - lever: model_repair
+    step: {}
 concentration:
+  - lever: backfill_fields          # few names with data -> few names carry the weight
+    step: {lookback: 63}
   - lever: rank_transform
     step: {}
   - lever: winsorize
-    step: {quantile: 0.01}
+    step: {std: 3}
   - lever: tighten_truncation
     step: {to: 0.05}
+  - lever: model_repair
+    step: {}
 self_correlation:
   - lever: orthogonalize_against_pool
     step: {}
-sub_universe:
+  - lever: set_neutralization
+    step: {to: SUBINDUSTRY}
+  - lever: lengthen_ts_window       # a different horizon of the same idea
+    step: {factor: 3}
+  - lever: model_repair
+    step: {}
+sub_universe:                       # the alpha must also work on the larger, liquid names
+  - lever: liquidity_tilt
+    step: {field: adv20}
+  - lever: backfill_fields
+    step: {lookback: 63}
+  - lever: rank_transform
+    step: {}
+  - lever: change_universe
+    step: {to: TOP1000}
   - lever: restrict_to_liquid_fields
+    step: {}
+  - lever: model_repair
     step: {}
 drawdown:
   - lever: volatility_scale
     step: {window: 20}
+  - lever: set_neutralization
+    step: {to: SUBINDUSTRY}
+  - lever: rank_transform
+    step: {}
+  - lever: model_repair
+    step: {}

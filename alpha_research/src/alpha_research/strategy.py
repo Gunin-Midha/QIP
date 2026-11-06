@@ -5,8 +5,14 @@ Method
    and counts, per family and per (dataset, region, prompt_version) arm, how many were
    decided, accepted and why the rest failed. It keeps the best accepted alphas (by Sharpe)
    and a few recent failures with their key metrics. No model.
+   It also lists, per dataset, how much has been tried (``datasets``), the known datasets
+   with no or few trials (``least_tried``: the plan's and the catalog's, passed in as
+   ``known_datasets``), and the repair levers that worked (``what_fixes_worked``, from
+   lever_stats.py) as construction techniques.
 2. ``evolve`` turns the summary into guidance for the Generator and, with the model, new
-   hypotheses to test. Without the model (or when its reply is unusable) the guidance is
+   hypotheses to test. Diversity (owner 2026-11-04): the prompt asks for at least half the
+   hypotheses on least-tried datasets and at most one building on an accepted alpha, and
+   guidance may teach construction techniques but never narrows the datasets or families. Without the model (or when its reply is unusable) the guidance is
    built from the counts alone and no hypotheses are proposed.
 3. Each evolution is a new prompt version ``<base>+evo<k>``. The Research Director adds it
    as new arms next to the old ones, so the bandit measures whether the guidance helps
@@ -22,7 +28,8 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 from .generator import GenerationError, ask_json
-from .llm import LLMClient
+from .lever_stats import LeverStats, repair_events
+from .llm import LLMClient, ModelDown
 from .prompts import strategy_system, strategy_user
 
 @dataclass(frozen=True)
@@ -43,8 +50,13 @@ class Evolution:
     llm_calls: int = 0
 
 
-def summarize(outcomes: list[dict], *, top_n: int = 5) -> dict:
+FEW_TRIALS = 3   # a dataset with fewer decided alphas than this counts as least tried
+
+
+def summarize(outcomes: list[dict], *, top_n: int = 5,
+              known_datasets: list[str] | None = None) -> dict:
     by_family: dict = defaultdict(lambda: {"decided": 0, "accepted": 0, "failures": Counter()})
+    by_dataset: Counter = Counter()
     by_arm: dict = defaultdict(lambda: {"decided": 0, "accepted": 0})
     failures = Counter()
     accepted, failed = [], []
@@ -56,6 +68,7 @@ def summarize(outcomes: list[dict], *, top_n: int = 5) -> dict:
         arm = by_arm[f"{c.dataset or 'unknown'}/{c.region}/{c.prompt_version or 'none'}"]
         fam["decided"] += 1
         arm["decided"] += 1
+        by_dataset[c.dataset or "unknown"] += 1
         metrics = {} if r is None else {k: round(v, 4) for k in ("sharpe", "fitness", "turnover")
                                          if (v := getattr(r, k)) is not None}
         if d.decision == "accept":
@@ -68,6 +81,10 @@ def summarize(outcomes: list[dict], *, top_n: int = 5) -> dict:
             failed.append({"expression": c.expression, "decision": d.decision,
                            "failure_class": d.failure_class, **metrics})
     accepted.sort(key=lambda a: a.get("sharpe") or 0, reverse=True)
+    known = sorted(set(known_datasets or []) | set(by_dataset))
+    least = sorted((d for d in known if by_dataset[d] < FEW_TRIALS), key=lambda d: (by_dataset[d], d))
+    worked = [r for r in LeverStats.from_events(repair_events(outcomes)).table()
+              if r["posterior_mean"] > 0.5]
     return {
         "decided": sum(f["decided"] for f in by_family.values()),
         "accepted": sum(f["accepted"] for f in by_family.values()),
@@ -78,6 +95,10 @@ def summarize(outcomes: list[dict], *, top_n: int = 5) -> dict:
         "arms": dict(sorted(by_arm.items())),
         "best_accepted": accepted[:top_n],
         "recent_failures": failed[-top_n:],
+        "datasets": dict(by_dataset.most_common()),
+        "least_tried": least[:20],
+        "what_fixes_worked": [{k: r[k] for k in ("failure_class", "lever", "fixed", "posterior_mean")}
+                              for r in worked[:8]],
     }
 
 
@@ -103,6 +124,12 @@ def rule_guidance(summary: dict) -> str:
         lines.append(f"- Families with accepted alphas: {', '.join(good)}.")
     if summary["best_accepted"]:
         lines.append(f"- Best accepted so far: {summary['best_accepted'][0]['expression']}")
+    if summary.get("least_tried"):
+        lines.append(f"- Keep exploring: {len(summary['least_tried'])} datasets have fewer than "
+                     f"{FEW_TRIALS} trials, e.g. {', '.join(summary['least_tried'][:5])}. "
+                     "Few accepts so far is too little evidence to narrow the search.")
+    for r in summary.get("what_fixes_worked", [])[:3]:
+        lines.append(f"- Construction that fixed {r['failure_class']} before: {r['lever']}.")
     return "\n".join(lines)
 
 
@@ -118,8 +145,9 @@ class StrategyEvolution:
     def due(self, round_number: int) -> bool:
         return self.config.every_rounds > 0 and round_number % self.config.every_rounds == 0
 
-    def evolve(self, outcomes: list[dict], base_prompt_version: str) -> Evolution | None:
-        summary = summarize(outcomes)
+    def evolve(self, outcomes: list[dict], base_prompt_version: str,
+               known_datasets: list[str] | None = None) -> Evolution | None:
+        summary = summarize(outcomes, known_datasets=known_datasets)
         if summary["decided"] == 0:
             return None
         self.count += 1
@@ -138,6 +166,9 @@ class StrategyEvolution:
         except GenerationError as exc:
             evo.llm_calls += 2
             evo.notes.append(f"strategy model reply unusable, rule guidance used: {exc}")
+            return
+        except ModelDown as exc:
+            evo.notes.append(f"strategy model down, rule guidance used: {exc}")
             return
         evo.llm_calls += calls
         if not isinstance(reply, dict):

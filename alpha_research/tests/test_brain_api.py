@@ -1,3 +1,4 @@
+import dataclasses
 """brain_api: translation, session behaviour and RealBrainClient, all over a fake transport.
 
 The BRAIN bodies below are illustrative, in the publicly known response shape (OQ-2), with
@@ -442,7 +443,17 @@ def test_pipeline_decides_on_real_client_results(bcfg, config, playbook, memory,
     p = Pipeline(config, playbook, client, memory, sleep=vc.sleep, clock=vc.clock)
     out = p.process(candidate())
     assert out.result.status == "complete" and out.decision in DECISIONS
-    # weight concentration 0.12 is above the test config's 0.10 limit: a risk veto
+    # BRAIN failed its own CONCENTRATED_WEIGHT check: with use_brain_checks that is a hard
+    # gate failure (before any risk veto), and the playbook has concentration levers
+    assert (out.decision, out.failure_class) == ("repair", "concentration")
+    assert any(g.name == "brain:CONCENTRATED_WEIGHT" and g.passed is False
+               for g in out.decision_record.gate_results)
+    no_brain = dataclasses.replace(config, gates=dataclasses.replace(config.gates,
+                                                                     use_brain_checks=False))
+    client, _, vc = make_client(brain_routes(), bcfg)
+    p = Pipeline(no_brain, playbook, client, memory, sleep=vc.sleep, clock=vc.clock)
+    out = p.process(candidate(candidate_id="c2", decay=5))
+    # without BRAIN's checks, the test config's 0.10 concentration limit vetoes it
     assert (out.decision, out.failure_class) == ("reject", "concentration")
 
 

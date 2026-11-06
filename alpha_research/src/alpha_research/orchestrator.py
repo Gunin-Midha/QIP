@@ -11,6 +11,9 @@ Allocation method:
    posterior Beta(successes + 1, failures + 1) afresh and give the slot to the arm with
    the highest sample (ties go to the earlier arm). Re-sampling per slot spreads slots in
    proportion to each arm's probability of being best.
+3. Cap (``max_share``, optional): no arm gets more than ceil(max_share * budget) slots
+   while another arm is below the cap, so a few early accepts cannot pull a whole round
+   into one dataset or model (owner 2026-11-04: keep the search diverse).
 """
 
 from __future__ import annotations
@@ -39,22 +42,33 @@ class Orchestrator:
         self.state = {a: ArmState() for a in self.arms}
         self.rng = np.random.default_rng(seed)
 
-    def floor_slots(self, budget: int, floor_share: float) -> int:
-        return math.floor(floor_share * budget / len(self.arms))
+    def floor_slots(self, budget: int, floor_share: float, n_arms: int | None = None) -> int:
+        return math.floor(floor_share * budget / (n_arms or len(self.arms)))
 
-    def allocate(self, budget: int, floor_share: float = 0.2) -> dict:
+    def allocate(self, budget: int, floor_share: float = 0.2,
+                 max_share: float | None = None, only=None) -> dict:
+        """Slots per arm. ``only`` limits the allocation to those arms (e.g. arms whose
+        model is down get none); the others are listed with 0."""
         if budget < 0:
             raise ValueError("budget must be >= 0")
         if not 0 <= floor_share <= 1:
             raise ValueError("floor_share must be between 0 and 1")
-        floor = self.floor_slots(budget, floor_share)
-        slots = Counter({a: floor for a in self.arms})
-        remaining = budget - floor * len(self.arms)
-        alphas = np.array([self.state[a].successes + 1 for a in self.arms], dtype=float)
-        betas = np.array([self.state[a].failures + 1 for a in self.arms], dtype=float)
+        arms = [a for a in self.arms if only is None or a in set(only)]
+        if not arms:
+            raise ValueError("no arm to allocate to")
+        floor = self.floor_slots(budget, floor_share, len(arms))
+        slots = Counter({a: floor for a in arms})
+        remaining = budget - floor * len(arms)
+        alphas = np.array([self.state[a].successes + 1 for a in arms], dtype=float)
+        betas = np.array([self.state[a].failures + 1 for a in arms], dtype=float)
+        cap = math.ceil(max_share * budget) if max_share is not None else None
         for _ in range(remaining):
             samples = self.rng.beta(alphas, betas)
-            slots[self.arms[int(np.argmax(samples))]] += 1
+            if cap is not None:
+                full = np.array([slots[a] >= cap for a in arms])
+                if not full.all():
+                    samples = np.where(full, -1.0, samples)
+            slots[arms[int(np.argmax(samples))]] += 1
         return {a: slots[a] for a in self.arms}
 
     def add_arm(self, arm: Hashable) -> bool:

@@ -14,12 +14,12 @@ def test_turnover_second_lever(playbook):
 
 
 def test_exhausted(playbook):
-    tried = ["increase_decay", "lengthen_ts_window", "wrap_in_smoothing", "hump"]
+    tried = ["increase_decay", "lengthen_ts_window", "wrap_in_smoothing", "hump", "model_repair"]
     assert next_lever(playbook, "turnover", tried) is None
 
 
 def test_unknown_class(playbook):
-    assert next_lever(playbook, "sharpe", []) is None
+    assert next_lever(playbook, "weak_year", []) is None
     assert next_lever(playbook, "made_up", []) is None
 
 

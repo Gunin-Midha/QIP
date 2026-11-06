@@ -51,7 +51,9 @@ any key. If they fail, stop here and ask in the group.
 | Key | Where | Steps |
 |---|---|---|
 | Gemini | aistudio.google.com | Sign in, **Get API key**, **Create API key**. Then open aistudio.google.com/rate-limit and check that `gemini-3.6-flash` is listed for free. |
-| Groq (for Qwen) | console.groq.com | Sign up, **API Keys**, **Create API Key**. Check that `qwen/qwen3.8-27b` is in **Models**. |
+| Groq (for Qwen and gpt-oss) | console.groq.com | Sign up, **API Keys**, **Create API Key**. Check that `qwen/qwen3.8-27b` and `gpt-oss-120b` are in **Models**. |
+| NVIDIA (for Llama and DeepSeek) | build.nvidia.com | Sign in (may ask for phone verification), open any model, **Get API Key**. The key starts with `nvapi-`. |
+| GitHub Models (optional, hosted GPT) | github.com/settings/tokens | **Fine-grained token**, permission **Models: read**. About 50 calls a day. |
 
 Treat a key like a password. Never paste it into chat, a file in the repo, or a commit.
 
@@ -65,6 +67,8 @@ export BRAIN_EMAIL="your-brain-login@example.com"
 read -s BRAIN_PASSWORD && export BRAIN_PASSWORD
 read -s GEMINI_API_KEY && export GEMINI_API_KEY
 read -s GROQ_API_KEY && export GROQ_API_KEY
+read -s NVIDIA_API_KEY && export NVIDIA_API_KEY
+read -s GITHUB_MODELS_TOKEN && export GITHUB_MODELS_TOKEN   # only if you made one
 ```
 
 Type the line exactly as shown: the word after `read -s` is the variable's name, not your
@@ -91,6 +95,16 @@ list, not on BRAIN" or "on BRAIN, not in seed list", your account level differs 
 send the output to Gunin rather than editing `config/fastexpr.yaml` yourself.
 
 ## 7. Test each model with one call
+
+First check that every model in `config/agents.yaml` answers (one tiny call each). If one
+fails with "model not found", list what the host serves and fix the id in the config:
+
+```bash
+PYTHONPATH=src python3 -m alpha_research.cli models --check
+PYTHONPATH=src python3 -m alpha_research.cli models --host nvidia --filter deepseek
+```
+
+Then try a real generation with two of them:
 
 ```bash
 PYTHONPATH=src python3 -m alpha_research.cli generate --model gemini-3.6-flash \
@@ -175,6 +189,7 @@ $env:BRAIN_EMAIL = "your-brain-login@example.com"
 $env:BRAIN_PASSWORD = (Read-Host -AsSecureString | ConvertFrom-SecureString -AsPlainText)
 $env:GEMINI_API_KEY = (Read-Host -AsSecureString | ConvertFrom-SecureString -AsPlainText)
 $env:GROQ_API_KEY = (Read-Host -AsSecureString | ConvertFrom-SecureString -AsPlainText)
+$env:NVIDIA_API_KEY = (Read-Host -AsSecureString | ConvertFrom-SecureString -AsPlainText)
 python -m alpha_research.cli brain auth
 ```
 

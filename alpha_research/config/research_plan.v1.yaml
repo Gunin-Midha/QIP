@@ -1,0 +1,62 @@
+# Research plan v1 (2026-11-04): aimed at first accepted alphas on our account.
+#
+# Why these ideas: the first two runs used the example plan (short-term reversal and raw
+# cash-flow changes on pv1 / fundamental6). Reversal kept failing self-correlation against
+# our existing alphas, and the cash-flow ideas had no signal. This plan uses less crowded
+# datasets on our account (options, analyst estimates, risk models, supply-chain links) and
+# signals with a long record in the literature. Every field named below exists in our
+# USA / TOP3000 / delay-1 catalog (captures/datafields_usa_top3000_d1.json); naming them
+# matters, because the Generator shows the model the catalog fields that best match the
+# hypothesis text. The dataset label itself does not restrict the fields.
+#
+# Settings: SUBINDUSTRY or INDUSTRY neutralization (never NONE: run 2's NONE alpha was a
+# market bet with a 67% drawdown); decay set per signal speed to keep turnover in range.
+# The model may still suggest its own decay and neutralization per alpha.
+#
+# Each arm runs once per generator model, so 3 arms = 6 research directions.
+
+arms:
+  - dataset: option8
+    settings:
+      region: USA
+      universe: TOP3000
+      delay: 1
+      decay: 4
+      neutralization: SUBINDUSTRY
+      truncation: 0.08
+      start_date: "2019-01-01"
+      end_date: "2023-12-31"
+    hypotheses:
+      - "Implied volatility spread (Cremers and Weinbaum 2010): stocks whose at-the-money call implied volatility is high relative to put implied volatility (implied_volatility_call_60 minus implied_volatility_put_60) outperform over the next 1-4 weeks, because informed traders buy calls before good news and puts before bad news. Rank the spread within subindustry."
+      - "Rising downside fear: when put implied volatility (implied_volatility_put_60) rises faster than call implied volatility (implied_volatility_call_60) over the last 10-20 days, the stock underperforms over the next month. Use the change in the put-minus-call spread, smoothed to keep turnover moderate."
+      - "Bearish option positioning: a put/call volume ratio (pcr_vol_30) that is high relative to the stock's own 60-day average signals informed bearish trading and predicts lower returns over the next 2-4 weeks."
+
+  - dataset: analyst4
+    settings:
+      region: USA
+      universe: TOP3000
+      delay: 1
+      decay: 3
+      neutralization: SUBINDUSTRY
+      truncation: 0.08
+      start_date: "2019-01-01"
+      end_date: "2023-12-31"
+    hypotheses:
+      - "Earnings estimate revisions (Chan, Jegadeesh and Lakonishok 1996): stocks whose consensus EPS estimate (est_eps) has risen over the last 20-60 trading days, scaled by the absolute estimate or by price (close), keep outperforming for weeks because analysts and investors adjust slowly. Rank within subindustry."
+      - "Forward earnings yield: stocks with a high forecast earnings yield (est_eps divided by close) relative to subindustry peers are cheap on expected profits and outperform over the next months. Fill gaps in est_eps with the last known value."
+      - "Revision breadth plus momentum: combine the 60-day change in consensus EPS (est_eps) with the stock's 120-day return; stocks where both agree outperform, while disagreement weakens the signal."
+
+  - dataset: model51
+    settings:
+      region: USA
+      universe: TOP3000
+      delay: 1
+      decay: 5
+      neutralization: INDUSTRY
+      truncation: 0.08
+      start_date: "2019-01-01"
+      end_date: "2023-12-31"
+    hypotheses:
+      - "Idiosyncratic volatility puzzle (Ang, Hodrick, Xing and Zhang 2006): stocks with low idiosyncratic risk (unsystematic_risk_last_90_days) relative to industry peers earn higher risk-adjusted returns over the following months. Use a slow-moving, ranked signal."
+      - "Customer momentum (Cohen and Frazzini 2008): a company's stock under-reacts to news about its customers, so the recent average return of its customers (rel_ret_cust, or the sign pv13_custretsig_retsig) predicts its own return over the next 1-4 weeks. Fill missing values with the last known value and smooth over 5-20 days."
+      - "Earnings news sentiment drift: positive composite sentiment in earnings news (rp_css_earnings) is under-reacted to, so stocks with improving earnings-news sentiment over the last 5-10 days drift up over the next 2-3 weeks. Fill missing days with the last known value and favour liquid stocks."

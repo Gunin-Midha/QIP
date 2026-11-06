@@ -6,7 +6,9 @@ Critic
      less. A negative ``ts_delay`` reads the future; zero is meaningless.
    - advisory: the final expression is not cross-sectionally normalized (its outermost
      operator, ignoring a leading minus, is not rank, zscore, scale, normalize, quantile,
-     winsorize or a group_* operator), or a window is longer than 512 days.
+     winsorize or a group_* operator), or a window is longer than 512 days, or the
+     neutralization is NONE (the alpha keeps a market bet; run 2's cash-flow alpha looked
+     strong only because of it). Advisory issues never block: they inform the reviews.
 2. Model review (``critic.use_model``): one call per batch sees each candidate, its
    hypothesis and rationale, and the rule issues, and answers simulate, revise or drop,
    with issues and optionally a revised expression. A revision must pass
@@ -19,6 +21,9 @@ Generator's case (hypothesis and rationale) against the Critic's issues and rule
 revise (only offered when a valid revision exists) or drop. One call per batch. Without the
 model the Critic's verdict stands, except that revise becomes simulate when no valid
 revision exists.
+
+Repair children skip the model review and the judge (``review_and_debate``): they get the
+rule checks only, so the lever learner sees exactly what the lever changed.
 
 A revision becomes a new candidate ``<id>_c1`` with ``lever="critic_revision"``, the
 original as parent and ``generation + 1``. The original is not simulated.
@@ -34,9 +39,9 @@ from dataclasses import dataclass, field
 from typing import Collection
 
 from .fastexpr import (Call, ComplexityLimits, FastExprError, FastExprSpec, Num, Unary,
-                       analyze, parse)
+                       analyze, catalog, parse)
 from .generator import GenerationError, ask_json
-from .llm import LLMClient
+from .llm import LLMClient, ModelDown
 from .prompts import critic_system, critic_user, judge_system, judge_user
 from .research_loop import assign_lineage
 from .schemas import CandidateRecord, SchemaError
@@ -92,6 +97,13 @@ def _window_value(node) -> float | None:
     return None
 
 
+def setting_issues(c: CandidateRecord) -> list[Issue]:
+    if c.neutralization == "NONE":
+        return [Issue("advisory", "neutralization NONE leaves a market bet in the alpha: its "
+                                  "Sharpe may come from market direction, not stock selection")]
+    return []
+
+
 def rule_issues(expression: str) -> list[Issue]:
     try:
         stmts = parse(expression)
@@ -141,7 +153,7 @@ class Critic:
         self.spec = spec
         self.context = context  # prompts.brain_context(config)
         self.llm = llm
-        self.datafields = None if datafields is None else set(datafields)
+        self.datafields = catalog(datafields)  # {id: type}: types check vec_* use
         self.limits = limits
         self.max_output = max_output
 
@@ -166,14 +178,14 @@ class Critic:
         return child
 
     def review(self, candidates: list[CandidateRecord], rationales: dict[str, str],
-               out: ReviewOutcome) -> dict[str, Review]:
+               out: ReviewOutcome, *, use_model: bool = True) -> dict[str, Review]:
         reviews: dict[str, Review] = {}
         for c in candidates:
-            issues = rule_issues(c.expression)
+            issues = rule_issues(c.expression) + setting_issues(c)
             blocking = any(i.severity == "blocking" for i in issues)
             reviews[c.candidate_id] = Review(c.candidate_id, "drop" if blocking else "simulate",
                                              [i.text for i in issues], blocking=blocking)
-        if self.llm is None or not candidates:
+        if self.llm is None or not use_model or not candidates:
             return reviews
         user = critic_user(candidates, rationales,
                            {cid: r.issues for cid, r in reviews.items()}, self.spec.operators)
@@ -183,6 +195,9 @@ class Critic:
         except GenerationError as exc:
             out.llm_calls += 2
             out.notes.append(f"critic model reply unusable, rule verdicts used: {exc}")
+            return reviews
+        except ModelDown as exc:
+            out.notes.append(f"critic model down, rule verdicts used: {exc}")
             return reviews
         out.llm_calls += calls
         by_id = {c.candidate_id: c for c in candidates}
@@ -236,6 +251,9 @@ class DebateJudge:
             out.llm_calls += 2
             out.notes.append(f"judge model reply unusable, critic verdicts used: {exc}")
             return rulings
+        except ModelDown as exc:
+            out.notes.append(f"judge model down, critic verdicts used: {exc}")
+            return rulings
         out.llm_calls += calls
         ids = {c.candidate_id for c in contested}
         items = reply.get("rulings") if isinstance(reply, dict) else reply
@@ -270,9 +288,14 @@ def _issue_texts(items) -> list[str]:
 
 def review_and_debate(candidates: list[CandidateRecord], rationales: dict[str, str],
                       critic: Critic, judge: DebateJudge) -> ReviewOutcome:
-    """Critic, then the judge on contested candidates. Returns what to simulate."""
+    """Critic, then the judge on contested candidates. Returns what to simulate. Repair
+    children (any candidate with a lever) get the rule checks only: a model revision on top
+    of a repair would change two things at once and blur what the lever did."""
     out = ReviewOutcome()
-    out.reviews = critic.review(candidates, rationales, out)
+    fresh = [c for c in candidates if c.lever is None]
+    out.reviews = critic.review(fresh, rationales, out)
+    out.reviews.update(critic.review([c for c in candidates if c.lever is not None],
+                                     rationales, out, use_model=False))
     contested = [c for c in candidates if out.reviews[c.candidate_id].verdict != "simulate"]
     out.rulings = judge.judge(contested, out.reviews, rationales, out)
     for c in candidates:

@@ -100,7 +100,7 @@ def test_research_run_wires_prompts_and_context(memory, config, playbook):
     from test_research import RouterLLM, make_run
     llm = RouterLLM()
     report = make_run(memory, config, playbook, llm=llm).run(2)
-    assert report["prompt_versions"] == {"generator": "gen-v1", **prompts.PROMPT_VERSIONS}
+    assert report["prompt_versions"] == {"generator": "gen-v2", **prompts.PROMPT_VERSIONS}
     assert report["models"]["generator"] == ["claude-test"]
     agent_systems = [s for s in llm.all_systems if "Fast Expression language." not in s[:200]
                      and not s.startswith("You are a quantitative researcher")]
@@ -112,6 +112,12 @@ def test_cli_prompts_prints_rendered_prompts(capsys):
     from alpha_research import cli
     assert cli.main(["prompts", "--agent", "judge", "--config", str(ROOT / "config" / "thresholds.yaml")]) == 0
     out = capsys.readouterr().out
-    assert out.startswith("===== judge (judge-v2)") and "Sharpe at least 1.25" in out
+    assert out.startswith("===== judge (judge-v3)") and "Sharpe at least 1.25" in out
     assert cli.main(["prompts", "--config", str(ROOT / "config" / "thresholds.yaml")]) == 0
     assert capsys.readouterr().out.count("=====") == 5
+
+
+def test_critic_and_judge_revise_fixable_defects_instead_of_dropping():
+    # run rs20261104163055: two ideas were dropped for a missing ts_backfill
+    assert "never a reason to drop" in prompts.critic_system("")
+    assert "A fixable defect" in prompts.judge_system("")

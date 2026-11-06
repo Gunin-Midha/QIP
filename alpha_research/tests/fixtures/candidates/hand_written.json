@@ -122,7 +122,7 @@
     "family": "price_volume",
     "hypothesis": null,
     "fixture_id": "sim_shp_01",
-    "expected_decision": "reject",
+    "expected_decision": "repair",
     "expected_failure_class": "sharpe"
   },
   {
@@ -143,7 +143,7 @@
     "family": "fundamentals",
     "hypothesis": null,
     "fixture_id": "sim_shp_02",
-    "expected_decision": "reject",
+    "expected_decision": "repair",
     "expected_failure_class": "sharpe"
   },
   {
@@ -185,7 +185,7 @@
     "family": "analyst",
     "hypothesis": null,
     "fixture_id": "sim_shp_04",
-    "expected_decision": "reject",
+    "expected_decision": "repair",
     "expected_failure_class": "sharpe"
   },
   {

@@ -6,6 +6,7 @@ One round:
                        dataset x region x prompt_version x generator model)
         | slots per arm, capped by the simulation budget
         v
+    queued repairs (any arm, up to repair.max_share_per_round of the slots) first, then
     queued repairs for the arm  +  Alpha Generator (next hypothesis or paper of the arm)
         v
     Cheap Pre-Filter            drops invalid, already-simulated and near-duplicate ideas
@@ -16,6 +17,7 @@ One round:
     Pipeline (BRAIN simulation, gates, risk, diversity, pool, memory)
         |-- accept / reject / repair  -> Director.update(arm, accepted)
         |-- repair                    -> Repair Agent -> child queued for the same arm
+                                         (levers ranked by what worked before, lever_stats)
         v
     every N rounds: Strategy Evolution -> guidance + hypotheses as a new prompt version,
                     added as new arms so the Director measures whether it helps
@@ -32,13 +34,32 @@ is simulated.
 Budgets stop the run cleanly: ``max_simulations`` (candidates that reached BRAIN; invalid
 and duplicate ones do not count) and ``max_llm_calls`` (every model call by every agent).
 The Director starts from the outcomes already in memory, so a second run continues where
-the first stopped. Nothing here submits alphas for competition.
+the first stopped. With ``repair.resume_from_memory``, a repair decision whose child never
+reached BRAIN (the run stopped, or the arm got no slot) is repaired again at the start, for
+arms in the current plan. Nothing here submits alphas for competition.
+
+A model that fails after its client's retries (a free tier's daily quota, an outage) is
+down for the rest of the run, not a reason to stop it: its generator arms get no more
+slots (their queued repairs still run), the Critic and judge fall back to their rules, and
+Pre-Filter, Repair and Strategy switch to the next model that is still up (their own model
+first, then the generator models, then the others). The run stops only when no generator
+model is left.
+
+Slots a round could not use go back to the Director in the same round (``_round``): slots
+of a generator model that went down (always, since run rs20261104163055 lost 3 to Gemini's
+quota) and slots emptied by the generator, Pre-Filter or Critic (up to
+``director.refill_passes`` extra passes, so a drop costs a model call, not a simulation).
+
+Repair children skip the Critic's model review and the judge: a rewrite of a repair would
+change two things at once, and the lever learner would credit the lever with the Critic's
+change. They still get the rule checks (a blocking issue drops them).
 """
 
 from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -52,16 +73,17 @@ from .brain_client import BrainClient
 from .config import Config, ConfigError
 from .critic import Critic, DebateJudge, ReviewOutcome, review_and_debate
 from .compare import arm_models, model_comparison
-from .fastexpr import FastExprSpec
+from .fastexpr import FastExprSpec, catalog
 from .generator import (AlphaGenerator, GenerationError, GenerationSettings, GeneratorConfig,
                         Source)
-from .llm import LLMClient, LLMUnavailable, provider_of
+from .llm import LLMClient, LLMUnavailable, ModelDown, provider_of
 from .memory import MemoryStore
 from .orchestrator import Orchestrator
 from .pipeline import Pipeline
 from .prompts import PROMPT_VERSIONS, brain_context
 from .prefilter import PreFilter, PrefilterConfig
 from .repair import Playbook
+from .lever_stats import LeverStats, RepairLearningConfig, distance, repair_events
 from .repair_agent import RepairAgent
 from .schemas import CandidateRecord
 from .strategy import StrategyConfig, StrategyEvolution
@@ -80,12 +102,15 @@ class CallCounter:
         self.max_calls = max_calls
         self.calls = 0
         self.by_model: dict[str, int] = {}
+        self.down: dict[str, str] = {}   # model -> why it is out for the rest of the run
 
 
 class BudgetedLLM:
     """Counts every model call across all agents and stops at ``max_calls``. ``model``
     labels the calls (and the candidates the client writes); it defaults to the inner
-    client's model."""
+    client's model. A call that fails after the client's own retries (quota, outage, bad
+    key) marks the model down for the rest of the run and raises ``ModelDown``; later calls
+    to it raise at once without spending budget."""
 
     def __init__(self, inner: LLMClient, max_calls: int | None = None, *,
                  counter: CallCounter | None = None, model: str | None = None):
@@ -100,11 +125,45 @@ class BudgetedLLM:
 
     def complete(self, system: str, user: str, *, max_output: int = 4096) -> str:
         c = self.counter
+        if self.model in c.down:
+            raise ModelDown(self.model, c.down[self.model])
         if c.max_calls is not None and c.calls >= c.max_calls:
             raise LLMBudgetExhausted(f"model call budget of {c.max_calls} used up")
         c.calls += 1
         c.by_model[self.model] = c.by_model.get(self.model, 0) + 1
-        return self.inner.complete(system, user, max_output=max_output)
+        try:
+            return self.inner.complete(system, user, max_output=max_output)
+        except ModelDown as exc:
+            c.down[self.model] = exc.reason
+            raise
+        except LLMUnavailable as exc:
+            c.down[self.model] = str(exc)
+            raise ModelDown(self.model, str(exc)) from exc
+
+
+class FallbackLLM:
+    """An agent's model with fallbacks: calls the first model that is not down, in order.
+    Raises ``ModelDown`` only when every model in the list is down."""
+
+    def __init__(self, models: list[BudgetedLLM]):
+        self.models = models
+
+    def _live(self) -> list[BudgetedLLM]:
+        return [m for m in self.models if m.model not in m.counter.down]
+
+    @property
+    def model(self) -> str:
+        live = self._live()
+        return (live or self.models)[0].model
+
+    def complete(self, system: str, user: str, *, max_output: int = 4096) -> str:
+        for m in self._live():
+            try:
+                return m.complete(system, user, max_output=max_output)
+            except ModelDown:
+                continue
+        names = ", ".join(m.model for m in self.models)
+        raise ModelDown(names, "every model for this agent is down")
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +212,9 @@ class AgentsConfig:
     floor_share: float
     max_output: int
     models: ModelsConfig
+    max_arm_share: float | None = None
+    refill_passes: int = 0   # extra allocation passes per round for slots emptied by drops
+    repair: RepairLearningConfig = field(default_factory=RepairLearningConfig)
 
     def used_models(self) -> list[str]:
         """Model ids this config will call (agents with the model switched off left out)."""
@@ -262,6 +324,10 @@ def agents_config_from_dict(raw) -> AgentsConfig:
         floor_share=float(floor),
         max_output=_pos_int(raw, "agents", "max_output", lo=256),
         models=models_config_from_dict(raw.get("models")),
+        repair=RepairLearningConfig.from_dict(secs["repair"]),
+        max_arm_share=_opt_num(secs["director"], "director", "max_arm_share", 0, 1),
+        refill_passes=(_pos_int(secs["director"], "director", "refill_passes", lo=0)
+                       if "refill_passes" in secs["director"] else 0),
     )
 
 
@@ -338,7 +404,8 @@ class ResearchRun:
                  llm_factory: Callable[[str], LLMClient], client: BrainClient,
                  config: Config, playbook: Playbook,
                  spec: FastExprSpec, generator_config: GeneratorConfig, memory: MemoryStore,
-                 datafields: list[str] | None = None, seed: int | None = None,
+                 datafields: list[str] | None = None, field_meta: dict | None = None,
+                 seed: int | None = None,
                  sleep: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.monotonic, out: TextIO | None = None,
                  run_id: str | None = None):
@@ -353,6 +420,8 @@ class ResearchRun:
         self.spec = spec
         self.generator_config = generator_config
         self.datafields = datafields
+        self.field_meta = field_meta or {}
+        typed = catalog(datafields, self.field_meta)  # agents' validators check vec_* use
         self.out = out
         self.run_id = run_id or "rs" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
         self.pipeline = Pipeline(config, playbook, client, memory, sleep=sleep, clock=clock,
@@ -360,21 +429,21 @@ class ResearchRun:
         limits, mo = generator_config.limits, agents.max_output
         ctx = brain_context(config)  # thresholds from config, shown to every agent's model
         m = self.models
-        pf_llm = self.llm(m.prefilter) if agents.prefilter.use_model else None
+        pf_llm = self.fallback(m.prefilter) if agents.prefilter.use_model else None
         self.prefilter = PreFilter(agents.prefilter, spec, memory, llm=pf_llm,
-                                   datafields=datafields, limits=limits, max_output=mo, context=ctx)
-        # one Critic per critic model; without the critic model, one rules-only Critic
-        critic_models = m.critic if agents.critic_model else (None,)
-        self.critics = {cm: Critic(spec, llm=self.llm(cm) if cm else None, datafields=datafields,
+                                   datafields=typed, limits=limits, max_output=mo, context=ctx)
+        # one Critic per critic model, plus a rules-only Critic (None) for when they are down
+        critic_models = (*m.critic, None) if agents.critic_model else (None,)
+        self.critics = {cm: Critic(spec, llm=self.llm(cm) if cm else None, datafields=typed,
                                    limits=limits, max_output=mo, context=ctx)
                         for cm in critic_models}
-        self.judge = DebateJudge(llm=self.llm(m.debate) if agents.debate_model else None,
+        self.judge = DebateJudge(llm=self.fallback(m.debate) if agents.debate_model else None,
                                  max_output=mo, context=ctx)
         self.repairer = RepairAgent(playbook, spec, memory,
-                                    llm=self.llm(m.repair) if agents.repair_model else None,
-                                    datafields=datafields, limits=limits, max_output=mo,
-                                    context=ctx)
-        st_llm = self.llm(m.strategy) if agents.strategy.every_rounds else None
+                                    llm=self.fallback(m.repair) if agents.repair_model else None,
+                                    datafields=typed, limits=limits, max_output=mo,
+                                    context=ctx, learning=agents.repair, seed=seed)
+        st_llm = self.fallback(m.strategy) if agents.strategy.every_rounds else None
         self.strategist = StrategyEvolution(agents.strategy, llm=st_llm, max_output=mo,
                                             context=ctx)
 
@@ -392,6 +461,7 @@ class ResearchRun:
         self.sims_used = 0
         self.log: list[dict] = []
         self.stop_reason: str | None = None
+        self.resumed: list[dict] = []
         self.warm_started = self._warm_start()
 
     # ------------------------------------------------------------------ setup
@@ -403,12 +473,27 @@ class ResearchRun:
                                             model=model)
         return self._llms[model]
 
+    def fallback(self, model: str) -> FallbackLLM:
+        """``model`` first, then the generator models, then every other model the run uses."""
+        order = dict.fromkeys([model, *self.models.generator, *self.agents.used_models()])
+        return FallbackLLM([self.llm(m) for m in order])
+
+    def down(self) -> dict[str, str]:
+        """Models out for the rest of the run, with the reason."""
+        return dict(self.counter.down)
+
     def _critics_for(self, key: tuple) -> tuple[str | None, list[str]]:
-        """(primary critic model, shadow critic models) for an arm."""
+        """(primary critic model, shadow critic models) for an arm. The primary is the
+        first critic from another provider that is not down; with none left, the rules-only
+        critic (None)."""
         if not self.agents.critic_model:
             return None, []
-        primary = self.models.primary_critic(key[3])
-        shadows = [cm for cm in self.critics if cm != primary] if self.models.shadow_critics else []
+        g = provider_of(key[3])
+        primary = next((c for c in self.models.critic
+                        if provider_of(c) != g and c not in self.counter.down), None)
+        shadows = ([cm for cm in self.critics
+                    if cm not in (primary, None) and cm not in self.counter.down]
+                   if self.models.shadow_critics else [])
         return primary, shadows
 
     def _warm_start(self) -> int:
@@ -433,12 +518,56 @@ class ResearchRun:
             cfg = dataclasses.replace(self.generator_config, prompt_version=key[2])
             self.generators[key] = AlphaGenerator(self.llm(key[3]), self.spec, plan.settings,
                                                   cfg, datafields=self.datafields,
-                                                  guidance=plan.guidance)
+                                                  guidance=plan.guidance,
+                                                  field_meta=self.field_meta)
         return self.generators[key]
 
     # ------------------------------------------------------------------ run
 
+    def _resume_repairs(self) -> None:
+        """Queue a child for the repair decisions in memory that have no child yet, closest
+        to accept first, at most ``repair.max_resume``; the Repair Agent's lineage budget
+        still applies to each."""
+        outcomes = self.memory.candidate_outcomes()
+        parents = {row["candidate"].parent_id for row in outcomes}
+        models = arm_models(outcomes, self.memory.critic_reviews())
+        cfg = self.agents.repair
+        open_rows = []
+        for row in outcomes:
+            c, d = row["candidate"], row["decision"]
+            if d is None or d.decision != "repair" or c.candidate_id in parents:
+                continue
+            key = (c.dataset, c.region, c.prompt_version, models.get(c.candidate_id))
+            if key not in self.repair_queue:
+                continue
+            dist = distance(d, row["result"], cfg.unmeasured_failure_penalty)
+            open_rows.append((float("inf") if dist is None else dist, len(open_rows), key, row))
+        open_rows.sort(key=lambda t: (t[0], t[1]))
+        for _, _, key, row in open_rows:
+            if sum(1 for i in self.resumed if "child" in i) >= cfg.max_resume:
+                break
+            c, d = row["candidate"], row["decision"]
+            rep = self.repairer.repair(c, d, row["result"], self._pool_expressions())
+            item = {"parent": c.candidate_id, "arm": "/".join(map(str, key)), "notes": rep.notes}
+            if rep.child is not None:
+                self.repair_queue[key].append(rep.child)
+                item["child"] = rep.child.candidate_id
+            self.resumed.append(item)
+        if self.resumed:
+            self._emit(f"--- resumed {len(self.resumed)} repair(s) from memory: "
+                       f"{[i.get('child') for i in self.resumed]}")
+
+    def _pool_expressions(self) -> list[str]:
+        return [c.expression for a in self.pipeline.pool.alpha_ids()
+                if (c := self.memory.get_candidate(a)) is not None]
+
     def run(self, rounds: int) -> dict:
+        if self.agents.repair.resume_from_memory:
+            try:
+                self._resume_repairs()
+            except LLMUnavailable as exc:
+                self.stop_reason = str(exc)
+                return self.report()
         for r in range(1, rounds + 1):
             if self.sims_used >= self.budget.max_simulations:
                 self.stop_reason = "simulation budget used up"
@@ -460,24 +589,89 @@ class ResearchRun:
             self.stop_reason = self.stop_reason or f"completed {rounds} rounds"
         return self.report()
 
+    def _take_repairs(self, cap: int) -> dict[tuple, list[CandidateRecord]]:
+        """Up to ``cap`` queued repairs, one arm at a time in turn, oldest first."""
+        taken: dict[tuple, list[CandidateRecord]] = {}
+        while cap > 0 and any(self.repair_queue.values()):
+            for key, queue in self.repair_queue.items():
+                if queue and cap > 0:
+                    taken.setdefault(key, []).append(queue.popleft())
+                    cap -= 1
+        return taken
+
     def _round(self, r: int) -> None:
         slots = min(self.budget.per_round, self.budget.max_simulations - self.sims_used)
-        alloc = self.director.allocate(slots, self.agents.floor_share)
-        entry = {"round": r, "allocation": {"/".join(map(str, k)): n for k, n in alloc.items()},
-                 "arms": []}
+        entry = {"round": r, "arms": []}
         self.log.append(entry)
-        self._emit(f"--- round {r}: {slots} slots, allocation {entry['allocation']}")
-        for i, (key, n) in enumerate(alloc.items()):
-            if n == 0:
-                continue
-            arm_log = {"arm": "/".join(map(str, key)), "slots": n}
+        # queued repairs first: a near-miss alpha is the cheapest chance of an accept, and an
+        # arm the Director gives no slot would otherwise never run its repairs
+        cap = math.ceil(slots * self.agents.repair.max_share_per_round)
+        first = self._take_repairs(min(cap, slots))
+        for key, cands in first.items():
+            arm_log = {"arm": "/".join(map(str, key)), "slots": len(cands), "repairs_first": True}
             entry["arms"].append(arm_log)
-            self._arm(r, i, key, n, arm_log)
+            self._screen_and_simulate(key, cands, {}, arm_log)
             if self.sims_used >= self.budget.max_simulations:
                 self.stop_reason = "simulation budget used up"
                 return
+        slots -= sum(len(c) for c in first.values())
+        live = self._live_arms()
+        if not live:
+            self.stop_reason = "every generator model is down: " + "; ".join(
+                f"{m}: {why}" for m, why in self.counter.down.items())
+            return
+        alloc = (self.director.allocate(slots, self.agents.floor_share, self.agents.max_arm_share,
+                                        only=live) if slots > 0 else {})
+        entry["allocation"] = {"/".join(map(str, k)): n for k, n in alloc.items()}
+        self._emit(f"--- round {r}: {slots} slots after {sum(len(c) for c in first.values())} "
+                   f"queued repair(s), allocation {entry['allocation']}")
+        lost, emptied = self._run_allocation(r, alloc, entry, "")
+        passes = 0
+        while not self.stop_reason:
+            spare = lost
+            if emptied and passes < self.agents.refill_passes:
+                spare += emptied
+                passes += 1
+            spare = min(spare, self.budget.max_simulations - self.sims_used)
+            live = self._live_arms()
+            if spare <= 0 or not live:
+                return
+            alloc = self.director.allocate(spare, self.agents.floor_share,
+                                           self.agents.max_arm_share, only=live)
+            entry.setdefault("refills", []).append(
+                {"/".join(map(str, k)): n for k, n in alloc.items() if n})
+            self._emit(f"--- round {r}: refill {spare} unused slot(s): {entry['refills'][-1]}")
+            lost, emptied = self._run_allocation(r, alloc, entry, f"f{len(entry['refills'])}")
 
-    def _arm(self, r: int, i: int, key: tuple, n: int, log: dict) -> None:
+    def _live_arms(self) -> list[tuple]:
+        return [k for k in self.arms if k[3] not in self.counter.down]
+
+    def _run_allocation(self, r: int, alloc: dict, entry: dict, tag: str) -> tuple[int, int]:
+        """Run each arm's slots. Returns (slots lost to a down generator model, slots
+        emptied by the generator, Pre-Filter or Critic)."""
+        lost = emptied = 0
+        for i, (key, n) in enumerate(alloc.items()):
+            if n == 0:
+                continue
+            if key[3] in self.counter.down:  # went down earlier in this pass
+                lost += n
+                continue
+            arm_log = {"arm": "/".join(map(str, key)), "slots": n}
+            if tag:
+                arm_log["refill"] = True
+            entry["arms"].append(arm_log)
+            d, e = self._arm(r, i, key, n, arm_log, tag)
+            lost, emptied = lost + d, emptied + e
+            if self.sims_used >= self.budget.max_simulations:
+                self.stop_reason = "simulation budget used up"
+                break
+        return lost, emptied
+
+    def _arm(self, r: int, i: int, key: tuple, n: int, log: dict,
+             tag: str = "") -> tuple[int, int]:
+        """Fill ``n`` slots of one arm. Returns (slots lost to a down generator model,
+        slots emptied by the generator, Pre-Filter or Critic)."""
+        lost = 0
         queue = self.repair_queue[key]
         batch = [queue.popleft() for _ in range(min(n, len(queue)))]
         log["repairs_taken"] = len(batch)
@@ -488,35 +682,50 @@ class ResearchRun:
             source = plan.sources[0]
             plan.sources.rotate(-1)
             try:
-                res = self._generator(key).generate(source, need, batch_id=f"{self.run_id}r{r:02d}a{i}")
+                res = self._generator(key).generate(
+                    source, need, batch_id=f"{self.run_id}r{r:02d}a{i}{tag}")
             except GenerationError as exc:
                 log["generation_error"] = str(exc)
                 res = None
+            except ModelDown as exc:  # the arm gets no more slots; the run goes on
+                log["generation_error"] = str(exc)
+                self._emit(f"{exc}; its arms get no more slots, these go to live arms")
+                res = None
+                lost = need
             if res is not None:
                 batch += res.candidates
                 rationales.update(res.rationales)
                 log["generated"] = len(res.candidates)
                 log["generator_rejected"] = len(res.rejected)
+        simulated = self._screen_and_simulate(key, batch, rationales, log)
+        return lost, max(0, n - lost - simulated)
 
+    def _screen_and_simulate(self, key: tuple, batch: list[CandidateRecord],
+                             rationales: dict[str, str], log: dict) -> int:
+        """Pre-Filter, Critic and judge, then simulate. Returns how many were simulated."""
         pf = self.prefilter.run(batch)
         log["prefilter_dropped"] = [[c.candidate_id, why] for c, why in pf.dropped]
         primary, shadows = self._critics_for(key)
         log["critic"] = primary
         rv = review_and_debate(pf.kept, rationales, self.critics[primary], self.judge)
         self._record_reviews(key, primary, "primary", rv.reviews)
-        for cm in shadows:  # recorded for compare.py; never changes what is simulated
+        fresh = [c for c in pf.kept if c.lever is None]
+        for cm in shadows if fresh else []:  # recorded for compare.py; never changes what is simulated
             shadow = ReviewOutcome()
-            reviews = self.critics[cm].review(pf.kept, rationales, shadow)
+            reviews = self.critics[cm].review(fresh, rationales, shadow)
             self._record_reviews(key, cm, "shadow", reviews)
             log.setdefault("shadow_verdicts", {})[cm] = {cid: r.verdict
                                                          for cid, r in reviews.items()}
         log["critic_dropped"] = [[c.candidate_id, why] for c, why in rv.dropped]
         log["revised"] = [c.candidate_id for c in rv.to_simulate if c.lever == "critic_revision"]
         log["outcomes"] = []
+        simulated = 0
         for cand in rv.to_simulate:
             if self.sims_used >= self.budget.max_simulations:
                 break
             self._simulate(key, cand, log)
+            simulated += 1
+        return simulated
 
     def _record_reviews(self, key: tuple, critic_model: str | None, role: str,
                         reviews: dict) -> None:
@@ -537,36 +746,60 @@ class ResearchRun:
         if outcome.decision in DECIDED:
             self.director.update(key, outcome.decision == "accept")
         if outcome.decision == "repair" and outcome.decision_record is not None:
-            pool = [c.expression for a in self.pipeline.pool.alpha_ids()
-                    if (c := self.memory.get_candidate(a)) is not None]
-            rep = self.repairer.repair(cand, outcome.decision_record, outcome.result, pool)
+            rep = self.repairer.repair(cand, outcome.decision_record, outcome.result,
+                                       self._pool_expressions())
             item["repair"] = rep.notes
             if rep.child is not None:
                 self.repair_queue[key].append(rep.child)
                 item["repair_child"] = rep.child.candidate_id
 
     def _evolve(self, r: int) -> None:
+        known = sorted({k[0] for k in self.arms}
+                       | {m["dataset"] for m in self.field_meta.values() if m.get("dataset")})
         evo = self.strategist.evolve(self.memory.candidate_outcomes(),
-                                     self.generator_config.prompt_version)
+                                     self.generator_config.prompt_version, known_datasets=known)
         if evo is None:
             return
         added = []
-        for key, plan in list(self.arms.items()):
-            if key[2] != self.generator_config.prompt_version:
-                continue
+        base = [(k, p) for k, p in self.arms.items() if k[2] == self.generator_config.prompt_version]
+        arm_datasets = {k[0] for k in self.arms}
+        catalog_datasets = {m["dataset"] for m in self.field_meta.values() if m.get("dataset")}
+        # a hypothesis on a catalog dataset no arm covers gets arms of its own (one per
+        # generator model), so the Director credits that dataset, not the arm it ran under
+        # (run rs20261104163055 ran news12 ideas as analyst4 and model51); one on an unknown
+        # dataset goes to every arm, as before
+        new_ds: dict[str, list[str]] = {}
+        for ds, text in evo.hypotheses:
+            if ds is not None and ds not in arm_datasets and ds in catalog_datasets:
+                new_ds.setdefault(ds, []).append(text)
+        for key, plan in base:
             new_key = (key[0], key[1], evo.prompt_version, key[3])
             sources = deque(plan.sources)
             for ds, text in evo.hypotheses:
-                if ds is None or ds == key[0]:
+                if ds is None or ds == key[0] or (ds not in arm_datasets and ds not in new_ds):
                     sources.appendleft(Source("hypothesis", text))
-            self.arms[new_key] = ArmPlan(plan.dataset, plan.settings, sources, evo.guidance)
-            self.repair_queue[new_key] = deque()
-            if self.director.add_arm(new_key):
-                added.append("/".join(map(str, new_key)))
+            self._add_arm(new_key, ArmPlan(plan.dataset, plan.settings, sources, evo.guidance),
+                          added)
+        templates = {k[3]: p for k, p in base}   # one plan per generator model for the settings
+        for ds, texts in new_ds.items():
+            for model, plan in templates.items():
+                region = plan.settings.region
+                settings = dataclasses.replace(plan.settings, dataset=ds)
+                sources = deque(Source("hypothesis", t) for t in texts)
+                self._add_arm((ds, region, evo.prompt_version, model),
+                              ArmPlan(ds, settings, sources, evo.guidance), added)
         self.log[-1]["evolution"] = {"prompt_version": evo.prompt_version, "source": evo.source,
                                      "guidance": evo.guidance, "hypotheses": evo.hypotheses,
                                      "new_arms": added, "notes": evo.notes}
         self._emit(f"--- strategy evolution: {evo.prompt_version} ({evo.source}), new arms {added}")
+
+    def _add_arm(self, key: tuple, plan: ArmPlan, added: list[str]) -> None:
+        if key in self.arms:
+            return
+        self.arms[key] = plan
+        self.repair_queue[key] = deque()
+        if self.director.add_arm(key):
+            added.append("/".join(map(str, key)))
 
     # ------------------------------------------------------------------ report
 
@@ -583,8 +816,9 @@ class ResearchRun:
             "simulations_used": self.sims_used,
             "model_calls": self.counter.calls,
             "model_calls_by_model": dict(self.counter.by_model),
+            "models_down": self.down(),
             "models": {"generator": list(self.models.generator),
-                       "critic": list(self.critics) if self.agents.critic_model else [],
+                       "critic": [c for c in self.critics if c] if self.agents.critic_model else [],
                        "shadow_critics": self.models.shadow_critics,
                        "prefilter": self.models.prefilter, "debate": self.models.debate,
                        "repair": self.models.repair, "strategy": self.models.strategy},
@@ -593,6 +827,10 @@ class ResearchRun:
             "warm_start_outcomes": self.warm_started,
             "pool_size": self.pipeline.pool.count(),
             "arms": arms,
+            "resumed_repairs": self.resumed,
+            "lever_stats": LeverStats.from_events(
+                repair_events(self.memory.candidate_outcomes(), self.agents.repair),
+                self.agents.repair.prior).table(),
             "comparison": model_comparison(self.memory.candidate_outcomes(),
                                            self.memory.critic_reviews()),
             "rounds": self.log,

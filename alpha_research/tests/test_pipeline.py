@@ -30,7 +30,7 @@ def test_candidate_file_coverage():
     count = lambda d, f=None: sum(1 for x in expected if x[0] == d and (f is None or x[1] == f))
     assert len(entries) == 31
     assert count("accept") == 5
-    assert count("reject", "sharpe") == 5
+    assert count("reject", "sharpe") == 2 and count("repair", "sharpe") == 3   # near misses
     assert count("repair", "turnover") == 5
     assert count("reject", "concentration") + count("reject", "drawdown") == 3
     assert count("repair", "sub_universe") == 3

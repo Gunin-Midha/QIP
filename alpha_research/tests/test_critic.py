@@ -59,6 +59,38 @@ def test_model_revision_becomes_child(candidate):
     assert out.rulings["g1"].source == "model"
 
 
+def test_repair_children_get_rule_checks_only(candidate):
+    fresh = candidate(candidate_id="g1", expression="ts_delta(close, 5)")
+    child = candidate(candidate_id="p_r1", expression="ts_delta(close, 10)", parent_id="p",
+                      lever="increase_decay", generation=1)
+    bad = candidate(candidate_id="p_r2", expression="rank(ts_delay(close, -1))", parent_id="p",
+                    lever="model_repair", generation=1)
+    llm = ScriptedLLMClient([reviews(
+        {"candidate_id": "g1", "verdict": "simulate"},
+        {"candidate_id": "p_r1", "verdict": "revise", "revised_expression": "rank(close)"})])
+    out = review_and_debate([fresh, child, bad], {}, Critic(SPEC, llm=llm), DebateJudge())
+    # the model saw only the fresh candidate, the repair is simulated as the lever wrote it,
+    # and a blocking rule issue still drops a repair
+    assert out.to_simulate == [fresh, child] and out.dropped[0][0] == bad
+    assert out.reviews["p_r1"].source == "rules" and out.llm_calls == 1
+
+
+def test_model_down_falls_back_to_rules(candidate):
+    from alpha_research.llm import ModelDown
+
+    class Down:
+        model = "down"
+
+        def complete(self, *a, **k):
+            raise ModelDown("down", "daily quota")
+
+    c = candidate(candidate_id="g1", expression="rank(ts_delay(close, -1))")
+    out = review_and_debate([c], {}, Critic(SPEC, llm=Down()), DebateJudge(llm=Down()))
+    assert out.dropped[0][0] == c and out.reviews["g1"].source == "rules"
+    assert any("critic model down" in n for n in out.notes)
+    assert any("judge model down" in n for n in out.notes)
+
+
 def test_invalid_revision_is_ignored_and_revise_becomes_simulate(candidate):
     c = candidate(candidate_id="g1")
     critic = Critic(SPEC, llm=ScriptedLLMClient([reviews(

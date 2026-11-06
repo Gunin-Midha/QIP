@@ -124,9 +124,12 @@ class Pipeline:
             veto, risk_checks, risk_reasons = risk.assess(result, self.config, gates)
         else:
             veto, risk_checks, risk_reasons = False, [], []
-        decision = evaluator.decide(result, gates, self.playbook, risk_checks, veto, risk_reasons)
+        decision = evaluator.decide(result, gates, self.playbook, risk_checks, veto, risk_reasons,
+                                    self.config.repair.near_miss_share)
 
         admitted_by_diversity = None
+        if decision.decision == "accept":
+            decision = self._overfitting(candidate, result, decision)
         if decision.decision == "accept":
             admitted_by_diversity, decision = self._diversity(result, decision)
 
@@ -136,6 +139,19 @@ class Pipeline:
         self.loop.route(candidate, decision)
         return self._emit(Outcome(candidate.candidate_id, decision.decision,
                                   decision.failure_class, result, decision))
+
+    def _overfitting(self, candidate: CandidateRecord, result: ResultRecord,
+                     decision: DecisionRecord) -> DecisionRecord:
+        """Overfitting auditor at accept time: deflated Sharpe over the repair lineage."""
+        g = self.auditor.check_accept(candidate.candidate_id, result)
+        gate_results = list(decision.gate_results) + [g]
+        if g.passed is False:
+            return dataclasses.replace(
+                decision, decision="reject", failure_class="other", gate_results=gate_results,
+                reasons=decision.reasons + [f"overfitting: deflated Sharpe {g.value} is not "
+                                            f"above {g.threshold} ({g.note})"])
+        return dataclasses.replace(decision, gate_results=gate_results,
+                                   reasons=decision.reasons + [f"deflated_sharpe: {g.note}"])
 
     def _diversity(self, result: ResultRecord,
                    decision: DecisionRecord) -> tuple[bool | None, DecisionRecord]:

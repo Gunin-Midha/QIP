@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import random
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -37,7 +38,7 @@ from typing import Callable, Collection, Iterable
 import yaml
 
 from .config import ConfigError
-from .fastexpr import Analysis, ComplexityLimits, FastExprSpec, analyze
+from .fastexpr import Analysis, ComplexityLimits, FastExprSpec, analyze, catalog
 from .llm import LLMClient
 from .schemas import (NEUTRALIZATIONS, CandidateRecord, SchemaError, experiment_hash)
 
@@ -59,6 +60,10 @@ class GeneratorConfig:
     max_datafields_in_prompt: int
     max_output: int
     limits: ComplexityLimits
+    # share of the listed fields drawn from across the catalog (other datasets), not by
+    # relevance, so the model sees more than the obvious inputs (owner 2026-11-04: keep
+    # the search diverse)
+    datafield_exploration_share: float = 0.0
 
 
 def _cfg_int(d: dict, key: str, *, nullable: bool = False, minimum: int = 0) -> int | None:
@@ -96,7 +101,15 @@ def load_generator_config(path: str | Path) -> GeneratorConfig:
             max_calls=_cfg_int(g, "max_operator_calls", nullable=True, minimum=1),
             max_chars=_cfg_int(g, "max_expression_chars", nullable=True, minimum=1),
         ),
+        datafield_exploration_share=_cfg_share(g, "datafield_exploration_share"),
     )
+
+
+def _cfg_share(d: dict, key: str) -> float:
+    v = d.get(key, 0.0)
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 1:
+        raise ConfigError(f"generator config: {key!r} must be a number in [0, 1], got {v!r}")
+    return float(v)
 
 
 @dataclass(frozen=True)
@@ -162,6 +175,25 @@ def load_datafields(path: str | Path) -> list[str]:
     ids = [ln.split(",")[0].strip() for ln in text.splitlines()
            if ln.strip() and not ln.lstrip().startswith("#")]
     return sorted(set(i for i in ids if i))
+
+
+def load_datafield_meta(path: str | Path) -> dict[str, dict]:
+    """Per-field facts from a JSON catalog written by ``cli brain datafields``: coverage
+    (share of instruments with a value), alpha_count (BRAIN alphas using the field, a
+    crowding measure) and dataset. Empty for a catalog of bare ids or a text file."""
+    if Path(path).suffix.lower() != ".json":
+        return {}
+    data = json.loads(Path(path).read_text())
+    if isinstance(data, dict):
+        data = data.get("datafields", data.get("results", []))
+    meta = {}
+    for x in data:
+        if isinstance(x, dict) and isinstance(x.get("id"), str):
+            ds = x.get("dataset")
+            meta[x["id"]] = {"coverage": x.get("coverage"), "alpha_count": x.get("alphaCount"),
+                             "dataset": ds.get("id") if isinstance(ds, dict) else ds,
+                             "type": x.get("type")}
+    return meta
 
 
 # ---------------------------------------------------------------------------
@@ -233,20 +265,69 @@ EXTRACT_SYSTEM = (
     " Reply with a single JSON object and nothing else: no prose, no code fences.")
 
 
-def _rank_datafields(catalog: Collection[str], text: str, limit: int) -> list[str]:
+def _rank_datafields(catalog: Collection[str], text: str, limit: int,
+                     meta: dict | None = None) -> list[str]:
     """Most relevant catalog fields first: score by how many underscore-separated parts of
-    the field id occur in the text. Deterministic; ties break alphabetically."""
+    the field id occur in the text. Deterministic; ties break toward less crowded fields
+    (fewer BRAIN alphas use them, when ``meta`` says), then alphabetically."""
     low = text.lower()
+    meta = meta or {}
 
     def score(name: str) -> int:
         return sum(1 for part in set(name.lower().split("_")) if len(part) >= 3 and part in low)
 
-    return sorted(catalog, key=lambda n: (-score(n), n))[:limit]
+    def crowd(name: str) -> float:
+        n = (meta.get(name) or {}).get("alpha_count")
+        return float(n) if isinstance(n, (int, float)) else float("inf")
+
+    return sorted(catalog, key=lambda n: (-score(n), crowd(n), n))[:limit]
+
+
+NOT_SIGNALS = {"SYMBOL", "UNIVERSE"}   # identifiers and universe flags: never sampled
+TYPE_HINTS = {"VECTOR": "vector: wrap in vec_avg or vec_sum", "GROUP": "group"}
+
+
+def select_datafields(catalog: Collection[str], text: str, limit: int,
+                      explore_share: float = 0.0,
+                      meta: dict | None = None) -> tuple[list[str], list[str]]:
+    """(relevant, exploration) fields for the prompt. The relevant part is
+    ``_rank_datafields``; the exploration part (``explore_share`` of ``limit``) is drawn
+    from the rest of the catalog one dataset at a time in turn, so every dataset can show
+    up, in an order fixed by the text (the same task always sees the same fields)."""
+    meta = meta or {}
+    n_explore = round(limit * explore_share) if len(catalog) > limit else 0
+    relevant = _rank_datafields(catalog, text, limit - n_explore, meta)
+    chosen = set(relevant)
+    rng = random.Random(hashlib.sha1(text.encode()).hexdigest())
+    by_ds: dict[str, list[str]] = {}
+    for f in sorted(catalog):
+        if f not in chosen and (meta.get(f) or {}).get("type") not in NOT_SIGNALS:
+            by_ds.setdefault((meta.get(f) or {}).get("dataset") or "unknown", []).append(f)
+    for fields in by_ds.values():
+        rng.shuffle(fields)
+    order = sorted(by_ds)
+    rng.shuffle(order)
+    explore: list[str] = []
+    while len(explore) < n_explore and any(by_ds.values()):
+        for ds in order:
+            if by_ds[ds] and len(explore) < n_explore:
+                explore.append(by_ds[ds].pop())
+    return relevant, explore
+
+
+def _annotate(name: str, meta: dict) -> str:
+    m = meta.get(name) or {}
+    bits = [TYPE_HINTS[m["type"]]] if m.get("type") in TYPE_HINTS else []
+    if isinstance(m.get("coverage"), (int, float)):
+        bits.append(f"cov {m['coverage'] * 100:.0f}%")
+    if isinstance(m.get("alpha_count"), (int, float)):
+        bits.append(f"{m['alpha_count']} alphas")
+    return f"{name} [{', '.join(bits)}]" if bits else name
 
 
 def build_system_prompt(spec: FastExprSpec, datafields: Collection[str] | None,
                         relevance_text: str, config: GeneratorConfig,
-                        guidance: str | None = None) -> str:
+                        guidance: str | None = None, meta: dict | None = None) -> str:
     lines = [
         "You are a quantitative researcher writing alpha expressions for the WorldQuant "
         "BRAIN platform, in the Fast Expression language.",
@@ -275,10 +356,24 @@ def build_system_prompt(spec: FastExprSpec, datafields: Collection[str] | None,
         f"Base fields: {', '.join(sorted(spec.base_fields))}",
     ]
     if datafields is not None:
-        shown = _rank_datafields(datafields, relevance_text, config.max_datafields_in_prompt)
-        lines.append(f"Datafields (use only these and the base fields; {len(shown)} of "
-                     f"{len(datafields)} shown, the most relevant to this task):")
-        lines.append("  " + ", ".join(shown))
+        meta = meta or {}
+        shown, explore = select_datafields(datafields, relevance_text,
+                                           config.max_datafields_in_prompt,
+                                           config.datafield_exploration_share, meta)
+        lines.append(f"Datafields (use only these and the base fields; "
+                     f"{len(shown) + len(explore)} of {len(datafields)} shown). Most relevant "
+                     f"to this task:")
+        lines.append("  " + ", ".join(_annotate(f, meta) for f in shown))
+        if explore:
+            lines.append("From across the other datasets (optional; for combinations or "
+                         "conditioning beyond the obvious inputs):")
+            lines.append("  " + ", ".join(_annotate(f, meta) for f in explore))
+        if meta:
+            lines.append("In brackets: cov = share of stocks with a value (for a low-coverage "
+                         "field consider ts_backfill or group_backfill so more stocks carry a "
+                         "signal); alphas = how many BRAIN alphas already use the field (a "
+                         "heavily used field is crowded and less likely to be new). Hints, "
+                         "not limits: every listed field may be used.")
     else:
         lines.append("No datafield catalog was supplied. Prefer the base fields. Any other "
                      "datafield name you use may not exist on the platform and will be "
@@ -407,6 +502,25 @@ class _Draft:
     analysis: Analysis
 
 
+def signal_dataset(fields: Collection[str], base_fields: Collection[str], meta: dict,
+                   default: str | None) -> str | None:
+    """The dataset an expression's signal comes from: the one most of its non-base
+    datafields belong to (``meta`` from the catalog), the arm's own dataset on a tie or
+    when no field's dataset is known. Strategy Evolution counts tries per dataset and the
+    overfitting audit counts trials per dataset, so the label must follow the fields."""
+    counts: dict[str, int] = {}
+    for f in fields:
+        ds = (meta.get(f) or {}).get("dataset")
+        if f not in base_fields and ds:
+            counts[ds] = counts.get(ds, 0) + 1
+    if not counts:
+        return default
+    top = max(counts.values())
+    if counts.get(default) == top:
+        return default
+    return min(d for d, n in counts.items() if n == top)
+
+
 # ---------------------------------------------------------------------------
 # the agent
 # ---------------------------------------------------------------------------
@@ -416,15 +530,17 @@ class AlphaGenerator:
                  config: GeneratorConfig, *, datafields: Iterable[str] | None = None,
                  known_hashes: Iterable[str] = (),
                  now: Callable[[], datetime] | None = None,
-                 guidance: str | None = None):
+                 guidance: str | None = None, field_meta: dict | None = None):
         self.llm = llm
         self.spec = spec
         self.settings = settings
         self.config = config
         self.datafields = None if datafields is None else sorted(set(datafields))
+        self.catalog = catalog(self.datafields, field_meta)  # with types, for the validator
         self._seen: set[str] = set(known_hashes)  # experiment hashes already produced or run
         self._now = now or (lambda: datetime.now(timezone.utc))
         self.guidance = guidance  # from Strategy Evolution; shown in the system prompt
+        self.field_meta = field_meta or {}
 
     # ------------------------------------------------------------------ public
 
@@ -490,7 +606,7 @@ class AlphaGenerator:
     def _generate_unit(self, unit: _Unit, k: int, result: GenerationResult) -> None:
         relevance = unit.hypothesis + " " + (unit.context or "")
         system = build_system_prompt(self.spec, self.datafields, relevance, self.config,
-                                     self.guidance)
+                                     self.guidance, self.field_meta)
         reply = self._ask_json(system, _generate_prompt(unit.hypothesis, unit.context, k), result)
         good, bad = self._check(self._items(reply), unit)
 
@@ -534,7 +650,7 @@ class AlphaGenerator:
                                     ["item has no 'expression' string"]))
                 continue
             expr = expr.strip()
-            a = analyze(expr, self.spec, datafields=self.datafields,
+            a = analyze(expr, self.spec, datafields=self.catalog,
                         limits=self.config.limits)
             if a.ok:
                 good.append(_Draft(expr, raw, a))
@@ -564,6 +680,10 @@ class AlphaGenerator:
 
         hyp = raw.get("hypothesis")
         hyp = hyp.strip() if isinstance(hyp, str) and hyp.strip() else unit.hypothesis
+        dataset = signal_dataset(draft.analysis.fields_used, self.spec.base_fields,
+                                 self.field_meta, s.dataset)
+        if dataset != s.dataset:
+            warnings.append(f"dataset {dataset} (from its fields; the arm's is {s.dataset})")
         cid = f"{result.batch_id}_{len(result.candidates) + 1:03d}"
         try:
             cand = CandidateRecord.from_dict({
@@ -571,7 +691,7 @@ class AlphaGenerator:
                 "region": s.region, "universe": s.universe, "delay": s.delay, "decay": decay,
                 "neutralization": neut, "truncation": s.truncation,
                 "start_date": s.start_date.isoformat(), "end_date": s.end_date.isoformat(),
-                "hypothesis": hyp, "dataset": s.dataset, "family": _clean_family(raw.get("family")),
+                "hypothesis": hyp, "dataset": dataset, "family": _clean_family(raw.get("family")),
                 "parent_id": None, "prompt_version": self.config.prompt_version,
                 "model": result.model,
             })

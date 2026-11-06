@@ -52,6 +52,14 @@ class Playbook:
             raise ConfigError(f"playbook file not found: {path}")
         return cls.from_dict(yaml.safe_load(path.read_text()))
 
+    def step_for(self, lever: str) -> dict | None:
+        """The step of a lever's first listing in the playbook (any class), else None."""
+        for levers in self.entries.values():
+            for lv in levers:
+                if lv.name == lever:
+                    return dict(lv.step)
+        return None
+
     def has_entry(self, failure_class: str) -> bool:
         return bool(self.entries.get(failure_class))
 

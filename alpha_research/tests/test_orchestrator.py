@@ -59,3 +59,9 @@ def test_add_arm_starts_from_the_prior():
     assert o.add_arm("b") is True and o.add_arm("b") is False
     assert o.arms == ["a", "b"] and o.pass_rate("b") == 0.5
     assert sum(o.allocate(10).values()) == 10
+
+
+def test_allocate_only_to_live_arms():
+    o = Orchestrator(["a", "b", "c"], seed=0)
+    alloc = o.allocate(6, floor_share=0.5, only=["a", "c"])
+    assert alloc["b"] == 0 and alloc["a"] + alloc["c"] == 6 and set(alloc) == {"a", "b", "c"}

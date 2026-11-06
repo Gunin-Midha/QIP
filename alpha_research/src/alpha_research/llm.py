@@ -14,16 +14,21 @@ and never needs a network.
   standard library (``urllib``), so it needs no extra package. The key is read from
   GEMINI_KEY_ENV_VAR and sent only in the ``x-goog-api-key`` header.
 * ``ChatCompletionsLLMClient`` calls a hosted chat-completions endpoint with ``urllib``
-  for open models (Qwen, DeepSeek, Nemotron...). Two hosts, chosen by the model id:
-  ``groq:<maker>/<model>`` goes to Groq (free plan includes ``groq:qwen/qwen3.8-27b``),
-  and a plain ``<maker>/<model>`` goes to OpenRouter (free variants end in ``:free``).
-  Each host's key is read from its own environment variable (HOSTS) and sent only in the
-  ``Authorization`` header.
+  for hosted models (Qwen, gpt-oss, Llama, DeepSeek...). The host comes from the model id:
+  ``<host>:<maker>/<model>`` goes to that host (``groq``, ``nvidia``, ``github``), and a
+  plain ``<maker>/<model>`` goes to OpenRouter (free variants end in ``:free``). With a
+  host prefix the maker may be left out when the name says it (``groq:gpt-oss-120b``,
+  ``groq:llama-3.3-70b-versatile``): BARE_MODEL_MAKERS gives the provider and, where the
+  host wants it, the namespace sent to the host. Each host's key is read from its own
+  environment variable (HOSTS) and sent only in the ``Authorization`` header.
+  ``list_models(host)`` asks a host which models it serves (``cli models``).
 
 Rate limits: when Gemini or a hosted endpoint answers HTTP 429 and says how long to wait
 ("try again in 7.95s", or Gemini's ``retryDelay``), the client waits that long and retries,
 up to RATE_LIMIT_RETRIES times, as long as the wait is at most RATE_LIMIT_MAX_WAIT_SECONDS.
-A longer wait (a daily quota) or a 429 without a wait fails as before. The retries happen
+A longer wait (a daily quota) or a 429 without a wait fails as before. A temporary server
+error (HTTP 500, 502, 503 or 504, such as Gemini's 503 "high demand") is retried after each
+wait in SERVER_ERROR_WAITS_SECONDS (10 s, 30 s, 60 s) before it fails. The retries happen
 inside one ``complete`` call, so the research budget counts them as one model call.
 
 The provider is inferred from the model id (``provider_of``): ``claude-*`` is Anthropic,
@@ -54,13 +59,29 @@ GEMINI_TIMEOUT_SECONDS = 300.0   # thinking models can take minutes on a long pr
 HOSTED_TIMEOUT_SECONDS = 300.0
 RATE_LIMIT_MAX_WAIT_SECONDS = 60.0   # a longer requested wait is a daily quota: give up
 RATE_LIMIT_RETRIES = 3
+SERVER_ERROR_STATUSES = (500, 502, 503, 504)
+SERVER_ERROR_WAITS_SECONDS = (10.0, 30.0, 60.0)   # one retry after each wait
 # host -> (chat-completions URL, key environment variable). The default host serves
 # plain "<maker>/<model>" ids; other hosts are named as a "<host>:" prefix on the id.
 HOSTS = {
     "openrouter": ("https://openrouter.ai/api/v1/chat/completions", "OPENROUTER_API_KEY"),
     "groq": ("https://api.groq.com/openai/v1/chat/completions", "GROQ_API_KEY"),
+    "nvidia": ("https://integrate.api.nvidia.com/v1/chat/completions", "NVIDIA_API_KEY"),
+    "github": ("https://models.github.ai/inference/chat/completions", "GITHUB_MODELS_TOKEN"),
 }
 DEFAULT_HOST = "openrouter"
+# where each host lists its models (default: the chat URL with chat/completions -> models)
+MODEL_LIST_URLS = {"github": "https://models.github.ai/catalog/models"}
+# a hosted id without "<maker>/": name prefix -> (provider, namespace the host expects or
+# None to send the name as is). gpt-oss and GPT ids are namespaced on every host we use.
+BARE_MODEL_MAKERS = {
+    "gpt-": ("openai", "openai"),
+    "llama": ("meta", None),
+    "deepseek": ("deepseek", None),
+    "qwen": ("qwen", None),
+}
+# host namespaces that name the same maker differently
+MAKER_ALIASES = {"meta-llama": "meta", "deepseek-ai": "deepseek"}
 # Groq sits behind Cloudflare, which refuses urllib's default User-Agent (error code 1010)
 USER_AGENT = "qip-alpha-research/0.1"
 # reasoning models (e.g. Qwen on Groq) may put their thinking inline; it is not the reply
@@ -79,23 +100,56 @@ def provider_of(model: str) -> str | None:
         if model.startswith(prefix):
             return provider
     hosted = split_hosted(model)
-    return hosted[1].partition("/")[0].lower() if hosted else None
+    if not hosted:
+        return None
+    maker, slash, _ = hosted[1].partition("/")
+    if not slash:
+        return _bare_maker(maker)[0]
+    maker = maker.lower()
+    return MAKER_ALIASES.get(maker, maker)
+
+
+def _bare_maker(name: str) -> tuple[str, str | None] | tuple[None, None]:
+    for prefix, made in BARE_MODEL_MAKERS.items():
+        if name.lower().startswith(prefix):
+            return made
+    return None, None
 
 
 def split_hosted(model: str) -> tuple[str, str] | None:
     """``(host, id sent to that host)`` for a hosted id, else None. ``groq:qwen/x`` ->
-    ``("groq", "qwen/x")``; ``qwen/x:free`` -> ``("openrouter", "qwen/x:free")``."""
+    ``("groq", "qwen/x")``; ``qwen/x:free`` -> ``("openrouter", "qwen/x:free")``;
+    ``groq:gpt-oss-120b`` -> ``("groq", "<namespace>/gpt-oss-120b")`` (BARE_MODEL_MAKERS);
+    a bare name needs a host prefix and a known maker."""
     host, colon, rest = model.partition(":")
     if colon and host in HOSTS:
         model = rest
     else:
         host = DEFAULT_HOST
     maker, slash, name = model.partition("/")
-    return (host, model) if slash and maker and name else None
+    if slash:
+        return (host, model) if maker and name else None
+    if (host == DEFAULT_HOST and not colon) or not model:
+        return None
+    provider, namespace = _bare_maker(model)
+    if provider is None:
+        return None
+    return host, f"{namespace}/{model}" if namespace else model
 
 
 class LLMUnavailable(RuntimeError):
     """No usable model: missing SDK, missing key, no scripted reply left, or a failed call."""
+
+
+class ModelDown(LLMUnavailable):
+    """A model failed after its retries (e.g. a daily quota) and is out for the rest of the
+    run. Agents with a rules fallback catch this and carry on without the model; other
+    models keep working."""
+
+    def __init__(self, model: str, reason: str):
+        super().__init__(f"{model} is unavailable for the rest of the run: {reason}")
+        self.model = model
+        self.reason = reason
 
 
 class LLMClient(Protocol):
@@ -155,8 +209,10 @@ class AnthropicLLMClient:
 Transport = Callable[[str, bytes, dict, float], tuple[int, bytes]]
 
 
-def _urllib_transport(url: str, body: bytes, headers: dict, timeout: float) -> tuple[int, bytes]:
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+def _urllib_transport(url: str, body: bytes | None, headers: dict,
+                      timeout: float) -> tuple[int, bytes]:
+    req = urllib.request.Request(url, data=body, headers=headers,
+                                 method="GET" if body is None else "POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, resp.read()
@@ -192,8 +248,10 @@ def rate_limit_wait(data, raw: bytes) -> float | None:
 
 def _post_json(transport: Transport, sleep: Callable[[float], None], url: str, body: bytes,
                headers: dict, timeout: float, model: str) -> tuple[int, bytes, object]:
-    """POST with waits on short rate limits. Returns (status, raw body, parsed JSON or {})."""
-    for attempt in range(RATE_LIMIT_RETRIES + 1):
+    """POST with waits on short rate limits and temporary server errors. Returns (status,
+    raw body, parsed JSON or {})."""
+    rate_limited = server_errors = 0
+    while True:
         try:
             status, raw = transport(url, body, headers, timeout)
         except (OSError, TimeoutError) as exc:  # network failure -> clean exit
@@ -202,15 +260,22 @@ def _post_json(transport: Transport, sleep: Callable[[float], None], url: str, b
             data = json.loads(raw) if raw else {}
         except (json.JSONDecodeError, UnicodeDecodeError):
             data = {}
-        if status == 429 and attempt < RATE_LIMIT_RETRIES:
+        if status == 429 and rate_limited < RATE_LIMIT_RETRIES:
             wait = rate_limit_wait(data, raw)
             if wait is not None and wait <= RATE_LIMIT_MAX_WAIT_SECONDS:
+                rate_limited += 1
                 log.warning("%s is rate-limited; waiting %.0fs before retry %d of %d",
-                            model, wait + 1, attempt + 1, RATE_LIMIT_RETRIES)
+                            model, wait + 1, rate_limited, RATE_LIMIT_RETRIES)
                 sleep(wait + 1)  # one second of margin over what the host asked for
                 continue
+        if status in SERVER_ERROR_STATUSES and server_errors < len(SERVER_ERROR_WAITS_SECONDS):
+            wait = SERVER_ERROR_WAITS_SECONDS[server_errors]
+            server_errors += 1
+            log.warning("%s answered HTTP %d; waiting %.0fs before retry %d of %d", model,
+                        status, wait, server_errors, len(SERVER_ERROR_WAITS_SECONDS))
+            sleep(wait)
+            continue
         return status, raw, data
-    raise AssertionError("unreachable")
 
 
 class GeminiLLMClient:
@@ -287,7 +352,9 @@ class ChatCompletionsLLMClient:
                          {"role": "user", "content": user}],
             "max_tokens": max_output,
         }).encode()
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self._key}",
+        # an explicit JSON Accept: NVIDIA's gateway may otherwise hold the reply open
+        headers = {"Content-Type": "application/json", "Accept": "application/json",
+                   "Authorization": f"Bearer {self._key}",
                    "User-Agent": USER_AGENT, "X-Title": "QIP alpha research"}
         status, raw, data = _post_json(self._transport, self._sleep, self._url, body, headers,
                                        self._timeout, self.model)
@@ -308,6 +375,35 @@ class ChatCompletionsLLMClient:
                     "config/agents.yaml" if finish == "length" else "")
             raise LLMUnavailable(f"model returned an empty reply (finish_reason {finish}){hint}")
         return text
+
+
+def list_models(host: str, api_key: str | None = None, *,
+                transport: Transport | None = None,
+                timeout: float = HOSTED_TIMEOUT_SECONDS) -> list[str]:
+    """Model ids a host serves now, sorted (``cli models``), from its model list endpoint.
+    Ids come back as the host names them; prefix them with ``<host>:`` in the config."""
+    if host not in HOSTS:
+        raise LLMUnavailable(f"unknown host {host!r}; known: {sorted(HOSTS)}")
+    chat_url, env_var = HOSTS[host]
+    key = api_key or os.environ.get(env_var)
+    if not key:
+        raise LLMUnavailable(f"{env_var} is not set; export it first")
+    url = MODEL_LIST_URLS.get(host) or chat_url.replace("chat/completions", "models")
+    headers = {"Authorization": f"Bearer {key}", "User-Agent": USER_AGENT,
+               "Accept": "application/json"}
+    try:
+        status, raw = (transport or _urllib_transport)(url, None, headers, timeout)
+    except (OSError, TimeoutError) as exc:
+        raise LLMUnavailable(f"model list failed: {type(exc).__name__}: {exc}") from exc
+    try:
+        data = json.loads(raw) if raw else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        data = {}
+    if status != 200:
+        raise LLMUnavailable(f"model list failed: HTTP {status}: {raw[:200]!r}")
+    items = data.get("data") if isinstance(data, dict) else data
+    ids = [i.get("id") for i in items or [] if isinstance(i, dict)]
+    return sorted(i for i in ids if isinstance(i, str))
 
 
 def make_real_client(model: str) -> LLMClient:

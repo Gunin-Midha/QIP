@@ -9,6 +9,9 @@
     python -m alpha_research.cli research --plan config/research_plan.example.yaml \
         --config <thresholds with holdout> --max-simulations 20 --max-llm-calls 60
     python -m alpha_research.cli compare --data-dir data
+    python -m alpha_research.cli repair --data-dir data --candidate-id ID --out rescue.json
+    python -m alpha_research.cli levers --data-dir data
+    python -m alpha_research.cli models --host nvidia --filter llama | --check
 
 Exit codes: 0 success, 2 config error, 3 schema error, 4 no fixture for a candidate,
 5 model unavailable or unusable reply, 6 generate produced no valid candidate,
@@ -33,14 +36,16 @@ from .brain_api import (EMAIL_ENV_VAR, SECRET_ENV_VAR, BrainApiError, RealBrainC
 from .brain_client import FixtureBrainClient, FixtureNotFoundError, SubmissionRejected
 from .compare import model_comparison
 from .config import ConfigError, load_config
-from .fastexpr import FastExprSpec
+from .fastexpr import FastExprSpec, catalog
 from .generator import (AlphaGenerator, GenerationError, GenerationSettings, Source,
-                        load_datafields, load_generator_config)
-from .llm import LLMUnavailable, ScriptedLLMClient, make_real_client
+                        load_datafield_meta, load_datafields, load_generator_config)
+from .llm import HOSTS, LLMUnavailable, ScriptedLLMClient, list_models, make_real_client
 from .memory import MemoryStore, default_data_dir
 from .orchestrator import run_rounds
 from .pipeline import Pipeline, load_candidate_file
 from .repair import Playbook
+from .lever_stats import LeverStats, repair_events
+from .repair_agent import RepairAgent
 from .research import Budget, ResearchRun, load_agents_config, load_plan, write_report
 from . import prompts as agent_prompts
 from .schemas import REGIONS, SchemaError
@@ -172,16 +177,17 @@ def _generate(args) -> int:
     config = load_generator_config(args.generator_config)
     settings = _generation_settings(args)
     source = _generation_source(args)
-    datafields = None
+    datafields, field_meta = None, {}
     if args.datafields:
         try:
             datafields = load_datafields(args.datafields)
+            field_meta = load_datafield_meta(args.datafields)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise ConfigError(f"cannot read datafield catalog {args.datafields}: {exc}") from exc
     llm = _llm_client(args)
 
-    result = AlphaGenerator(llm, spec, settings, config, datafields=datafields).generate(
-        source, args.n)
+    result = AlphaGenerator(llm, spec, settings, config, datafields=datafields,
+                            field_meta=field_meta).generate(source, args.n)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -302,10 +308,11 @@ def _research(args) -> int:
     plans = load_plan(args.plan)
     spec = FastExprSpec.load(args.fastexpr)
     gen_config = load_generator_config(args.generator_config)
-    datafields = None
+    datafields, field_meta = None, {}
     if args.datafields:
         try:
             datafields = load_datafields(args.datafields)
+            field_meta = load_datafield_meta(args.datafields)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise ConfigError(f"cannot read datafield catalog {args.datafields}: {exc}") from exc
     budget = Budget(max_simulations=args.max_simulations, per_round=args.per_round,
@@ -323,7 +330,8 @@ def _research(args) -> int:
         run = ResearchRun(plans, agents, budget, llm_factory=llm_factory, client=client,
                           config=config,
                           playbook=playbook, spec=spec, generator_config=gen_config,
-                          memory=memory, datafields=datafields, seed=args.seed, out=sys.stdout)
+                          memory=memory, datafields=datafields, field_meta=field_meta,
+                          seed=args.seed, out=sys.stdout)
         report = run.run(args.rounds)
         path = write_report(report, args.report or Path(args.data_dir) / f"{report['run_id']}.json")
     finally:
@@ -348,6 +356,86 @@ def _compare(args) -> int:
     if args.out:
         Path(args.out).write_text(text + "\n")
     print(text)
+    return EXIT_OK
+
+
+def _repair(args) -> int:
+    """Rescue alphas by hand: one child per applicable mechanical lever for each named
+    candidate in memory, written as a candidate file for ``run --client real``."""
+    playbook = Playbook.load(args.playbook)
+    spec = FastExprSpec.load(args.fastexpr)
+    agents = load_agents_config(args.agents)
+    datafields = (catalog(load_datafields(args.datafields), load_datafield_meta(args.datafields))
+                  if args.datafields else None)
+    memory = MemoryStore(args.data_dir)
+    out, notes = [], {}
+    try:
+        agent = RepairAgent(playbook, spec, memory, datafields=datafields,
+                            learning=agents.repair)
+        for cid in args.candidate_id:
+            cand = memory.get_candidate(cid)
+            decisions = memory.decisions_for(cid)
+            if cand is None or not decisions:
+                print(f"error: no candidate with a decision named {cid!r} in {args.data_dir}",
+                      file=sys.stderr)
+                return EXIT_CONFIG
+            results = memory.results_for(cid)
+            kids, n = agent.variants(cand, decisions[-1], results[-1] if results else None,
+                                     limit=args.limit, ignore_budget=args.ignore_budget)
+            out += [k.to_dict() for k in kids]
+            notes[cid] = n
+            print(f"{cid} ({decisions[-1].decision} / {decisions[-1].failure_class}): "
+                  f"{len(kids)} variant(s)" + "".join(f"; {x}" for x in n if x.startswith("no repair")))
+            for k in kids:
+                print(f"  {k.candidate_id}  {k.lever:<20} {k.universe} {k.neutralization} "
+                      f"decay {k.decay}  {k.expression}")
+    finally:
+        memory.close()
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out).write_text(json.dumps(out, indent=2, default=str) + "\n")
+    Path(args.out).with_suffix(".notes.json").write_text(json.dumps(notes, indent=2) + "\n")
+    print(f"wrote {len(out)} candidate(s) to {args.out}")
+    return EXIT_OK if out else EXIT_EMPTY
+
+
+def _levers(args) -> int:
+    """What each repair lever has done so far, per failure class, from memory."""
+    agents = load_agents_config(args.agents)
+    memory = MemoryStore(args.data_dir)
+    try:
+        events = repair_events(memory.candidate_outcomes(), agents.repair)
+    finally:
+        memory.close()
+    table = {"lever_stats": LeverStats.from_events(events, agents.repair.prior).table(),
+             "events": [dataclasses.asdict(e) for e in events]}
+    text = json.dumps(table, indent=2, default=str)
+    if args.out:
+        Path(args.out).write_text(text + "\n")
+    print(text)
+    return EXIT_OK
+
+
+def _models(args) -> int:
+    """List a host's models, or check every model in the agents config with one tiny call."""
+    if args.check:
+        agents = load_agents_config(args.agents)
+        failed = 0
+        for m in agents.used_models():
+            try:
+                reply = make_real_client(m).complete(
+                    "Reply with the single word OK.", "Say OK.", max_output=256)
+                print(f"ok      {m}: {reply.strip()[:40]!r}")
+            except LLMUnavailable as exc:
+                failed += 1
+                print(f"FAILED  {m}: {exc}")
+        return EXIT_LLM if failed else EXIT_OK
+    if not args.host:
+        print("give --host or --check", file=sys.stderr)
+        return EXIT_CONFIG
+    ids = list_models(args.host)
+    for i in ids:
+        if not args.filter or args.filter.lower() in i.lower():
+            print(f"{args.host}:{i}")
     return EXIT_OK
 
 
@@ -444,6 +532,36 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--data-dir", default=str(default_data_dir()))
     cp.add_argument("--out", default=None, help="also write the table to this JSON file")
     cp.set_defaults(func=_compare)
+
+    rp = sub.add_parser("repair", help="write repair variants of candidates in memory "
+                                       "(one per applicable mechanical lever) for run --client real")
+    rp.add_argument("--candidate-id", action="append", required=True,
+                    help="candidate in memory to rescue (repeat for several)")
+    rp.add_argument("--out", required=True, help="candidate file to write")
+    rp.add_argument("--limit", type=int, default=None, help="at most this many variants each")
+    rp.add_argument("--ignore-budget", action="store_true",
+                    help="ignore the lineage repair budget (repair.max_depth, max_trials_per_root, "
+                         "patience); every extra simulation still counts in the overfitting check")
+    rp.add_argument("--data-dir", default=str(default_data_dir()))
+    rp.add_argument("--playbook", default="config/repair_playbook.yaml")
+    rp.add_argument("--fastexpr", default="config/fastexpr.yaml")
+    rp.add_argument("--agents", default="config/agents.yaml")
+    rp.add_argument("--datafields", default=None, help="datafield catalog to validate against")
+    rp.set_defaults(func=_repair)
+
+    lv = sub.add_parser("levers", help="what each repair lever has fixed so far, from memory")
+    lv.add_argument("--data-dir", default=str(default_data_dir()))
+    lv.add_argument("--agents", default="config/agents.yaml")
+    lv.add_argument("--out", default=None, help="also write the table to this JSON file")
+    lv.set_defaults(func=_levers)
+
+    md = sub.add_parser("models", help="list a host's models, or --check the configured ones")
+    md.add_argument("--host", choices=sorted(HOSTS), default=None)
+    md.add_argument("--filter", default=None, help="only ids containing this text")
+    md.add_argument("--check", action="store_true",
+                    help="send one tiny request to every model config/agents.yaml uses")
+    md.add_argument("--agents", default="config/agents.yaml")
+    md.set_defaults(func=_models)
 
     pr = sub.add_parser("prompts", help="print the agents' system prompts with this config's thresholds")
     pr.add_argument("--agent", choices=["all", "prefilter", "critic", "judge", "repair", "strategy"],

@@ -71,3 +71,25 @@ class ResearchLoop:
         if action is Action.REQUEUE:
             self.enqueue(candidate)
         return action
+
+
+def lineage_root(candidate_id: str, cands: dict) -> str:
+    """The original candidate of a repair lineage (follow ``parent_id`` up). ``cands`` maps
+    candidate id -> CandidateRecord."""
+    seen, cur = set(), candidate_id
+    while cur in cands and cands[cur].parent_id and cur not in seen:
+        seen.add(cur)
+        cur = cands[cur].parent_id
+    return cur
+
+
+def lineage_members(outcomes: list[dict], root: str) -> list[dict]:
+    """Every outcome row in the lineage of ``root`` (root included), oldest first."""
+    cands = {r["candidate"].candidate_id: r["candidate"] for r in outcomes}
+    return [r for r in outcomes if lineage_root(r["candidate"].candidate_id, cands) == root]
+
+
+def simulated(row: dict) -> bool:
+    """The row reached BRAIN (a result that is not ``invalid``)."""
+    return row["result"] is not None and row["result"].status != "invalid"
+
