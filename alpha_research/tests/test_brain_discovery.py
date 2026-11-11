@@ -45,3 +45,10 @@ def test_fills_by_use_when_too_few_well_covered():
     few = [d for d in DATASETS if d["coverage"] < 0.5] + DATASETS[:3]
     chosen = ids(discovery.pick_datasets(few, 3, explore_share=0.5))
     assert len(chosen) == 3 and len(set(chosen)) == 3
+
+
+def test_named_datasets_are_fetched_as_well_where_the_region_has_them():
+    picked = discovery.pick_datasets(DATASETS, 2)
+    extra = discovery.with_extra(picked, DATASETS, [DATASETS[-1]["id"], "not_here"])
+    assert ids(extra) == ids(picked) + [DATASETS[-1]["id"]]
+    assert discovery.with_extra(picked, DATASETS, [picked[0]["id"]]) == picked

@@ -676,3 +676,42 @@ Fixed:
 **Not built (suggestions).** See "Per-region tuning: further ideas" in CLAUDE.md.
 
 609 tests pass.
+
+### Research plan v2 (2026-11-11, draft)
+
+**Why.** The owner asked for a plan over every region and delay the account allows, with region blocks whose defaults the arms inherit, datasets per region from the downloaded catalogs, and the new neutralizations.
+
+**What blocked it.** The loader keyed arms by (dataset, region), so one dataset at delay 0 and delay 1 in the same region was refused, and the Director's arm had no delay. The run took one datafield catalog, so a USA field would pass validation in a CHN alpha and fail only at BRAIN. Strategy Evolution gave a new dataset's arms the settings of an arbitrary arm per model, which in a multi-region plan could be a region without that dataset.
+
+**What was built.**
+- `research.load_plan`: v2 layout (`defaults`, `regions.<R>.enabled/settings/catalogs/arms`), settings merged defaults <- region <- arm, checked against `REGION_SETTINGS`; arms unique per (dataset, region, delay); `ArmPlan.catalog`. v1 plans load as before.
+- Arm key `(dataset, region, prompt_version, model, delay)` (delay last, so the other indexes keep their meaning); `arm_label` for reports.
+- `ResearchRun(markets=)`: catalog per (region, delay); each arm's Generator gets its market's fields and meta; `fastexpr.catalog_for` lets the Pre-Filter, Critic and Repair Agent validate each candidate against its own market. `cli research` reads each plan catalog once (`_plan_catalogs`).
+- `_evolve`: templates per (model, region, delay); a new dataset's arms only where its market's catalog has it.
+- `config/research_plan.v2.yaml`: 37 arms over 18 region/delays (11 regions). Datasets chosen from the 20 downloaded per region/delay for coverage, low alpha and user counts, a high pyramid multiplier and fields that carry a signal; option8 kept in USA D1. Every field named in a hypothesis was checked against that market's catalog. Group neutralization by default (COUNTRY in multi-country regions, SECTOR in the 500-name universes), CROWDING / STATISTICAL / REVERSION_AND_MOMENTUM on three arms, lower decay at delay 0.
+
+**Open.** 37 arms x 4 generator models = 148 Director arms, far more than a free-tier run simulates; per-region `enabled` runs a subset. An offline round over the real catalogs (fake model, stub BRAIN) ran 10 simulations across regions.
+
+631 tests pass.
+
+### Region rotation (2026-11-11)
+
+**Why.** The owner asked to cap each run at about 20 alphas, with a run covering only some regions and the next run the others, so that across runs every region is covered equally.
+
+**What was built.** `director.regions_per_run` (default 3) and `director.region_balance_since` (default 2026-11-11, so the earlier USA-only runs do not count) in `config/agents.yaml`. `MemoryStore.simulations_by_region(since)` (read-only) counts candidates that reached BRAIN per region. At the start of a run `ResearchRun._pick_regions` chooses the least-simulated regions (then the longest since the last simulation, then plan order); only their arms are live, only their repairs are taken or resumed. Each allocation splits the slots across those regions with `orchestrator.balance_slots` (fewest simulations so far, memory plus this run), then the Director allocates within each region. Report: `regions_this_run`, `simulations_by_region`. The run size stays the `--max-simulations` flag (20).
+
+**Checked.** Three offline 20-simulation runs over the v2 plan (fake model, stub BRAIN) took USA/ALL/GLB, then EUR/ASI/CHN, then JPN/AMR/IND, 5 to 7 simulations per region each.
+
+**Open (OQ-19).** The unit balanced is the region, not region/delay (delays inside a region follow the Director); defaults 3 regions per run and the 2026-11-11 start date.
+
+643 tests pass.
+
+### Seeds: earlier alphas to improve (2026-11-11)
+
+**Why.** The owner asked to include the two earlier accepted alphas, which fail consultant-level checks: the IV spread from memory (`rs20261103184506r01a0_002_r1x`; consultant check LOW_SHARPE 1.03, LOW_FITNESS 0.62, IS_LADDER_SHARPE 0.73) and a skew + volatility-risk-premium alpha accepted in the BRAIN web app (USA/TOP3000/D1, decay 0, truncation 0.01, INDUSTRY; BRAIN TRAIN view Sharpe 1.72, fitness 1.15, risk-neutralized Sharpe 1.50 / fitness 0.71).
+
+**What was built.** `research.load_seeds` (`seeds:` in the plan: `from_memory` or inline expression + settings, settings checked like arms via `_entry_settings`); `ResearchRun(seeds=)` / `_prepare_seeds`: a new root candidate on the arm's dates (so it is a new experiment, and BRAIN runs its current checks), the arm chosen by region/delay then dataset then model, validated against the market catalog; simulated first in the round once its region is in the run, with `credit=False` (no Director update); report `seeds`. Skipped with a note: not in memory, invalid, no arm, already simulated, same experiment as one in memory. `scripts/brain_discovery.py --datasets` fetches named datasets as well as the picked ones.
+
+**Status.** The skew/VRP seed uses `opt6_ivhvxernratio` (option6), which is not in our USA D1 catalog (option6 was not among the 20 datasets fetched), so it is skipped as invalid until `scripts/brain_discovery.py --regions USA --datasets option6` is run. Offline check on a copy of memory: the IV seed was the first simulation of the run, on 2014-01-01..2023-12-31.
+
+657 tests pass.

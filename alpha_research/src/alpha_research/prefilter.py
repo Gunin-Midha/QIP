@@ -21,10 +21,10 @@ Checks, in order (the first that fails drops the candidate):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Collection
+from typing import Collection, Mapping
 
 from .fastexpr import (Assign, Binary, Call, ComplexityLimits, FastExprError, FastExprSpec,
-                       Name, Num, Str, Unary, analyze, catalog, parse)
+                       Name, Num, Str, Unary, analyze, catalog, catalog_for, parse)
 from .generator import GenerationError, ask_json
 from .llm import LLMClient, ModelDown
 from .memory import MemoryStore
@@ -97,6 +97,7 @@ def _universe_key(c: CandidateRecord) -> tuple:
 class PreFilter:
     def __init__(self, config: PrefilterConfig, spec: FastExprSpec, memory: MemoryStore, *,
                  llm: LLMClient | None = None, datafields: Collection[str] | None = None,
+                 markets: Mapping[tuple, Mapping] | None = None,
                  limits: ComplexityLimits | None = None, max_output: int = 2048,
                  context: str = ""):
         self.config = config
@@ -105,6 +106,7 @@ class PreFilter:
         self.memory = memory
         self.llm = llm
         self.datafields = catalog(datafields)  # {id: type}: types check vec_* use
+        self.markets = markets  # {(region, delay): typed catalog}, ahead of datafields
         self.limits = limits
         self.max_output = max_output
 
@@ -145,7 +147,8 @@ class PreFilter:
         return out
 
     def _static_reason(self, c: CandidateRecord, known, threshold) -> str | None:
-        a = analyze(c.expression, self.spec, datafields=self.datafields, limits=self.limits)
+        fields = catalog_for(self.markets, self.datafields, c.region, c.delay)
+        a = analyze(c.expression, self.spec, datafields=fields, limits=self.limits)
         if not a.ok:
             return "invalid expression: " + "; ".join(a.errors)
         if self.memory.has_result_for_hash(experiment_hash(c)):

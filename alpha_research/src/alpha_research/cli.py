@@ -46,7 +46,8 @@ from .pipeline import Pipeline, load_candidate_file
 from .repair import Playbook
 from .lever_stats import LeverStats, repair_events
 from .repair_agent import RepairAgent
-from .research import Budget, ResearchRun, load_agents_config, load_plan, write_report
+from .research import (Budget, ResearchRun, load_agents_config, load_plan, load_seeds,
+                       write_report)
 from . import prompts as agent_prompts
 from .schemas import REGIONS, SchemaError
 from .simulator import VirtualClock, normalize
@@ -339,12 +340,33 @@ def _brain_datasets(args) -> int:
     return EXIT_OK
 
 
+def _plan_catalogs(plans) -> dict[tuple, tuple[list[str], dict]]:
+    """{(region, delay): (datafields, meta)} from the catalogs a v2 plan names, each file
+    read once. Markets without one fall back to --datafields."""
+    markets, read = {}, {}
+    for p in plans:
+        if p.catalog is None:
+            continue
+        if p.catalog not in read:
+            try:
+                read[p.catalog] = (load_datafields(p.catalog), load_datafield_meta(p.catalog))
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise ConfigError(f"cannot read datafield catalog {p.catalog} for "
+                                  f"{p.settings.region} delay {p.settings.delay}: {exc} "
+                                  "(scripts/brain_discovery.py downloads the catalogs)") from exc
+            print(f"catalog {p.settings.region} D{p.settings.delay}: "
+                  f"{len(read[p.catalog][0]):,} fields from {p.catalog}")
+        markets[(p.settings.region, p.settings.delay)] = read[p.catalog]
+    return markets
+
+
 def _research(args) -> int:
     config = load_config(args.config)
     config.require_holdout()  # before logging in or calling the model
     playbook = Playbook.load(args.playbook)
     agents = load_agents_config(args.agents)
     plans = load_plan(args.plan)
+    seeds = load_seeds(args.plan)
     spec = FastExprSpec.load(args.fastexpr)
     gen_config = load_generator_config(args.generator_config)
     datafields, field_meta = None, {}
@@ -354,6 +376,7 @@ def _research(args) -> int:
             field_meta = load_datafield_meta(args.datafields)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise ConfigError(f"cannot read datafield catalog {args.datafields}: {exc}") from exc
+    markets = _plan_catalogs(plans)
     budget = Budget(max_simulations=args.max_simulations, per_round=args.per_round,
                     max_llm_calls=args.max_llm_calls)
     if min(budget.max_simulations, budget.per_round, budget.max_llm_calls) < 1:
@@ -370,7 +393,7 @@ def _research(args) -> int:
                           config=config,
                           playbook=playbook, spec=spec, generator_config=gen_config,
                           memory=memory, datafields=datafields, field_meta=field_meta,
-                          seed=args.seed, out=sys.stdout)
+                          markets=markets, seeds=seeds, seed=args.seed, out=sys.stdout)
         report = run.run(args.rounds)
         path = write_report(report, args.report or Path(args.data_dir) / f"{report['run_id']}.json")
     finally:
@@ -378,6 +401,9 @@ def _research(args) -> int:
     print(f"stopped: {report['stop_reason']} | simulations {report['simulations_used']} | "
           f"model calls {report['model_calls']} | pool {report['pool_size']} | report {path}")
     print(f"  model calls by model: {report['model_calls_by_model']}")
+    if report["regions_this_run"] is not None:
+        print(f"  regions this run: {report['regions_this_run']}; simulations per region so far: "
+              f"{report['simulations_by_region']}")
     for arm, s in report["arms"].items():
         print(f"  {arm}: accepted {s['accepted']}, not accepted {s['not_accepted']}, "
               f"pass rate {s['posterior_pass_rate']}, repairs queued {s['repairs_queued']}")

@@ -281,6 +281,39 @@ evolve every 2 rounds) are OQ-13. None of these settings changes an accept or re
 decision. A research plan lists arms with a dataset label, simulation settings,
 hypotheses and paper text files; see `config/research_plan.example.yaml`.
 
+**Plan v2 (every region and delay).** `config/research_plan.v2.yaml` uses region blocks:
+`defaults` (settings for every arm), then per region `enabled`, `settings` (region
+defaults), `catalogs` (`{delay: datafield catalog}` from `scripts/brain_discovery.py`,
+paths relative to the plan) and `arms` (`dataset`, `delay`, optional `settings`,
+hypotheses). An arm's settings are defaults <- region <- arm; the loader checks universe,
+delay and neutralization against `schemas.REGION_SETTINGS`. Each candidate is validated
+against its own region/delay catalog (Generator, Pre-Filter, Critic, Repair Agent);
+`--datafields` covers markets without one. Arms are keyed
+`(dataset, region, prompt_version, model, delay)` and reported as
+`dataset/REGION/D<delay>/prompt_version/model`. Strategy Evolution adds a new dataset's
+arms only in markets whose catalog has it. `enabled: false` skips a region.
+
+**Region rotation.** With `director.regions_per_run` (agents.yaml, default 3) a run works
+on only that many regions: the ones with the fewest simulations in memory since
+`director.region_balance_since`, then the longest since their last simulation, then plan
+order. Inside the run each slot goes to the chosen region with the fewest simulations so
+far (`orchestrator.balance_slots`), and the Director picks arms within the region. The next
+run takes the regions this one skipped, so over runs every region gets the same number of
+simulations; a region that fell short is picked again. Queued repairs of other regions
+wait for their region's run. `--max-simulations 20` caps a run at 20 alphas. The report
+shows `regions_this_run` and `simulations_by_region`. `regions_per_run: null` turns
+rotation off (then `region_floor_share` / `max_region_share` apply).
+
+**Seeds.** A plan's `seeds` list names earlier alphas to improve: `from_memory: <candidate
+id>`, or an inline `expression` with `dataset`, `region`, `delay` and optional `settings`
+(over `defaults` and the region's settings). At the start of a run each becomes a new root
+candidate (`<id>_seed` or `seed_<hash>`, no parent, generation 0) on its arm's dates (BRAIN's
+current period) and is simulated before anything else once its region is in the run; then
+the Repair Agent works on what fails. A seed does not update the Director's view of its arm.
+It is validated against its market's catalog; a seed not in memory, invalid, without an arm
+in its region/delay, or already simulated is listed in the report's `seeds` and skipped.
+`scripts/brain_discovery.py --datasets option6` adds named datasets to the catalogs.
+
 **The models behind the agents.** Each agent has its own model, set in the `models`
 section of `config/agents.yaml`. The provider comes from the model id: `claude-*` is
 Anthropic, `gemini-*` is Google (Gemini's REST API over the standard library). A null

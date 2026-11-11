@@ -51,6 +51,14 @@ director:
   # gets more than max_region_share of a round while another region is below it.
   region_floor_share: 0.5
   max_region_share: 0.6
+  # Region rotation (owner 2026-11-11: each run covers a few regions, the next run others,
+  # all regions equal across runs; builder defaults, OQ-19): a run works on the
+  # regions_per_run plan regions with the fewest simulations since region_balance_since,
+  # and each slot goes to the chosen region with the fewest so far, so a region that fell
+  # short is picked again. Within a region the Director picks arms as usual. null = every
+  # region in every run (region_floor_share and max_region_share apply only then).
+  regions_per_run: 3
+  region_balance_since: "2026-11-11"
 
 max_output: 4096                   # output cap for one model call
 

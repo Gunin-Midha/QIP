@@ -13,6 +13,7 @@ then skipped and listed at the end.
 
 Run from alpha_research/ (BRAIN_EMAIL and BRAIN_PASSWORD in the environment):
     PYTHONPATH=src python3 scripts/brain_discovery.py [--max-datasets 20] [--regions USA EUR]
+        [--datasets option6]   # also fetch these datasets where the region has them
 """
 
 import argparse
@@ -83,6 +84,12 @@ def pick_datasets(datasets: list[dict], n: int, explore_share: float = 0.3) -> l
     return chosen
 
 
+def with_extra(picked: list[dict], datasets: list[dict], extra: list[str]) -> list[dict]:
+    """``picked`` plus the datasets named in ``extra`` that this region/delay has."""
+    ids = {d["id"] for d in picked}
+    return picked + [d for d in datasets if d["id"] in set(extra) and d["id"] not in ids]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="captures/consultant_catalogs")
@@ -90,6 +97,8 @@ def main() -> int:
     ap.add_argument("--regions", nargs="*", default=list(REGION_SETTINGS))
     ap.add_argument("--max-datasets", type=int, default=20,
                     help="datasets per region/delay to download fields for (0 = all)")
+    ap.add_argument("--datasets", nargs="*", default=[],
+                    help="dataset ids to fetch as well as the picked ones, where the region has them")
     ap.add_argument("--explore-share", type=float, default=0.3,
                     help="share of those slots for little-explored datasets")
     args = ap.parse_args()
@@ -131,7 +140,8 @@ def main() -> int:
                 gaps.append(f"{tag}: dataset list")
                 continue
             datasets_file.write_text(json.dumps(datasets, indent=2) + "\n")
-        picked = pick_datasets(datasets, args.max_datasets, args.explore_share)
+        picked = with_extra(pick_datasets(datasets, args.max_datasets, args.explore_share),
+                            datasets, args.datasets)
         parts.mkdir(parents=True, exist_ok=True)
         todo = [ds for ds in picked if not (parts / f"{ds['id']}.json").exists()]
         say(f"  {len(datasets)} datasets; fields for {len(picked)} of them "

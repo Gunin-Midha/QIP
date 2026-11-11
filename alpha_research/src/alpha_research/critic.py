@@ -36,10 +36,10 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
-from typing import Collection
+from typing import Collection, Mapping
 
 from .fastexpr import (Call, ComplexityLimits, FastExprError, FastExprSpec, Num, Unary,
-                       analyze, catalog, parse)
+                       analyze, catalog, catalog_for, parse)
 from .generator import GenerationError, ask_json
 from .llm import LLMClient, ModelDown
 from .prompts import critic_system, critic_user, judge_system, judge_user
@@ -148,12 +148,14 @@ def rule_issues(expression: str) -> list[Issue]:
 class Critic:
     def __init__(self, spec: FastExprSpec, *, llm: LLMClient | None = None,
                  datafields: Collection[str] | None = None,
+                 markets: Mapping[tuple, Mapping] | None = None,
                  limits: ComplexityLimits | None = None, max_output: int = 4096,
                  context: str = ""):
         self.spec = spec
         self.context = context  # prompts.brain_context(config)
         self.llm = llm
         self.datafields = catalog(datafields)  # {id: type}: types check vec_* use
+        self.markets = markets  # {(region, delay): typed catalog}, ahead of datafields
         self.limits = limits
         self.max_output = max_output
 
@@ -163,7 +165,8 @@ class Critic:
         expression = expression.strip()
         if expression == original.expression:
             return None
-        if not analyze(expression, self.spec, datafields=self.datafields, limits=self.limits).ok:
+        fields = catalog_for(self.markets, self.datafields, original.region, original.delay)
+        if not analyze(expression, self.spec, datafields=fields, limits=self.limits).ok:
             return None
         if any(i.severity == "blocking" for i in rule_issues(expression)):
             return None

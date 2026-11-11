@@ -314,6 +314,23 @@ class MemoryStore:
             })
         return out
 
+    def simulations_by_region(self, since: str | None = None) -> dict[str, dict]:
+        """{region: {"simulations": n, "last": time}} for candidates that reached BRAIN
+        (any result but ``invalid``), counting results recorded on or after ``since`` (ISO
+        date or time). Used to rotate regions across research runs. Read-only."""
+        rows = self.conn.execute(
+            "SELECT c.candidate_id, c.payload_json AS cand, MAX(r.created_at) AS last "
+            "FROM results r JOIN candidates c ON c.candidate_id = r.candidate_id "
+            "WHERE r.status != 'invalid' AND r.created_at >= ? GROUP BY c.candidate_id",
+            (since or "",)).fetchall()
+        out: dict[str, dict] = {}
+        for r in rows:
+            region = json.loads(r["cand"]).get("region")
+            info = out.setdefault(region, {"simulations": 0, "last": None})
+            info["simulations"] += 1
+            info["last"] = max(info["last"] or "", r["last"])
+        return out
+
     def critic_reviews(self) -> list[dict]:
         """Every critic verdict, oldest first. Read-only."""
         rows = self.conn.execute(

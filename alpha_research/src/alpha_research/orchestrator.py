@@ -1,7 +1,7 @@
 """Research Director: Thompson sampling with floor quotas (spec section 13.1).
 
 Arms are hashable tuples: (dataset, region, prompt_version) in the Phase 2 driver, and
-(dataset, region, prompt_version, generator model) in the research loop. Each arm has a Beta(1, 1) prior on its
+(dataset, region, prompt_version, generator model, delay) in the research loop. Each arm has a Beta(1, 1) prior on its
 pass rate. Novelty weighting is Phase 3 and not implemented.
 
 Allocation method:
@@ -31,7 +31,7 @@ from typing import Hashable, Iterable
 
 import numpy as np
 
-Arm = tuple  # (dataset, region, prompt_version[, generator model])
+Arm = tuple  # (dataset, region, prompt_version[, generator model, delay])
 
 
 @dataclass
@@ -127,6 +127,18 @@ class Orchestrator:
     def pass_rate(self, arm: Hashable) -> float:
         s = self.state[arm]
         return (s.successes + 1) / (s.successes + s.failures + 2)
+
+
+def balance_slots(slots: int, counts: dict) -> dict:
+    """Region rotation: each slot goes to the region with the fewest simulations so far
+    (``counts`` plus the slots already given here), ties in ``counts`` order."""
+    if slots < 0:
+        raise ValueError("slots must be >= 0")
+    order = {r: i for i, r in enumerate(counts)}
+    given = Counter({r: 0 for r in counts})
+    for _ in range(slots):
+        given[min(counts, key=lambda r: (counts[r] + given[r], order[r]))] += 1
+    return dict(given)
 
 
 def run_rounds(arm_outcomes: dict, rounds: int, budget: int, floor_share: float = 0.2,

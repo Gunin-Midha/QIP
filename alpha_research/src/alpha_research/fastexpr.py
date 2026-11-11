@@ -451,6 +451,15 @@ def catalog(datafields: Collection[str] | Mapping[str, str | None] | None,
     return {f: (meta.get(f) or {}).get("type") for f in datafields}
 
 
+def catalog_for(markets: Mapping[tuple, Mapping] | None, default: Mapping | None,
+                region: str, delay: int) -> Mapping | None:
+    """The catalog to validate an expression for ``region``/``delay`` against: that
+    market's own (a multi-region plan has one per region and delay), else ``default``."""
+    if markets and (region, delay) in markets:
+        return markets[(region, delay)]
+    return default
+
+
 class _Walker:
     def __init__(self, spec: FastExprSpec,
                  datafields: Collection[str] | Mapping[str, str | None] | None):

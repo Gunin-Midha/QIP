@@ -69,10 +69,10 @@ import dataclasses
 import random
 import string
 from dataclasses import dataclass, field
-from typing import Collection
+from typing import Collection, Mapping
 
 from .fastexpr import (Assign, Binary, Call, ComplexityLimits, FastExprError, FastExprSpec,
-                       Name, Num, Unary, analyze, catalog, parse, render)
+                       Name, Num, Unary, analyze, catalog, catalog_for, parse, render)
 from .generator import GenerationError, ask_json
 from .lever_stats import (LeverStats, RepairLearningConfig, combo_parts, failing_classes,
                           family_budget, rank_levers, repair_events, successful_examples)
@@ -382,6 +382,7 @@ def _metrics(result: ResultRecord | None) -> dict:
 class RepairAgent:
     def __init__(self, playbook: Playbook, spec: FastExprSpec, memory: MemoryStore, *,
                  llm: LLMClient | None = None, datafields: Collection[str] | None = None,
+                 markets: Mapping[tuple, Mapping] | None = None,
                  limits: ComplexityLimits | None = None, max_output: int = 2048,
                  context: str = "", learning: RepairLearningConfig | None = None,
                  seed: int | None = None):
@@ -391,6 +392,7 @@ class RepairAgent:
         self.memory = memory
         self.llm = llm
         self.datafields = catalog(datafields)  # {id: type}: types check vec_* use
+        self.markets = markets  # {(region, delay): typed catalog}, ahead of datafields
         self.limits = limits
         self.max_output = max_output
         self.learning = learning or RepairLearningConfig()
@@ -556,7 +558,7 @@ class RepairAgent:
         expr = reply.get("expression") if isinstance(reply, dict) else None
         if not isinstance(expr, str) or not expr.strip():
             raise LeverNotApplicable("model reply had no expression")
-        a = analyze(expr.strip(), self.spec, datafields=self.datafields, limits=self.limits)
+        a = analyze(expr.strip(), self.spec, datafields=self._fields(c), limits=self.limits)
         if not a.ok:
             raise LeverNotApplicable("model expression failed validation: " + "; ".join(a.errors))
         changes = {"expression": expr.strip(), "model": getattr(self.llm, "model", c.model)}
@@ -585,5 +587,9 @@ class RepairAgent:
             child.validate()
         except SchemaError:
             return None
-        a = analyze(child.expression, self.spec, datafields=self.datafields, limits=self.limits)
+        a = analyze(child.expression, self.spec, datafields=self._fields(child),
+                    limits=self.limits)
         return child if a.ok else None
+
+    def _fields(self, c: CandidateRecord):
+        return catalog_for(self.markets, self.datafields, c.region, c.delay)

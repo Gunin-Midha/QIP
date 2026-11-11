@@ -1,0 +1,362 @@
+# Research plan v2 (2026-11-11, DRAFT): every region and delay our consultant account allows.
+#
+# Layout (loader: research.load_plan):
+#   defaults            settings every arm starts from
+#   regions.<REGION>    one block per BRAIN region:
+#     enabled           false skips the whole region (to run a few regions at a time)
+#     settings          region defaults, laid over `defaults`
+#     catalogs          datafield catalog per delay (paths relative to this file), from
+#                       scripts/brain_discovery.py; the validators check each arm's fields
+#                       against its own region/delay catalog
+#     arms              dataset + delay (+ optional settings) + hypotheses
+#   An arm's settings = defaults <- region settings <- arm settings, plus region and delay.
+#
+# How the datasets were picked (captures/consultant_catalogs/, 2026-11-11): from the 20
+# datasets per region/delay with downloaded fields, ones with coverage >= ~0.6, few alphas
+# and users relative to the region (less crowded, so less PROD_CORRELATION risk), a high
+# pyramidMultiplier, and fields that carry a signal (not timestamps or text). USA D1 keeps
+# option8, the only family that came near the bar (IV spread, Sharpe 2.20 before repairs).
+# Every field named below is in that region/delay's catalog. VECTOR fields (several per
+# stock-day) must be wrapped in a vec_* operator (vec_avg, vec_sum, vec_count, ...).
+#
+# Settings: largest universe per region (the one the catalog was fetched for); group
+# neutralization by default, COUNTRY in multi-country regions, coarser groups in the
+# ~500-name universes; a few arms use BRAIN's factor neutralizations (CROWDING,
+# STATISTICAL, REVERSION_AND_MOMENTUM; AMR has none). Lower decay at delay 0, where the
+# signals are fast news and flows. The model may still suggest decay and neutralization.
+#
+# Size: 37 arms x 4 generator models = 148 Director arms, far more than one free-tier run
+# can simulate; memory carries the Director's evidence from run to run. Use `enabled` to
+# run a subset of regions.
+
+# Seeds: alphas accepted earlier that fail the consultant-level checks. Each is simulated
+# first (as a new root candidate on BRAIN's current 2014-2023 period) once its region is in
+# the run, then the Repair Agent works on what fails. A seed simulated in an earlier run is
+# not simulated again; its repairs resume from memory.
+seeds:
+  # IV spread, accepted 2026-11-04 at user level (Sharpe 1.38, fitness 1.01). Consultant
+  # check: LOW_SHARPE 1.03 < 1.58, LOW_FITNESS 0.62, IS_LADDER_SHARPE 0.73.
+  - from_memory: rs20261103184506r01a0_002_r1x
+  # Skew + volatility risk premium, accepted in the BRAIN web app (owner, 2026-11-11). BRAIN
+  # TRAIN view: Sharpe 1.72, fitness 1.15, turnover 25.3%; risk-neutralized Sharpe 1.50,
+  # fitness 0.71; 2020 Sharpe 0.37; no positions 2014-2015. opt6_ivhvxernratio (option6)
+  # is not in our USA D1 catalog yet: until `scripts/brain_discovery.py --regions USA
+  # --datasets option6` adds it, the run skips this seed as invalid (report: seeds).
+  - dataset: option8
+    region: USA
+    delay: 1
+    settings: {universe: TOP3000, decay: 0, truncation: 0.01, neutralization: INDUSTRY}
+    expression: |
+      skew = winsorize(ts_backfill(implied_volatility_call_90 - implied_volatility_put_90, 60), std=3);
+      vrp = winsorize(ts_backfill(opt6_ivhvxernratio, 60), std=3);
+      liq = rank(volume*close);
+      ts_decay_linear(zscore(skew), 10) * (1 - liq) + ts_decay_linear(zscore(skew) + zscore(vrp), 5) * liq
+
+defaults:
+  truncation: 0.08
+  start_date: "2014-01-01"
+  end_date: "2023-12-31"
+
+regions:
+  USA:
+    enabled: true
+    settings: {universe: TOP3000, neutralization: SUBINDUSTRY, decay: 4}
+    catalogs:
+      0: ../captures/consultant_catalogs/datafields_usa_top3000_d0.json
+      1: ../captures/consultant_catalogs/datafields_usa_top3000_d1.json
+    arms:
+      - dataset: option8
+        delay: 1
+        settings: {neutralization: CROWDING}
+        hypotheses:
+          - "Implied volatility spread (Cremers and Weinbaum 2010): stocks whose at-the-money call implied volatility exceeds put implied volatility (implied_volatility_call_60 minus implied_volatility_put_60, scaled by implied_volatility_mean_60) outperform over 1-4 weeks, because informed traders buy calls before good news. The plain version is crowded on BRAIN, so differentiate it: combine the 30- and 60-day spreads, or condition on the volatility skew (implied_volatility_mean_skew_120)."
+          - "Volatility risk premium: stocks whose implied volatility (implied_volatility_mean_30) is high relative to their own realised volatility (historical_volatility_30 or parkinson_volatility_30) are priced for risk that rarely arrives and underperform over the next month. Rank the implied-minus-realised gap within subindustry and smooth it."
+      - dataset: shortinterest3
+        delay: 1
+        settings: {decay: 6}
+        hypotheses:
+          - "Short-sale constraints (Asquith, Pathak and Ritter 2005): stocks with high securities-lending utilisation (loan_utilization_ratio) and rising borrowing costs (mean_loan_rate) are heavily shorted by informed traders and underperform over the next 1-3 months. These are VECTOR fields: aggregate with vec_avg first, fill gaps with ts_backfill, and use the 20-day change as well as the level."
+          - "Loan-rate stress: a jump in the dispersion of lending rates (loan_rate_volatility, vec_avg) or in max_loan_rate relative to min_loan_rate signals that shares are hard to borrow and predicts negative returns. Rank within subindustry and keep turnover moderate with ts_mean over 5-10 days."
+      - dataset: earnings4
+        delay: 1
+        settings: {decay: 5}
+        hypotheses:
+          - "Earnings-move premium: when the market-implied earnings move (market_implied_announcement_percent_move) is large relative to the stock's own past earnings-day moves (average of first_historical_announcement_percent_move through fifth_historical_announcement_percent_move, in absolute value), options overprice the event and the stock tends to drift down after the announcement. Rank the ratio within subindustry."
+          - "Ex-earnings volatility term structure: stocks whose implied volatility excluding earnings (ninety_day_ex_announcement_implied_volatility) is high relative to its long-run level (infinite_maturity_ex_announcement_implied_volatility) carry short-term fear that mean-reverts; buy where the ratio is falling over 10-20 days."
+      - dataset: sentiment21
+        delay: 0
+        settings: {decay: 2}
+        hypotheses:
+          - "Same-day news sentiment drift: stocks whose mean positive news sentiment (snt21_2pos_mean_130) exceeds mean negative sentiment (snt21_2neg_mean_138) keep rising over the next few days because investors under-react to news. Use the positive-minus-negative difference relative to its own 20-day average, ranked within subindustry."
+          - "Sentiment disagreement: a high standard deviation of negative sentiment scores (snt21_2dts_gen_133) relative to the stock's history means investors disagree about the news; with short-sale limits, prices overshoot and later fall (Miller 1977). Short stocks with a jump in disagreement, long those where it falls."
+      - dataset: event_sentiment_signals
+        delay: 0
+        settings: {decay: 2}
+        hypotheses:
+          - "Fundamental event sentiment: the sentiment of fundamental events in company documents (section_sentiment_score_2, or section_positive_score_2 minus section_negative_score_2) predicts next-week returns, since such events change cash-flow expectations and are under-reacted to. VECTOR fields: aggregate with vec_avg or vec_sum, and fill missing days with ts_backfill."
+          - "Key-driver tone: the balance of positive and negative events for a company's key business driver (key_factor_positive_event_count_section_2 versus key_factor_negative_event_count_section_2, through vec_sum) predicts returns over the following 1-2 weeks; scale the net count by the total so busy news days do not dominate."
+
+  ALL:
+    enabled: true
+    settings: {universe: LARGE, neutralization: INDUSTRY, decay: 4}
+    catalogs:
+      1: ../captures/consultant_catalogs/datafields_all_large_d1.json
+    arms:
+      - dataset: analyst_revision_horizons
+        delay: 1
+        hypotheses:
+          - "Short-horizon revision momentum across all markets: stocks whose short-term analyst earnings-revision component (preferred_earnings_revision_component_short_term_41) is high outperform over the next month, because analysts and investors update slowly. Rank within industry; nobody on BRAIN has used this region yet, so simple, robust forms come first."
+          - "Recommendation changes plus revisions: combine the short-term recommendation-change component (recommendation_change_component_short_term_4) with the earnings-revision component; stocks where both agree outperform, and the combination is less correlated with price momentum than either alone."
+      - dataset: acquisition_model
+        delay: 1
+        settings: {decay: 8}
+        hypotheses:
+          - "Takeover-target premium: stocks ranked as likely acquisition targets (industry_percentile_acquisition_likelihood, a VECTOR field: use vec_avg) earn a premium as bids arrive or speculation builds. Use the slow-moving level, smoothed, and avoid the smallest names."
+          - "Text-driven takeover talk: a rising news-based takeover score (global_text_factor_percentile_rank, vec_avg) relative to the fundamental score (global_fundamental_factor_percentile_rank) marks speculation the fundamentals do not support; such stocks give back gains over the following 1-3 months."
+
+  GLB:
+    enabled: true
+    settings: {universe: TOP3000, neutralization: COUNTRY, decay: 4}
+    catalogs:
+      1: ../captures/consultant_catalogs/datafields_glb_top3000_d1.json
+    arms:
+      - dataset: analyst69
+        delay: 1
+        settings: {neutralization: REVERSION_AND_MOMENTUM}
+        hypotheses:
+          - "Global revision breadth: the share of analysts raising EPS estimates over 4 weeks (anl69_best_eps_4wk_up minus anl69_best_eps_4wk_dn, divided by anl69_epss_best_eps_numest) predicts returns over the next 1-3 months in every country. VECTOR fields: aggregate with vec_avg. Neutralizing momentum and reversion tests whether revisions add something beyond price trends."
+          - "Consensus EPS change: the 4-week change in consensus EPS (anl69_epss_best_eps_4wk_chg) scaled by the absolute consensus (anl69_epss_best_eps) is a standardized revision signal; stocks with upward revisions outperform within their country."
+      - dataset: news20
+        delay: 1
+        hypotheses:
+          - "Global news impact: the average news impact score (nws20_nip, VECTOR: vec_avg) over the last 5 days predicts the next 1-2 weeks of returns within each country, because international investors react to local news with a lag."
+          - "Event sentiment versus attention: positive event sentiment (nws20_event_sentiment_score, vec_avg) on days with many relevant news items (vec_count of nws20_event_relevance) is stronger than on quiet days; weight sentiment by a ranked news count."
+
+  EUR:
+    enabled: true
+    settings: {universe: TOP2500, neutralization: COUNTRY, decay: 4}
+    catalogs:
+      0: ../captures/consultant_catalogs/datafields_eur_top2500_d0.json
+      1: ../captures/consultant_catalogs/datafields_eur_top2500_d1.json
+    arms:
+      - dataset: news_sentiment_nlp
+        delay: 0
+        settings: {decay: 2}
+        hypotheses:
+          - "Headline sentiment, same day: European stocks with positive headline sentiment (headline_sentiment_vader_score, VECTOR: vec_avg) rise over the next few days. Compare with the stock's own 20-day average so persistently upbeat names do not dominate."
+          - "Negative-word tone: headlines with high negative polarity (headline_sentiwordnet_negative_polarity, vec_max) predict short-term underperformance; investors under-react to negative wording more than to positive."
+      - dataset: fund_holdings_panel
+        delay: 0
+        settings: {decay: 6}
+        hypotheses:
+          - "Fund crowding: securities held by fast-growing numbers of fund accounts (holder_account_total, 20-60 day change) are bought by flows and later reverse; very concentrated holdings (herfindahl_index_holdings) add fire-sale risk. VECTOR fields: use vec_avg."
+          - "New positions: the number of new position initiations (boundary_transaction_total, vec_sum) relative to its own average signals fresh conviction buying that predicts returns over the next month."
+      - dataset: sentiment21
+        delay: 1
+        settings: {neutralization: STATISTICAL}
+        hypotheses:
+          - "Sentiment balance: European stocks whose mean positive news sentiment (snt21_2pos_mean_96) exceeds mean negative sentiment (snt21_2neg_mean_103), relative to the stock's own 20-day level, outperform over the next 1-2 weeks. Statistical neutralization strips common factor moves out of the sentiment signal."
+          - "Sentiment persistence: a 10-day average of the positive-minus-negative median sentiment (snt21_2pos_median_99 minus snt21_2neg_median_105) predicts a slower drift over the following month."
+      - dataset: shortinterest3
+        delay: 1
+        settings: {decay: 6}
+        hypotheses:
+          - "Borrow cost in Europe: rising average lending rates (mean_loan_rate_p5_d1, VECTOR: vec_avg) over 20 days signal growing short demand and predict underperformance over the next 1-2 months."
+          - "Short demand: the number of shares lent in new loans (new_loaned_share_count_d1, vec_sum) relative to its own 60-day average flags fresh informed shorting; short stocks where it spikes."
+
+  ASI:
+    enabled: true
+    settings: {universe: MINVOL1M, neutralization: COUNTRY, decay: 5}
+    catalogs:
+      1: ../captures/consultant_catalogs/datafields_asi_minvol1m_d1.json
+    arms:
+      - dataset: shortinterest3
+        delay: 1
+        hypotheses:
+          - "Utilisation in Asia: stocks with high share-lending utilisation (shrt3_utilizationpercent_units, VECTOR: vec_avg) underperform over the next 1-3 months, where short selling is costly and only well-informed traders short."
+          - "Loan-rate trend: a rising weighted average loan rate (mean_loan_rate_p5_d1, vec_avg) over 20 days relative to the minimum rate (min_loan_rate_p5_d1) shows tightening borrow supply; short such stocks within their country."
+      - dataset: news_sentiment_dl
+        delay: 1
+        settings: {decay: 3}
+        hypotheses:
+          - "Word-level news sentiment: the gap between mean positive and mean negative word sentiment in articles (mean_positive_word_sentiment_inferess minus mean_negative_word_sentiment_inferess, VECTOR: vec_avg) predicts the next week's return in Asian markets."
+          - "Negative-word intensity: articles with many negative words (negative_word_count_inferess, vec_sum) relative to the stock's normal news flow predict underperformance; scale by the total positive plus negative word count."
+
+  CHN:
+    enabled: true
+    settings: {universe: TOP2000U, neutralization: INDUSTRY, decay: 4}
+    catalogs:
+      0: ../captures/consultant_catalogs/datafields_chn_top2000u_d0.json
+      1: ../captures/consultant_catalogs/datafields_chn_top2000u_d1.json
+    arms:
+      - dataset: other561
+        delay: 0
+        settings: {decay: 2}
+        hypotheses:
+          - "Retail herding reverses: A-shares are retail-driven, and stocks with a surge of net retail buyers on virtual portfolios (oth561_basic_stat_net_buy_user_num minus oth561_basic_stat_net_sell_user_num, scaled by oth561_basic_stat_total_active_user_num) are overbought and underperform over the next days."
+          - "First-time buyers as attention: a spike in users buying a stock for the first time (oth561_basic_stat_first_buy_user_num relative to its 20-day average) marks attention-driven buying (Barber and Odean 2008) that reverses."
+      - dataset: cn_stock_sentiment
+        delay: 0
+        settings: {decay: 2}
+        hypotheses:
+          - "Social-media sentiment contrarian: when bullish comment probability (bullish_sentiment_probability, VECTOR: vec_avg) far exceeds bearish probability (bearish_sentiment_probability), retail optimism is high and the stock tends to fall over the next week. Test both the contrarian and the momentum sign."
+          - "Comment volume: the number of comments (vec_count of sentiment_numeric_label) relative to the stock's own average measures retail attention; high-attention stocks underperform in China."
+      - dataset: model26
+        delay: 1
+        settings: {decay: 6}
+        hypotheses:
+          - "Analyst revisions in China: stocks with a high analyst revisions score (mdl26_revisions) outperform over the next 1-3 months; fill gaps with ts_backfill and rank within industry."
+          - "Forward earnings yield: a high SmartEstimate earnings yield for next year (mdl26_ep_yield_smartestimate_fy1) relative to industry peers marks cheap stocks on expected profit; combine with the revisions score."
+      - dataset: other561
+        delay: 1
+        settings: {decay: 3}
+        hypotheses:
+          - "Retail flow with a day's delay: the 5-day sum of net retail buyers (oth561_basic_stat_net_buy_user_num) relative to its 60-day average predicts reversal over the next 1-2 weeks; retail flow is noise traders' demand."
+          - "Rebalancing flow: the total portfolio weight bought in rebalancing (oth561_basic_stat_buy_rebalancing_weight) relative to its history reflects deliberate rather than impulsive buying; test whether it predicts continuation rather than reversal."
+
+  JPN:
+    enabled: true
+    settings: {universe: TOP1600, neutralization: INDUSTRY, decay: 4}
+    catalogs:
+      0: ../captures/consultant_catalogs/datafields_jpn_top1600_d0.json
+      1: ../captures/consultant_catalogs/datafields_jpn_top1600_d1.json
+    arms:
+      - dataset: sentiment23
+        delay: 0
+        settings: {decay: 2}
+        hypotheses:
+          - "Japanese news sentiment, same day: stocks whose average positive news sentiment (snt23_2pos_mean) exceeds average negative sentiment (snt23_2neg_mean) relative to their 20-day norm outperform over the next few days."
+          - "Sentiment uncertainty: a wide confidence interval on negative sentiment (snt23_2neg_conf_up) or a high standard deviation (snt23_2neg_std) signals unclear news; prices tend to drift down after such days."
+      - dataset: model68
+        delay: 0
+        settings: {decay: 6}
+        hypotheses:
+          - "Risk-adjusted momentum: the standardized, risk-adjusted momentum score (mdl68_score, VECTOR: vec_avg) predicts returns over the next month with smaller crashes than raw momentum; rank within industry."
+          - "Risk adjustment matters: the gap between risk-adjusted (mdl68_ram) and raw momentum (mdl68_raw) separates steady winners from volatile ones; long stocks whose momentum survives the risk adjustment."
+      - dataset: news18
+        delay: 1
+        settings: {decay: 3}
+        hypotheses:
+          - "Earnings news sentiment in Japan: the composite sentiment of earnings news (rp_css_earnings) over the last 5 days predicts the next 2-3 weeks of returns; fill missing days with ts_backfill."
+          - "News impact: the average narrative impact score (nws18_nip, VECTOR: vec_avg) captures how much the news should move the price; stocks with positive impact keep drifting up."
+      - dataset: shortinterest3
+        delay: 1
+        settings: {decay: 6}
+        hypotheses:
+          - "Borrow cost in Japan: rising average lending rates (mean_loan_rate_p5_d1, VECTOR: vec_avg) relative to the 60-day average predict underperformance over the next month."
+          - "Loan-rate volatility: unstable borrowing costs (loan_rate_volatility_p5_d1, vec_avg) mark contested shorts; short stocks where it rises within their industry."
+
+  AMR:
+    enabled: true
+    settings: {universe: TOP600, neutralization: COUNTRY, decay: 4}
+    catalogs:
+      0: ../captures/consultant_catalogs/datafields_amr_top600_d0.json
+      1: ../captures/consultant_catalogs/datafields_amr_top600_d1.json
+    arms:
+      - dataset: analyst4
+        delay: 0
+        settings: {decay: 3}
+        hypotheses:
+          - "Revision breadth in the Americas ex-US: the number of upward minus downward estimate changes (anl4_basicconaf_pu minus anl4_basicconaf_down, divided by anl4_basicconaf_numest; VECTOR fields: vec_avg) predicts returns over the next month."
+          - "Estimate level change: the 20-day change in the mean estimate (anl4_basicconaf_mean, vec_avg) scaled by its absolute value is a standardized revision; fill gaps with ts_backfill."
+      - dataset: ai_news_scores
+        delay: 0
+        settings: {decay: 2}
+        hypotheses:
+          - "AI news sentiment, same day: the gap between positive and negative sentiment scores (positive_score_average_value minus negative_score_average_value) relative to its 20-day average predicts the next few days' returns."
+          - "Negative-news shock: a jump in the average negative score (negative_score_average_value) far above the stock's norm predicts continued underperformance over the next week."
+      - dataset: news79
+        delay: 1
+        settings: {decay: 3}
+        hypotheses:
+          - "Composite news sentiment: the 5-day average composite sentiment (nws79_composite_sentiment_score_462, VECTOR: vec_avg) predicts the next 1-2 weeks of returns in Canada and Latin America."
+          - "Analyst-rating news: the sentiment of news about analyst rating changes (nws79_analyst_ratings_sentiment_447, vec_avg) predicts drift after upgrades and downgrades."
+      - dataset: analyst69
+        delay: 1
+        settings: {decay: 5}
+        hypotheses:
+          - "Consensus EPS revisions: the 4-week change in consensus EPS (anl69_best_eps_4wk_chg, VECTOR: vec_avg) scaled by the absolute consensus (anl69_best_eps) predicts the next 1-3 months; coverage is about half the universe, so fill gaps with ts_backfill."
+          - "Estimate dispersion: a wide range between the highest and lowest EPS estimates (anl69_best_eps_hi minus anl69_best_eps_lo, scaled by anl69_best_eps) means uncertainty and predicts lower returns (Diether, Malloy and Scherbina 2002)."
+
+  IND:
+    enabled: true
+    settings: {universe: TOP500, neutralization: SECTOR, decay: 4}
+    catalogs:
+      1: ../captures/consultant_catalogs/datafields_ind_top500_d1.json
+    arms:
+      - dataset: news85
+        delay: 1
+        settings: {decay: 3}
+        hypotheses:
+          - "Indian news sentiment: the daily mean positive sentiment (sentiment_overall_average) relative to its 20-day average predicts the next week's return."
+          - "Attention-weighted sentiment: weight sentiment (sentiment_overall_average) by the normalized headline count (normalized_headline_count); news on busy days carries more information."
+      - dataset: model313
+        delay: 1
+        settings: {decay: 10}
+        hypotheses:
+          - "Intangible capital (Eisfeldt and Papanikolaou 2013): firms with high organizational capital intensity (mdl313_ico) earn higher returns, because that capital walks out the door with key staff and investors demand a premium. Slow signal: high decay, rank within sector."
+          - "Intangible intensity: the composite intangible asset intensity score (mdl313_iai) relative to sector peers predicts returns over the next months; book value understates these firms."
+
+  DEU:
+    enabled: true
+    settings: {universe: TOP500, neutralization: SECTOR, decay: 4}
+    catalogs:
+      0: ../captures/consultant_catalogs/datafields_deu_top500_d0.json
+      1: ../captures/consultant_catalogs/datafields_deu_top500_d1.json
+    arms:
+      - dataset: news18
+        delay: 0
+        settings: {decay: 2}
+        hypotheses:
+          - "German news impact, same day: the average news impact (nws18_multiple_comp_nip, VECTOR: vec_avg) predicts the next few days' returns."
+          - "Equity sentiment: the sum of the -1/0/+1 equity sentiment classifier (nws18_multiple_comp_qep, vec_sum) over the last 3 days predicts short-term drift."
+      - dataset: model216
+        delay: 0
+        settings: {decay: 5}
+        hypotheses:
+          - "Analyst revision model: the global analyst revisions rank (mdl216_armglobal1rank, VECTOR: vec_avg) predicts returns over the next month in Germany; few BRAIN users have tried it here."
+          - "Revision combination: the combined estimate revisions rank (mdl216_armestimaterevisioncombinationrank, vec_avg) ranked within sector; long upward revisions, short downward ones."
+      - dataset: model53
+        delay: 1
+        settings: {decay: 8}
+        hypotheses:
+          - "Distress anomaly (Campbell, Hilscher and Szilagyi 2008): firms with a high 1-year default probability (mdl53_ms5_1year) earn low returns; short distressed firms, long safe ones, within sector."
+          - "Credit term structure: when short-horizon default probability (mdl53_ms5_3month) rises relative to the 5-year one (mdl53_ms5_5year), distress is getting closer; such stocks underperform. Also try the model-implied credit spread (mdl53_implied_spreads)."
+      - dataset: sentiment27
+        delay: 1
+        settings: {decay: 8}
+        hypotheses:
+          - "Web popularity: firms whose websites rise in popularity (snl27_avgranking falling, VECTOR: vec_avg; rank 1 = most popular) gain customers and outperform over the next months."
+          - "Best-domain momentum: the 60-day change in the best domain rank (snl27_topranking, vec_min) captures demand shifts before they show up in sales."
+
+  GBR:
+    enabled: true
+    settings: {universe: TOP700, neutralization: INDUSTRY, decay: 4}
+    catalogs:
+      0: ../captures/consultant_catalogs/datafields_gbr_top700_d0.json
+      1: ../captures/consultant_catalogs/datafields_gbr_top700_d1.json
+    arms:
+      - dataset: news17
+        delay: 0
+        settings: {decay: 2}
+        hypotheses:
+          - "Press-release sentiment, same day: UK press-release sentiment (nws17_multiple_comp_event_sentiment_score, VECTOR: vec_avg) predicts the next few days' returns."
+          - "Press-release impact: the impact score (nws17_multiple_comp_nip, vec_avg) weighted by its sign predicts short-term drift; company-issued news is under-reacted to."
+      - dataset: insider_agg_matrix
+        delay: 0
+        settings: {decay: 8}
+        hypotheses:
+          - "Insider direction (Lakonishok and Lee 2001): the net direction of insider trading (directional_indicator) predicts returns over the next 1-6 months in the UK."
+          - "Executive buying: shares bought by executives (total_buy_shares) relative to typical trade size is a stronger signal than director selling, which is often for liquidity; fill gaps with ts_backfill."
+      - dataset: news18
+        delay: 1
+        settings: {decay: 3}
+        hypotheses:
+          - "Composite news sentiment: the story-level composite sentiment (sentiment_composite_score_d1, VECTOR: vec_avg) over 5 days predicts the next 1-2 weeks of UK returns."
+          - "News impact: the average impact score (nws18_multiple_comp_nip, vec_avg) relative to its 20-day average predicts short-term drift."
+      - dataset: institutions6
+        delay: 1
+        settings: {decay: 8}
+        hypotheses:
+          - "Institutional buying breadth: more institutions buying than selling (count_institutional_buyers_security minus count_institutional_sellers_security, scaled by count_institutional_holders_security) predicts returns over the next months."
+          - "Institutional ownership change: the change in institutional share count (aggregate_share_count_institutions) relative to all owners (aggregate_share_count_all_owners) marks informed accumulation."

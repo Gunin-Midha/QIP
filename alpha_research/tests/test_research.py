@@ -29,7 +29,7 @@ ONE_MODEL = ModelsConfig(default="claude-test", generator=("claude-test",), crit
                          repair="claude-test", strategy="claude-test")
 # no refill passes: these tests count what one allocation does (refill has its own tests)
 AGENTS = dataclasses.replace(MAIN_AGENTS, models=ONE_MODEL, refill_passes=0)
-ARM = ("pv1", "USA", "gen-v3", "claude-test")
+ARM = ("pv1", "USA", "gen-v3", "claude-test", 1)
 SETTINGS = {"region": "USA", "universe": "TOP3000", "delay": 1, "decay": 4,
             "neutralization": "SUBINDUSTRY", "truncation": 0.08,
             "start_date": "2019-01-01", "end_date": "2023-12-31"}
@@ -137,12 +137,12 @@ def test_closed_loop_end_to_end(memory, config, playbook):
     # strategy evolution added an arm with a new prompt version and its guidance
     evo = next(r["evolution"] for r in report["rounds"] if "evolution" in r)
     assert evo["prompt_version"] == "gen-v3+evo1" and evo["source"] == "model"
-    assert "pv1/USA/gen-v3+evo1/claude-test" in report["arms"]
-    new_key = ("pv1", "USA", "gen-v3+evo1", "claude-test")
+    assert "pv1/USA/D1/gen-v3+evo1/claude-test" in report["arms"]
+    new_key = ("pv1", "USA", "gen-v3+evo1", "claude-test", 1)
     assert run.arms[new_key].guidance == "avoid volume spikes without decay"
     assert "evolved idea" in [s.text for s in run.arms[new_key].sources]
     # the director learned from the outcomes
-    base = report["arms"]["pv1/USA/gen-v3/claude-test"]
+    base = report["arms"]["pv1/USA/D1/gen-v3/claude-test"]
     assert base["accepted"] >= 2 and base["accepted"] + base["not_accepted"] >= 3
     assert report["pool_size"] >= 2
     assert set(llm.calls) >= {"generator", "critic", "judge", "strategy"}
@@ -154,7 +154,7 @@ def test_guidance_reaches_the_generator_prompt(memory, config, playbook):
     run = make_run(memory, config, playbook, llm=llm,
                    budget=Budget(max_simulations=40, per_round=10, max_llm_calls=100))
     run.run(3)
-    gen = run.generators[("pv1", "USA", "gen-v3+evo1", "claude-test")]
+    gen = run.generators[("pv1", "USA", "gen-v3+evo1", "claude-test", 1)]
     assert gen.config.prompt_version == "gen-v3+evo1"
     assert sum("avoid volume spikes without decay" in s for s in llm.systems) >= 1
     assert "avoid volume spikes" not in llm.systems[0]
@@ -212,10 +212,10 @@ def test_each_generator_model_is_an_arm_with_an_other_provider_critic(memory, co
     run = make_run(memory, config, playbook, agents=agents,
                    budget=Budget(max_simulations=12, per_round=6, max_llm_calls=200))
     report = run.run(2)
-    assert {"pv1/USA/gen-v3/claude-a", "pv1/USA/gen-v3/gemini-b"} <= set(report["arms"])
+    assert {"pv1/USA/D1/gen-v3/claude-a", "pv1/USA/D1/gen-v3/gemini-b"} <= set(report["arms"])
     # both arms start from the same hypothesis: separate source queues
-    assert run.arms[("pv1", "USA", "gen-v3", "claude-a")].sources is not \
-        run.arms[("pv1", "USA", "gen-v3", "gemini-b")].sources
+    assert run.arms[("pv1", "USA", "gen-v3", "claude-a", 1)].sources is not \
+        run.arms[("pv1", "USA", "gen-v3", "gemini-b", 1)].sources
     reviews = memory.critic_reviews()
     primary = {(r["generator_model"], r["critic_model"]) for r in reviews if r["role"] == "primary"}
     shadow = {(r["generator_model"], r["critic_model"]) for r in reviews if r["role"] == "shadow"}
@@ -349,7 +349,7 @@ def test_slots_of_a_model_that_goes_down_go_to_live_arms(memory, config, playboo
                       seed=0, sleep=vc.sleep, clock=vc.clock, run_id="rs1")
     report = run.run(1)
     r1 = report["rounds"][0]
-    assert r1["allocation"]["pv1/USA/gen-v3/claude-a"] > 0          # claude-a was not known down
+    assert r1["allocation"]["pv1/USA/D1/gen-v3/claude-a"] > 0          # claude-a was not known down
     assert r1["refills"] and all(arm.endswith("gemini-b") for f in r1["refills"] for arm in f)
     refilled = [a for a in r1["arms"] if a.get("refill")]
     assert refilled and sum(len(a["outcomes"]) for a in refilled) > 0
@@ -390,11 +390,11 @@ def test_hypothesis_on_a_new_catalog_dataset_gets_its_own_arms(memory, config, p
                       memory=memory, field_meta={"tone": {"dataset": "news12", "type": "MATRIX"}},
                       seed=0, sleep=vc.sleep, clock=vc.clock, run_id="rs1")
     run.run(2)
-    new = ("news12", "USA", "gen-v3+evo1", "claude-test")
+    new = ("news12", "USA", "gen-v3+evo1", "claude-test", 1)
     assert new in run.arms and run.arms[new].settings.dataset == "news12"
     assert [s.text for s in run.arms[new].sources] == ["news tone drift"]
     # the old dataset's evolved arm keeps the unknown-dataset idea but not the news12 one
-    texts = [s.text for s in run.arms[("pv1", "USA", "gen-v3+evo1", "claude-test")].sources]
+    texts = [s.text for s in run.arms[("pv1", "USA", "gen-v3+evo1", "claude-test", 1)].sources]
     assert "made-up data idea" in texts and "news tone drift" not in texts
 
 
@@ -515,7 +515,7 @@ def test_cli_research_end_to_end(tmp_path, monkeypatch, capsys):
     assert rc == 0, out
     data = json.loads(report.read_text())
     assert data["simulations_used"] == 2 and data["stop_reason"] == "simulation budget used up"
-    assert "stopped: simulation budget used up" in out and "pv1/USA/gen-v3/claude-sonnet-5-5: accepted 2" in out
+    assert "stopped: simulation budget used up" in out and "pv1/USA/D1/gen-v3/claude-sonnet-5-5: accepted 2" in out
 
 
 def test_cli_research_needs_a_holdout(tmp_path, no_holdout_config):

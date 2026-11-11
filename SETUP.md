@@ -167,6 +167,24 @@ They are not shared with the team and must never be committed.
 To change the research ideas, copy `config/research_plan.example.yaml`, edit the
 hypotheses, and pass your copy to `--plan`.
 
+`config/research_plan.v2.yaml` covers every region and delay. It needs the catalogs from
+`scripts/brain_discovery.py` in `captures/consultant_catalogs/` (not in git), and then no
+`--datafields`. Set `enabled: false` on regions you don't want in a run. Each run works on
+3 regions (the least covered so far) and the next run on the next 3, so cap a run at 20
+alphas and just run it again:
+
+```bash
+PYTHONPATH=src python3 -m alpha_research.cli research --plan config/research_plan.v2.yaml \
+    --max-simulations 20 --max-llm-calls 60 --per-round 5 --rounds 6
+```
+
+The plan's `seeds` (earlier alphas to improve) are simulated first. One of them needs the
+option6 dataset at delay 1; fetch it once (one BRAIN login):
+
+```bash
+PYTHONPATH=src python3 scripts/brain_discovery.py --regions USA --datasets option6
+```
+
 ---
 
 ## When something goes wrong
