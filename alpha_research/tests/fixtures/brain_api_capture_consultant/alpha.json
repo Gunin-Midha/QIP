@@ -1,0 +1,200 @@
+{
+  "id": "MP6POJNn",
+  "type": "REGULAR",
+  "author": "REDACTED",
+  "settings": {
+    "instrumentType": "EQUITY",
+    "region": "USA",
+    "universe": "TOP3000",
+    "delay": 1,
+    "decay": 4,
+    "neutralization": "SUBINDUSTRY",
+    "truncation": 0.08,
+    "pasteurization": "ON",
+    "unitHandling": "VERIFY",
+    "nanHandling": "OFF",
+    "maxTrade": "OFF",
+    "maxPosition": "OFF",
+    "language": "FASTEXPR",
+    "visualization": false,
+    "startDate": "2014-01-01",
+    "endDate": "2023-12-31",
+    "simulationMode": "FULL"
+  },
+  "regular": {
+    "code": "rank(-ts_delta(close, 5))",
+    "description": null,
+    "operatorCount": 3
+  },
+  "dateCreated": "2026-11-10T11:46:55-05:00",
+  "dateSubmitted": null,
+  "dateModified": "2026-11-10T11:46:56-05:00",
+  "name": null,
+  "favorite": false,
+  "hidden": false,
+  "color": null,
+  "category": null,
+  "tags": [],
+  "classifications": [
+    {
+      "id": "DATA_USAGE:SINGLE_DATA_SET",
+      "name": "Single Data Set Alpha"
+    }
+  ],
+  "grade": null,
+  "stage": "IS",
+  "status": "UNSUBMITTED",
+  "is": {
+    "pnl": 8498862,
+    "bookSize": 20000000,
+    "longCount": 1542,
+    "shortCount": 1519,
+    "turnover": 0.3993,
+    "returns": 0.0852,
+    "drawdown": 0.0676,
+    "margin": 0.000427,
+    "sharpe": 1.34,
+    "fitness": 0.62,
+    "startDate": "2014-01-01",
+    "investabilityConstrained": {
+      "pnl": 8385603,
+      "bookSize": 20000000,
+      "longCount": 1626,
+      "shortCount": 1503,
+      "turnover": 0.3376,
+      "returns": 0.084,
+      "drawdown": 0.094,
+      "margin": 0.000498,
+      "fitness": 0.62,
+      "sharpe": 1.25
+    },
+    "riskNeutralized": {
+      "pnl": 3614599,
+      "bookSize": 20000000,
+      "longCount": 1542,
+      "shortCount": 1519,
+      "turnover": 0.3993,
+      "returns": 0.0362,
+      "drawdown": 0.0238,
+      "margin": 0.000181,
+      "fitness": 0.72,
+      "sharpe": 2.39
+    },
+    "checks": [
+      {
+        "name": "LOW_SHARPE",
+        "result": "WARNING",
+        "limit": 1.58,
+        "value": 1.34
+      },
+      {
+        "name": "LOW_FITNESS",
+        "result": "WARNING",
+        "limit": 1.0,
+        "value": 0.62
+      },
+      {
+        "name": "LOW_TURNOVER",
+        "result": "PASS",
+        "limit": 0.01,
+        "value": 0.3993
+      },
+      {
+        "name": "HIGH_TURNOVER",
+        "result": "PASS",
+        "limit": 0.7,
+        "value": 0.3993
+      },
+      {
+        "name": "CONCENTRATED_WEIGHT",
+        "result": "PASS"
+      },
+      {
+        "name": "LOW_SUB_UNIVERSE_SHARPE",
+        "result": "PASS",
+        "limit": 0.58,
+        "value": 1.02
+      },
+      {
+        "name": "CLUSTER_TEST",
+        "result": "WARNING",
+        "limit": 1.58,
+        "value": 1.17
+      },
+      {
+        "name": "SELF_CORRELATION",
+        "result": "PENDING"
+      },
+      {
+        "name": "DATA_DIVERSITY",
+        "result": "PENDING"
+      },
+      {
+        "name": "PROD_CORRELATION",
+        "result": "PENDING"
+      },
+      {
+        "name": "REGULAR_SUBMISSION",
+        "result": "PENDING"
+      },
+      {
+        "name": "LOW_2Y_SHARPE",
+        "result": "WARNING",
+        "value": 1.05,
+        "limit": 1.58
+      },
+      {
+        "name": "POWER_POOL_CORRELATION",
+        "result": "PENDING"
+      },
+      {
+        "result": "PASS",
+        "name": "MATCHES_PYRAMID",
+        "effective": 1,
+        "multiplier": 1.1,
+        "pyramids": [
+          {
+            "name": "USA/D1/PV",
+            "multiplier": 1.1
+          }
+        ]
+      },
+      {
+        "result": "WARNING",
+        "name": "MATCHES_THEMES",
+        "themes": [
+          {
+            "id": "ZDXgR5B",
+            "multiplier": 2.0,
+            "name": "GLB/D1 TOPDIV3000 Theme"
+          }
+        ]
+      },
+      {
+        "result": "PENDING",
+        "name": "MATCHES_THEMES",
+        "themes": [
+          {
+            "id": "9B3qVP4",
+            "multiplier": 1.0,
+            "name": "GLB/D1 Power Pool Nov`26"
+          }
+        ]
+      },
+      {
+        "name": "OSMOSIS_ALLOCATION",
+        "result": "WARNING"
+      }
+    ]
+  },
+  "os": null,
+  "train": null,
+  "test": null,
+  "competitions": null,
+  "themes": null,
+  "pyramids": null,
+  "pyramidThemes": null,
+  "team": null,
+  "osmosisPoints": null,
+  "origin": "PLATFORM"
+}

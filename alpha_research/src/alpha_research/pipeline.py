@@ -119,13 +119,14 @@ class Pipeline:
         if result.status != "invalid":
             self.auditor.register_variant(candidate.family, candidate.candidate_id)
 
-        gates = evaluator.run_gates(result, self.config)
+        config = self.config.for_settings(candidate.region, candidate.delay)
+        gates = evaluator.run_gates(result, config)
         if result.status == "complete":
-            veto, risk_checks, risk_reasons = risk.assess(result, self.config, gates)
+            veto, risk_checks, risk_reasons = risk.assess(result, config, gates)
         else:
             veto, risk_checks, risk_reasons = False, [], []
         decision = evaluator.decide(result, gates, self.playbook, risk_checks, veto, risk_reasons,
-                                    self.config.repair.near_miss_share)
+                                    config.repair.near_miss_share)
 
         admitted_by_diversity = None
         if decision.decision == "accept":

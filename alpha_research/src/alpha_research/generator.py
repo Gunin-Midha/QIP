@@ -33,14 +33,15 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Callable, Collection, Iterable
+from typing import Callable, Collection, Iterable, Sequence
 
 import yaml
 
 from .config import ConfigError
 from .fastexpr import Analysis, ComplexityLimits, FastExprSpec, analyze, catalog
 from .llm import LLMClient
-from .schemas import (NEUTRALIZATIONS, CandidateRecord, SchemaError, experiment_hash)
+from .schemas import (GROUP_NEUTRALIZATIONS, CandidateRecord, SchemaError, experiment_hash,
+                      neutralizations_for)
 
 
 class GenerationError(RuntimeError):
@@ -327,7 +328,8 @@ def _annotate(name: str, meta: dict) -> str:
 
 def build_system_prompt(spec: FastExprSpec, datafields: Collection[str] | None,
                         relevance_text: str, config: GeneratorConfig,
-                        guidance: str | None = None, meta: dict | None = None) -> str:
+                        guidance: str | None = None, meta: dict | None = None,
+                        neutralizations: Sequence[str] = (), market: str | None = None) -> str:
     lines = [
         "You are a quantitative researcher writing alpha expressions for the WorldQuant "
         "BRAIN platform, in the Fast Expression language.",
@@ -355,6 +357,17 @@ def build_system_prompt(spec: FastExprSpec, datafields: Collection[str] | None,
         f"Groups (for group_* operators): {', '.join(sorted(spec.groups))}",
         f"Base fields: {', '.join(sorted(spec.base_fields))}",
     ]
+    if market:
+        lines.append(f"Market: {market}. Fields, liquidity and what works differ between "
+                     "regions; write for this market.")
+    if neutralizations:
+        groups = [n for n in neutralizations if n in GROUP_NEUTRALIZATIONS]
+        factors = [n for n in neutralizations if n not in GROUP_NEUTRALIZATIONS and n != "NONE"]
+        lines.append(f"Neutralizations allowed (optional per alpha; otherwise the settings' "
+                     f"default): {', '.join(neutralizations)}. "
+                     f"{', '.join(groups)} neutralize within that group"
+                     + (f"; {', '.join(factors)} are BRAIN's factor neutralizations" if factors else "")
+                     + ".")
     if datafields is not None:
         meta = meta or {}
         shown, explore = select_datafields(datafields, relevance_text,
@@ -406,7 +419,7 @@ _ALPHA_FORMAT = (
     'this expression expresses the idea", "rationale": "why it should predict returns and '
     'why the sign is right", "family": "price_volume | fundamentals | analyst | sentiment | '
     'other (snake_case, your best label)", "decay": <optional integer >= 0>, '
-    '"neutralization": "<optional: NONE, MARKET, SECTOR, INDUSTRY or SUBINDUSTRY>"}]}')
+    '"neutralization": "<optional: one of the neutralizations allowed above>"}]}')
 
 
 def _generate_prompt(hypothesis: str, context: str | None, k: int) -> str:
@@ -606,7 +619,10 @@ class AlphaGenerator:
     def _generate_unit(self, unit: _Unit, k: int, result: GenerationResult) -> None:
         relevance = unit.hypothesis + " " + (unit.context or "")
         system = build_system_prompt(self.spec, self.datafields, relevance, self.config,
-                                     self.guidance, self.field_meta)
+                                     self.guidance, self.field_meta,
+                                     neutralizations_for(self.settings.region),
+                                     market=f"{self.settings.region} {self.settings.universe}, "
+                                            f"delay {self.settings.delay}")
         reply = self._ask_json(system, _generate_prompt(unit.hypothesis, unit.context, k), result)
         good, bad = self._check(self._items(reply), unit)
 
@@ -673,7 +689,7 @@ class AlphaGenerator:
         neut = s.neutralization
         if raw.get("neutralization") is not None:
             nz = raw["neutralization"]
-            if isinstance(nz, str) and nz.upper() in NEUTRALIZATIONS:
+            if isinstance(nz, str) and nz.upper() in neutralizations_for(s.region):
                 neut = nz.upper()
             else:
                 warnings.append(f"ignored invalid neutralization {nz!r}; used {s.neutralization}")

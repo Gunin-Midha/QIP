@@ -14,6 +14,12 @@ Method
    hypotheses on least-tried datasets and at most one building on an accepted alpha, and
    guidance may teach construction techniques but never narrows the datasets or families. Without the model (or when its reply is unusable) the guidance is
    built from the counts alone and no hypotheses are proposed.
+   Per region (consultant level, 2026-11-11): the summary splits the counts by region
+   (``regions``: decided, accepted, top failures, and how each neutralization fared), and
+   the model may give ``region_guidance`` per region, which only that region's new arms
+   get, because what works in one region may not work in another. ``region_notes`` writes
+   the same evidence for one region as plain lines without a model; the research loop
+   gives them to that region's Generator every round.
 3. Each evolution is a new prompt version ``<base>+evo<k>``. The Research Director adds it
    as new arms next to the old ones, so the bandit measures whether the guidance helps
    instead of assuming it does.
@@ -48,6 +54,12 @@ class Evolution:
     source: str = "rules"
     notes: list[str] = field(default_factory=list)
     llm_calls: int = 0
+    region_guidance: dict[str, str] = field(default_factory=dict)
+
+    def guidance_for(self, region: str) -> str:
+        """The guidance plus this region's own part, if the model gave one."""
+        extra = self.region_guidance.get(region)
+        return f"{self.guidance}\nIn {region}:\n{extra}" if extra else self.guidance
 
 
 FEW_TRIALS = 3   # a dataset with fewer decided alphas than this counts as least tried
@@ -86,6 +98,7 @@ def summarize(outcomes: list[dict], *, top_n: int = 5,
     worked = [r for r in LeverStats.from_events(repair_events(outcomes)).table()
               if r["posterior_mean"] > 0.5]
     return {
+        "regions": region_breakdown(outcomes),
         "decided": sum(f["decided"] for f in by_family.values()),
         "accepted": sum(f["accepted"] for f in by_family.values()),
         "failure_classes": dict(failures.most_common()),
@@ -102,6 +115,51 @@ def summarize(outcomes: list[dict], *, top_n: int = 5,
     }
 
 
+def region_breakdown(outcomes: list[dict]) -> dict:
+    """Per region: decided, accepted, top failure classes, datasets tried and how each
+    neutralization fared ({neutralization: [decided, accepted]})."""
+    regions: dict = defaultdict(lambda: {"decided": 0, "accepted": 0, "failures": Counter(),
+                                         "datasets": Counter(), "neutralizations": {}})
+    for row in outcomes:
+        c, d = row["candidate"], row["decision"]
+        if d is None:
+            continue
+        reg = regions[c.region]
+        ok = d.decision == "accept"
+        reg["decided"] += 1
+        reg["accepted"] += ok
+        reg["datasets"][c.dataset or "unknown"] += 1
+        if not ok:
+            reg["failures"][d.failure_class] += 1
+        n = reg["neutralizations"].setdefault(c.neutralization, [0, 0])
+        n[0] += 1
+        n[1] += ok
+    return {r: {"decided": v["decided"], "accepted": v["accepted"],
+                "failures": dict(v["failures"].most_common(3)),
+                "datasets": len(v["datasets"]),
+                "neutralizations": dict(sorted(v["neutralizations"].items()))}
+            for r, v in sorted(regions.items())}
+
+
+def region_notes(outcomes: list[dict], region: str, *, max_levers: int = 3) -> str | None:
+    """Plain evidence lines for one region's Generator, from memory; None with no history."""
+    info = region_breakdown(outcomes).get(region)
+    if not info:
+        return None
+    lines = [f"- In {region} so far: {info['accepted']} of {info['decided']} decided alphas "
+             f"accepted, over {info['datasets']} datasets."]
+    if info["failures"]:
+        lines.append("- Most common failures there: " + ", ".join(
+            f"{k} ({v})" for k, v in info["failures"].items()) + ".")
+    tried = [f"{n} {acc}/{dec}" for n, (dec, acc) in info["neutralizations"].items()]
+    lines.append("- Neutralizations tried there (accepted/decided): " + ", ".join(tried) + ".")
+    stats = LeverStats.from_events(repair_events(outcomes))
+    good = [r for r in stats.region_table() if r["region"] == region and r["fixed"] > 0]
+    for r in good[:max_levers]:
+        lines.append(f"- Repair that fixed {r['failure_class']} there: {r['lever']}.")
+    return "\n".join(lines)
+
+
 _FAILURE_ADVICE = {
     "turnover": "turnover is the most common failure: prefer longer windows, decay, or smoothing (ts_mean, ts_decay_linear)",
     "sharpe": "Sharpe is the most common failure: the signals are too weak; combine related fields or condition on liquidity",
@@ -110,6 +168,8 @@ _FAILURE_ADVICE = {
     "sub_universe": "sub-universe Sharpe is the most common failure: the signal only works in illiquid names; prefer liquid fields",
     "concentration": "weight concentration is the most common failure: rank or winsorize before combining",
     "drawdown": "drawdown is the most common failure: volatility-scale the signal",
+    "recent_sharpe": "recent-years Sharpe is the most common failure: the signals have faded lately; prefer less crowded fields and test robustness to the recent regime",
+    "prod_correlation": "correlation with BRAIN's production alphas is the most common failure: the ideas are too well known; use less common fields, group-relative forms or conditioning",
     "incomplete": "many simulations were incomplete: check expressions and datafields before simulating",
 }
 
@@ -174,6 +234,13 @@ class StrategyEvolution:
         if not isinstance(reply, dict):
             evo.notes.append("strategy reply was not an object, rule guidance used")
             return
+        rg = reply.get("region_guidance")
+        if isinstance(rg, dict):
+            for region, text in rg.items():
+                if isinstance(text, list):
+                    text = "\n".join(f"- {x}" for x in text if isinstance(x, str))
+                if isinstance(region, str) and isinstance(text, str) and text.strip():
+                    evo.region_guidance[region] = text.strip()[: self.config.max_guidance_chars]
         g = reply.get("guidance")
         if isinstance(g, list):
             g = "\n".join(f"- {x}" for x in g if isinstance(x, str))

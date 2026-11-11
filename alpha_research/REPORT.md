@@ -639,3 +639,40 @@ Fixed:
 5. **The Critic dropped fixable ideas** (two gpt-oss ideas for a missing `ts_backfill`). `critic-v3` / `judge-v3`: drop only for a look-ahead or an untestable idea; a fixable defect is revise (or simulate). Slots emptied by the Generator, Pre-Filter or Critic go back to the Director for `director.refill_passes` extra passes per round (config/agents.yaml: 1).
 
 559 tests pass.
+
+### Consultant upgrade (2026-11-10..11)
+
+**Why.** The account moved to consultant level (`level` GOLD). Settings, operators, limits, the in-sample period and the checks all changed, and BRAIN now asks for biometric verification on every new login.
+
+**What we found** (one discovery session, `captures/consultant_20261110/`, git-ignored): 11 regions with their own universes and delays; the factor neutralizations (REVERSION_AND_MOMENTUM, STATISTICAL, CROWDING, FAST, SLOW, SLOW_AND_FAST) and COUNTRY in GLB/EUR/ASI/AMR; 82 operators (+16); in-sample 2014-01-01..2023-12-31; LOW_SHARPE limit 1.58; new checks (LOW_2Y_SHARPE, IS_LADDER_SHARPE, PROD_CORRELATION, POWER_POOL_CORRELATION, DATA_DIVERSITY, REGULAR_SUBMISSION, CLUSTER_TEST, MATCHES_PYRAMID/THEMES, OSMOSIS_ALLOCATION, POWER_POOL_DESCRIPTION_*). The checks inside a fresh simulation are provisional (LOW_SHARPE WARNING, SELF_CORRELATION PENDING); `GET /alphas/<id>/check` gives the final ones. USA/TOP3000/D1 has 289 datasets and more than 10,000 fields, and BRAIN returns nothing past offset 10,000.
+
+**What was built.**
+- `brain_api.py`: biometric login (`BrainSession(on_biometric=)`; the CLI prints the link and waits for Enter in a terminal); `RealBrainClient` fetches the submission check (`fetch_submission_check`, `check_max_wait_seconds`) and `translate(check=)` prefers it, noting WARNING value/limit and the new `is.investabilityConstrained` / `is.riskNeutralized` stats; `list_datafields` goes one dataset at a time above `DATAFIELD_OFFSET_CAP`, with progress lines; `list_datasets`.
+- `schemas.REGION_SETTINGS` and `neutralizations_for(region)` (a test checks them against `brain options`); `GROUP_NEUTRALIZATIONS`. The Generator and Repair Agent accept the region's set; `set_neutralization` leaves factor neutralizations alone.
+- Prompts: the Generator system prompt (`gen-v3`) and the Repair request (`repair-v5`) list the neutralizations allowed in the region, groups and factor ones named apart; the reply shapes point at that list instead of the five old values.
+- `config/fastexpr.yaml` 82 operators; `gates.sharpe_min` 1.58; `gates.brain_checks_ignored` (submission-only checks, OQ-17); the evaluator maps the new checks to failure classes; candidate start dates 2014-01-01 in the plans and settings.
+- `cli brain datasets` (datasets with field counts) and `scripts/brain_discovery.py` (every region and delay in one login, per-dataset retries on 502, rerunnable; plain progress lines). Capped 2026-11-11 after the uncapped run took ~3 h for USA D0 alone: `--max-datasets` (20) chosen by `pick_datasets` (top per category, then most used, 30% least explored), per-dataset part files so nothing is lost on Ctrl+C (`tests/test_brain_discovery.py`). Run completed 2026-11-11: all 18 region/delay catalogs, no gaps (ALL D1 and USA D0 in full from the uncapped run; the other 16 with 20 datasets each, 688 to 4,021 fields).
+- Fixture `tests/fixtures/brain_api_capture_consultant/` (acc_01 again, its submission check, the IV-spread pool alpha's check, prod correlations, `brain options`; redacted; SOURCE.md).
+
+**Not done yet.** The full per-region catalogs (the first discovery hit the 10,000 cap in ALL, USA D0/D1, EUR D1, ASI, and 502s on GLB D1 and EUR D1); `captures/datafields_usa_top3000_d1.json` is still the capped 10,000-field catalog. The pool alpha (Sharpe 1.38) and the lever statistics were judged at user-level limits on 2019-2023, and its 1.38 is below the new 1.58 limit; it should be re-simulated on the new period before it is trusted.
+
+579 tests pass.
+
+### Regions, new checks and repairs (2026-11-11)
+
+**Why.** The owner asked that the Repair Agent repair BRAIN's new checks and use the new neutralizations, that every agent know the consultant features, and that each agent be tuned per region, because what works in one region may not work in another. Owner's choices: new failure classes for the new checks; build region lever learning, region limits, region-aware prompts and region quotas in the Director now; write research plan v2 once the full catalogs are downloaded.
+
+**What we found first.** The neutralization lever only moved along NONE < MARKET < SECTOR < INDUSTRY < SUBINDUSTRY, so the factor neutralizations and COUNTRY were never tried; and since lever learning and the lineage skip go by lever name, one `set_neutralization` covering all of them would have allowed only one neutralization repair per lineage. LOW_2Y_SHARPE / IS_LADDER_SHARPE were mapped to `sharpe` (whose levers, flip_sign and backfill, target another problem) and PROD_CORRELATION to `self_correlation` (whose main lever rewrites against our own pool, not BRAIN's production alphas). Their values were kept only in notes, so near-miss limits could not apply. BRAIN's risk-neutralized Sharpe (acc_01: 2.39 against 1.34) was a note too. `change_universe` knew only USA's universes.
+
+**What was built.**
+- `schemas`: `ResultRecord.check_values` and `alt_stats` (from `translate`, through `normalize`, stored in the result payload; old payloads load); failure classes `recent_sharpe`, `prod_correlation`; `GROUP_NEUTRALIZATIONS`.
+- `evaluator`: the new mapping and priority; `brain:<CHECK>` gates take BRAIN's value and limit; `gates_for` uses BRAIN's limit per check when `gates.limits_from_brain`.
+- `config`: `gates.limits_from_brain`; optional `regions` section of gate overrides (`USA` or `USA/D0`), `Config.for_settings`; `recent_sharpe` near-miss share. The pipeline evaluates each candidate with its region's config.
+- `repair_agent`: `neutralize_<name>` levers (7), region-aware `change_universe`, repair metrics with BRAIN's failed checks and alternate stats. Playbook: `recent_sharpe`, `prod_correlation` and factor levers as priors elsewhere. Prompts: `restore_recent_performance`, `differentiate_from_production`, `CLASS_MEANING`.
+- `lever_stats`: per-region evidence with shrinkage to the all-region estimate (`region_prior_strength`), region-aware ranking and examples, `region_table`; reports and `cli levers` show it.
+- `orchestrator`: `region_floor_share`, `max_region_share`.
+- `prompts.brain_context(config, regions)`, Generator market line and per-round `region_notes`, Strategy `regions` breakdown and `region_guidance`; `cli prompts --regions`.
+
+**Not built (suggestions).** See "Per-region tuning: further ideas" in CLAUDE.md.
+
+609 tests pass.

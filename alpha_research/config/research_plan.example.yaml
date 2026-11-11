@@ -13,7 +13,7 @@ arms:
       decay: 4
       neutralization: SUBINDUSTRY
       truncation: 0.08
-      start_date: "2019-01-01"
+      start_date: "2014-01-01"
       end_date: "2023-12-31"
     hypotheses:
       - "Stocks that fell sharply over the last week tend to rebound over the next week (short-term reversal)."
@@ -28,7 +28,7 @@ arms:
       decay: 0
       neutralization: INDUSTRY
       truncation: 0.08
-      start_date: "2019-01-01"
+      start_date: "2014-01-01"
       end_date: "2023-12-31"
     hypotheses:
       - "Firms with improving operating cash flow relative to assets outperform firms with deteriorating cash flow."

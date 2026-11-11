@@ -14,6 +14,12 @@ Allocation method:
 3. Cap (``max_share``, optional): no arm gets more than ceil(max_share * budget) slots
    while another arm is below the cap, so a few early accepts cannot pull a whole round
    into one dataset or model (owner 2026-11-04: keep the search diverse).
+4. Regions (optional; arms carry their region at index 1). ``region_floor_share``: after
+   the arm floors, each region is topped up to ``floor(region_floor_share * budget /
+   n_regions)`` slots, each slot going to the region's arm with the highest posterior draw,
+   so a region with no accepts yet keeps being explored. ``max_region_share``: no region gets
+   more than ceil(max_region_share * budget) slots while another region is below it. What
+   works in one region is learned per arm, so it never decides another region's slots.
 """
 
 from __future__ import annotations
@@ -34,6 +40,11 @@ class ArmState:
     failures: int = 0
 
 
+def _region(arm) -> object:
+    """The region of an arm tuple (index 1), or the arm itself for other arm types."""
+    return arm[1] if isinstance(arm, tuple) and len(arm) > 1 else arm
+
+
 class Orchestrator:
     def __init__(self, arms: Iterable[Hashable], seed: int | None = None):
         self.arms: list = list(dict.fromkeys(arms))
@@ -46,7 +57,9 @@ class Orchestrator:
         return math.floor(floor_share * budget / (n_arms or len(self.arms)))
 
     def allocate(self, budget: int, floor_share: float = 0.2,
-                 max_share: float | None = None, only=None) -> dict:
+                 max_share: float | None = None, only=None, *,
+                 region_floor_share: float | None = None,
+                 max_region_share: float | None = None) -> dict:
         """Slots per arm. ``only`` limits the allocation to those arms (e.g. arms whose
         model is down get none); the others are listed with 0."""
         if budget < 0:
@@ -62,13 +75,36 @@ class Orchestrator:
         alphas = np.array([self.state[a].successes + 1 for a in arms], dtype=float)
         betas = np.array([self.state[a].failures + 1 for a in arms], dtype=float)
         cap = math.ceil(max_share * budget) if max_share is not None else None
-        for _ in range(remaining):
-            samples = self.rng.beta(alphas, betas)
+        regions = [_region(a) for a in arms]
+        region_cap = math.ceil(max_region_share * budget) if max_region_share is not None else None
+
+        def give(allowed: np.ndarray) -> None:
+            samples = np.where(allowed, self.rng.beta(alphas, betas), -1.0)
             if cap is not None:
                 full = np.array([slots[a] >= cap for a in arms])
-                if not full.all():
+                if not (full | ~allowed).all():
+                    samples = np.where(full, -1.0, samples)
+            if region_cap is not None:
+                used = Counter()
+                for a, r in zip(arms, regions):
+                    used[r] += slots[a]
+                full = np.array([used[r] >= region_cap for r in regions])
+                if not (full | ~allowed).all():
                     samples = np.where(full, -1.0, samples)
             slots[arms[int(np.argmax(samples))]] += 1
+
+        if region_floor_share:
+            names = list(dict.fromkeys(regions))
+            need = math.floor(region_floor_share * budget / len(names))
+            for name in names:
+                mask = np.array([r == name for r in regions])
+                while remaining > 0 and sum(slots[a] for a, r in zip(arms, regions)
+                                            if r == name) < need:
+                    give(mask)
+                    remaining -= 1
+        everyone = np.ones(len(arms), dtype=bool)
+        for _ in range(remaining):
+            give(everyone)
         return {a: slots[a] for a in self.arms}
 
     def add_arm(self, arm: Hashable) -> bool:

@@ -122,8 +122,9 @@ def test_operators_from_brain_account_list(spec):
         assert analyze(expr, spec).ok, expr
 
 
-@pytest.mark.parametrize("op", ["ts_max", "ts_min", "ts_skewness", "exp", "regression_neut",
-                                "vector_neut"])
+# not on our account at consultant level either (2026-11-10); ts_max, ts_min and
+# vector_neut were in this list at user level and came with the upgrade
+@pytest.mark.parametrize("op", ["ts_skewness", "exp", "regression_neut"])
 def test_operators_not_on_brain_account_are_rejected(spec, op):
     assert op not in spec.operators
 

@@ -1,11 +1,40 @@
-# Submission gates (from the application and BRAIN's pass criteria)
+# Submission gates (BRAIN's pass criteria). Limits from BRAIN's own checks on our
+# consultant account (live capture 2026-11-10, USA/TOP3000/delay 1): LOW_SHARPE 1.58 (1.25
+# at user level), LOW_FITNESS 1.0, turnover 1%..70%, SELF_CORRELATION 0.7. BRAIN's limits can
+# differ by region and delay; with use_brain_checks its own check decides per alpha.
 gates:
-  sharpe_min: 1.25
+  sharpe_min: 1.58
   fitness_min: 1.0
   turnover_min: 0.01        # 1%
   turnover_max: 0.70        # 70%
   self_correlation_max: 0.70
   use_brain_checks: true    # every PASS/FAIL check BRAIN reports is a hard gate (owner, 2026-11-04)
+  # Our sharpe/fitness/turnover/self-correlation gates use the limit BRAIN reports for that
+  # alpha's own check when it sends one (LOW_SHARPE, LOW_FITNESS, LOW/HIGH_TURNOVER,
+  # SELF_CORRELATION), so they follow BRAIN per region and delay; the numbers above are the
+  # fallback (and what the agents' prompts show). Follows "BRAIN's checks only" (2026-11-04).
+  limits_from_brain: true
+  # BRAIN checks that are about submitting, not about the alpha, so never gates: the daily
+  # submission quota (REGULAR_SUBMISSION, limit 4), theme/pyramid/competition matches,
+  # Osmosis allocation, and the Power Pool description and correlation (which apply to
+  # Power Pool submissions only; OQ-17, builder default, owner to confirm).
+  brain_checks_ignored:
+    - REGULAR_SUBMISSION
+    - MATCHES_THEMES
+    - MATCHES_PYRAMID
+    - MATCHES_COMPETITION
+    - OSMOSIS_ALLOCATION
+    - POWER_POOL_DESCRIPTION_LENGTH
+    - POWER_POOL_DESCRIPTION_FORMAT
+    - POWER_POOL_CORRELATION
+
+# Per-region gate overrides, keyed REGION or REGION/D<delay> (the second wins); only the
+# five gate limits above may be set. Empty: BRAIN's own limits (limits_from_brain) already
+# differ per region and delay. Use this only for a limit BRAIN does not report, or to be
+# stricter than BRAIN somewhere, e.g.
+#   regions:
+#     USA/D0: {sharpe_min: 2.0}
+regions: {}
 
 # Risk manager (policy choices, owner must set. null = not configured)
 risk:
@@ -35,9 +64,9 @@ auditor:
   trials_scope: dataset
 
 # Holdout (must be set before any simulation runs). Owner's choice (2026-11-03): follow
-# BRAIN's default. Our account simulates in-sample 2019-01-01..2023-12-31 and keeps the
-# time after that as its own hidden out-of-sample period, so the holdout starts the day
-# after BRAIN's in-sample ends. The end date is the day it was set; move it forward as
+# BRAIN's default. Our account simulates in-sample 2014-01-01..2023-12-31 at consultant
+# level (2019-01-01..2023-12-31 at user level) and keeps the time after that as its own
+# hidden out-of-sample period, so the holdout starts the day after BRAIN's in-sample ends. The end date is the day it was set; move it forward as
 # time passes. No testPeriod is sent (OQ-12). The simulator rejects any BRAIN result whose
 # simulated period overlaps this, in case BRAIN moves its default period.
 holdout:
@@ -50,8 +79,9 @@ holdout:
 # away it is rejected, so repairs are spent on near misses. null = no limit.
 repair:
   near_miss_share:
-    sharpe: 0.6     # Sharpe |value| >= 0.6 x sharpe_min (0.75 with sharpe_min 1.25)
+    sharpe: 0.6     # Sharpe |value| >= 0.6 x sharpe_min (0.95 with sharpe_min 1.58)
     fitness: 0.5    # fitness |value| >= 0.5 x fitness_min
+    recent_sharpe: 0.6   # LOW_2Y_SHARPE / IS_LADDER_SHARPE value >= 0.6 x BRAIN's limit (OQ-18)
 
 # Simulator
 simulator:

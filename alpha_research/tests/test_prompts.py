@@ -5,6 +5,7 @@ import json
 import pytest
 
 from alpha_research import prompts
+from alpha_research.config import load_config
 from alpha_research.critic import Critic, DebateJudge, review_and_debate
 from alpha_research.fastexpr import FastExprSpec
 from alpha_research.llm import ScriptedLLMClient
@@ -72,6 +73,8 @@ def test_repair_user_shows_pool_metrics_and_lever(candidate):
     assert prompts.LEVER_INSTRUCTIONS["orthogonalize_against_pool"] in text
     generic = prompts.repair_user(candidate(), Lever("new_lever", {"x": 1}), d, {}, None, SPEC.operators)
     assert prompts.GENERIC_LEVER in generic and '{"x": 1}' in generic and "<pool>" not in generic
+    assert "Neutralizations allowed in USA: NONE, REVERSION_AND_MOMENTUM," in text
+    assert "listed in the request" in prompts.repair_system("ctx")
 
 
 def test_strategy_user_fences_records():
@@ -100,7 +103,7 @@ def test_research_run_wires_prompts_and_context(memory, config, playbook):
     from test_research import RouterLLM, make_run
     llm = RouterLLM()
     report = make_run(memory, config, playbook, llm=llm).run(2)
-    assert report["prompt_versions"] == {"generator": "gen-v2", **prompts.PROMPT_VERSIONS}
+    assert report["prompt_versions"] == {"generator": "gen-v3", **prompts.PROMPT_VERSIONS}
     assert report["models"]["generator"] == ["claude-test"]
     agent_systems = [s for s in llm.all_systems if "Fast Expression language." not in s[:200]
                      and not s.startswith("You are a quantitative researcher")]
@@ -112,7 +115,8 @@ def test_cli_prompts_prints_rendered_prompts(capsys):
     from alpha_research import cli
     assert cli.main(["prompts", "--agent", "judge", "--config", str(ROOT / "config" / "thresholds.yaml")]) == 0
     out = capsys.readouterr().out
-    assert out.startswith("===== judge (judge-v3)") and "Sharpe at least 1.25" in out
+    sharpe_min = load_config(ROOT / "config" / "thresholds.yaml").gates.sharpe_min
+    assert out.startswith("===== judge (judge-v4)") and f"Sharpe at least {sharpe_min:g}" in out
     assert cli.main(["prompts", "--config", str(ROOT / "config" / "thresholds.yaml")]) == 0
     assert capsys.readouterr().out.count("=====") == 5
 

@@ -52,7 +52,8 @@ def test_hypothesis_end_to_end_writes_loadable_candidates_and_report(run, capsys
 
 
 def test_flags_override_the_settings_file(run):
-    code, out = run([alphas("rank(close)")], "--n", "1", "--region", "EUR", "--decay", "9",
+    code, out = run([alphas("rank(close)")], "--n", "1", "--region", "EUR", "--universe", "TOP2500",
+                    "--decay", "9",
                     "--dataset", "pv9")
     assert code == 0
     c = load_candidate_file(out)[0].candidate

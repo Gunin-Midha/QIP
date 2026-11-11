@@ -5,7 +5,7 @@
     python -m alpha_research.cli bandit --candidates tests/fixtures/candidates/hand_written.json
     python -m alpha_research.cli generate --hypothesis "..." --settings my_settings.yaml \
         --out generated/batch1.json
-    python -m alpha_research.cli brain auth | options | capture | operators | datafields
+    python -m alpha_research.cli brain auth | options | capture | operators | datafields | datasets
     python -m alpha_research.cli research --plan config/research_plan.example.yaml \
         --config <thresholds with holdout> --max-simulations 20 --max-llm-calls 60
     python -m alpha_research.cli compare --data-dir data
@@ -31,7 +31,7 @@ from pathlib import Path
 import yaml
 
 from .brain_api import (EMAIL_ENV_VAR, SECRET_ENV_VAR, BrainApiError, RealBrainClient,
-                        list_datafields, list_operators, load_brain_config, make_session,
+                        list_datafields, list_datasets, list_operators, load_brain_config, make_session,
                         simulation_options)
 from .brain_client import FixtureBrainClient, FixtureNotFoundError, SubmissionRejected
 from .compare import model_comparison
@@ -66,7 +66,7 @@ def _run(args) -> int:
     if args.client == "real":
         config.require_holdout()  # fail before logging in, not after the first submit
         brain_config = load_brain_config(args.brain_config)
-        client = RealBrainClient(make_session(brain_config), brain_config,
+        client = RealBrainClient(_brain_session(brain_config), brain_config,
                                  capture_dir=args.capture_dir)
         sleep, clock = time.sleep, time.monotonic
     else:
@@ -208,15 +208,26 @@ def _generate(args) -> int:
     return EXIT_OK if result.candidates else EXIT_EMPTY
 
 
+def _biometric_prompt(url: str) -> None:
+    print(f"BRAIN asks for biometric verification. Open this link in a browser, verify,\n"
+          f"then come back here and press Enter:\n  {url}", file=sys.stderr)
+    input()
+
+
+def _brain_session(config):
+    """A BRAIN session that prompts for biometric verification in a terminal."""
+    return make_session(config, on_biometric=_biometric_prompt if sys.stdin.isatty() else None)
+
+
 def _brain_auth(args) -> int:
-    make_session(load_brain_config(args.brain_config)).authenticate()
+    _brain_session(load_brain_config(args.brain_config)).authenticate()
     print("BRAIN login ok")
     return EXIT_OK
 
 
 def _brain_options(args) -> int:
     """Allowed simulation settings for the account (regions, universes, neutralizations...)."""
-    options = simulation_options(make_session(load_brain_config(args.brain_config)))
+    options = simulation_options(_brain_session(load_brain_config(args.brain_config)))
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(options, indent=2) + "\n")
@@ -240,7 +251,7 @@ def _brain_capture(args) -> int:
     brain_config = load_brain_config(args.brain_config)
     entries = load_candidate_file(args.candidates)[: args.limit]
     out_dir = Path(args.out_dir)
-    client = RealBrainClient(make_session(brain_config), brain_config, capture_dir=out_dir)
+    client = RealBrainClient(_brain_session(brain_config), brain_config, capture_dir=out_dir)
     for e in entries:
         c = e.candidate
         try:
@@ -267,7 +278,7 @@ def _brain_capture(args) -> int:
 
 
 def _brain_operators(args) -> int:
-    session = make_session(load_brain_config(args.brain_config))
+    session = _brain_session(load_brain_config(args.brain_config))
     operators = list_operators(session)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -287,16 +298,44 @@ def _brain_operators(args) -> int:
 
 def _brain_datafields(args) -> int:
     brain_config = load_brain_config(args.brain_config)
-    session = make_session(brain_config)
+    session = _brain_session(brain_config)
+    print(f"Downloading datafields for {args.region}/{args.universe}/delay {args.delay} "
+          "(a large catalog can take 10-30 minutes)...", file=sys.stderr)
     fields = list_datafields(
         session, region=args.region, universe=args.universe, delay=args.delay,
-        instrument_type=brain_config.settings.get("instrumentType", "EQUITY"), dataset=args.dataset)
+        instrument_type=brain_config.settings.get("instrumentType", "EQUITY"), dataset=args.dataset,
+        progress=lambda msg: print("  " + msg, file=sys.stderr, flush=True))
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(fields, indent=2) + "\n")
     print(f"{len(fields)} datafields for {args.region}/{args.universe}/delay {args.delay}"
           f"{' dataset ' + args.dataset if args.dataset else ''}; wrote {out} "
           "(use it with generate --datafields)")
+    return EXIT_OK
+
+
+def _brain_datasets(args) -> int:
+    """Every dataset for these settings, with its field count, so a discovery run can see
+    which catalogs are too large for one datafield query."""
+    brain_config = load_brain_config(args.brain_config)
+    datasets = list_datasets(_brain_session(brain_config), region=args.region,
+                             universe=args.universe, delay=args.delay,
+                             instrument_type=brain_config.settings.get("instrumentType", "EQUITY"))
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(datasets, indent=2) + "\n")
+
+    def show(v, fmt="{}"):
+        return "?" if v is None else fmt.format(v)
+
+    for d in sorted(datasets, key=lambda d: d["id"]):
+        print(f"{d['id']} | {show((d.get('category') or {}).get('id'))} | "
+              f"{show(d.get('fieldCount'))} fields | coverage {show(d.get('coverage'), '{:.0%}')} | "
+              f"{show(d.get('alphaCount'))} alphas | pyramid {show(d.get('pyramidMultiplier'))}")
+    fields = [d.get("fieldCount") for d in datasets]
+    total = sum(f for f in fields if isinstance(f, int))
+    print(f"{len(datasets)} datasets for {args.region}/{args.universe}/delay {args.delay}, "
+          f"{total:,} fields{' (some counts missing)' if None in fields else ''}; wrote {out}")
     return EXIT_OK
 
 
@@ -324,7 +363,7 @@ def _research(args) -> int:
         agents.check_models()
     llm_factory = _llm_factory(args, agents.used_models())  # before logging in to BRAIN
     brain_config = load_brain_config(args.brain_config)
-    client = RealBrainClient(make_session(brain_config), brain_config, capture_dir=args.capture_dir)
+    client = RealBrainClient(_brain_session(brain_config), brain_config, capture_dir=args.capture_dir)
     memory = MemoryStore(args.data_dir)
     try:
         run = ResearchRun(plans, agents, budget, llm_factory=llm_factory, client=client,
@@ -406,7 +445,8 @@ def _levers(args) -> int:
         events = repair_events(memory.candidate_outcomes(), agents.repair)
     finally:
         memory.close()
-    table = {"lever_stats": LeverStats.from_events(events, agents.repair.prior).table(),
+    stats = LeverStats.from_events(events, agents.repair.prior, agents.repair.region_prior_strength)
+    table = {"lever_stats": stats.table(), "lever_stats_by_region": stats.region_table(),
              "events": [dataclasses.asdict(e) for e in events]}
     text = json.dumps(table, indent=2, default=str)
     if args.out:
@@ -442,7 +482,7 @@ def _models(args) -> int:
 def _prompts(args) -> int:
     """Print an agent's system prompt as the model will see it, thresholds included."""
     config = load_config(args.config)
-    context = agent_prompts.brain_context(config)
+    context = agent_prompts.brain_context(config, args.regions)
     builders = {"prefilter": agent_prompts.prefilter_system, "critic": agent_prompts.critic_system,
                 "judge": agent_prompts.judge_system, "repair": agent_prompts.repair_system,
                 "strategy": agent_prompts.strategy_system}
@@ -567,6 +607,8 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--agent", choices=["all", "prefilter", "critic", "judge", "repair", "strategy"],
                     default="all")
     pr.add_argument("--config", default="config/thresholds.yaml")
+    pr.add_argument("--regions", nargs="*", default=["USA"],
+                    help="regions whose settings and limits the context lists")
     pr.set_defaults(func=_prompts)
 
     brain = sub.add_parser("brain", help=f"BRAIN account tools (needs {EMAIL_ENV_VAR} and {SECRET_ENV_VAR})")
@@ -594,7 +636,13 @@ def build_parser() -> argparse.ArgumentParser:
     b_df.add_argument("--dataset", help="limit to one dataset id")
     b_df.add_argument("--out", required=True)
     b_df.set_defaults(func=_brain_datafields)
-    for sp in (b_auth, b_opt, b_cap, b_ops, b_df):
+    b_ds = bsub.add_parser("datasets", help="list the datasets (with field counts) for a region/universe/delay")
+    b_ds.add_argument("--region", required=True)
+    b_ds.add_argument("--universe", required=True)
+    b_ds.add_argument("--delay", type=int, required=True)
+    b_ds.add_argument("--out", required=True)
+    b_ds.set_defaults(func=_brain_datasets)
+    for sp in (b_auth, b_opt, b_cap, b_ops, b_df, b_ds):
         sp.add_argument("--brain-config", default="config/brain.yaml")
     return p
 

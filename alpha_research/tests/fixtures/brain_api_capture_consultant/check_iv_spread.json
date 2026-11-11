@@ -1,0 +1,114 @@
+{
+  "is": {
+    "checks": [
+      {
+        "name": "LOW_SHARPE",
+        "result": "FAIL",
+        "limit": 1.58,
+        "value": 1.03
+      },
+      {
+        "name": "LOW_FITNESS",
+        "result": "FAIL",
+        "limit": 1.0,
+        "value": 0.62
+      },
+      {
+        "name": "LOW_TURNOVER",
+        "result": "PASS",
+        "limit": 0.01,
+        "value": 0.0846
+      },
+      {
+        "name": "HIGH_TURNOVER",
+        "result": "PASS",
+        "limit": 0.7,
+        "value": 0.0846
+      },
+      {
+        "name": "CONCENTRATED_WEIGHT",
+        "result": "PASS"
+      },
+      {
+        "name": "LOW_SUB_UNIVERSE_SHARPE",
+        "result": "PASS",
+        "limit": 0.45,
+        "value": 0.45
+      },
+      {
+        "name": "IS_LADDER_SHARPE",
+        "result": "FAIL",
+        "year": 2,
+        "startDate": "2024-01-02",
+        "endDate": "2022-01-03",
+        "limit": 1.58,
+        "value": 0.73
+      },
+      {
+        "name": "CLUSTER_TEST",
+        "result": "WARNING",
+        "limit": 1.58,
+        "value": 0.83
+      },
+      {
+        "name": "UNITS",
+        "result": "WARNING",
+        "message": "Incompatible unit for input of \"add\" at index 1, expected \"Unit[TSPrice:1]\", found \"Unit[]\""
+      },
+      {
+        "name": "SELF_CORRELATION",
+        "result": "PENDING"
+      },
+      {
+        "name": "DATA_DIVERSITY",
+        "result": "PASS"
+      },
+      {
+        "name": "PROD_CORRELATION",
+        "result": "PENDING"
+      },
+      {
+        "name": "REGULAR_SUBMISSION",
+        "result": "PASS",
+        "limit": 4,
+        "value": 0
+      },
+      {
+        "result": "PASS",
+        "name": "MATCHES_PYRAMID",
+        "effective": 2,
+        "multiplier": 1.1,
+        "pyramids": [
+          {
+            "name": "USA/D1/PV",
+            "multiplier": 1.1
+          },
+          {
+            "name": "USA/D1/OPTION",
+            "multiplier": 1.3
+          }
+        ]
+      },
+      {
+        "result": "WARNING",
+        "name": "MATCHES_THEMES",
+        "themes": [
+          {
+            "id": "9B3qVP4",
+            "multiplier": 1.0,
+            "name": "GLB/D1 Power Pool Nov`26"
+          },
+          {
+            "id": "ZDXgR5B",
+            "multiplier": 2.0,
+            "name": "GLB/D1 TOPDIV3000 Theme"
+          }
+        ]
+      },
+      {
+        "name": "OSMOSIS_ALLOCATION",
+        "result": "WARNING"
+      }
+    ]
+  }
+}

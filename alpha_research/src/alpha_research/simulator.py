@@ -155,6 +155,16 @@ def _to_float(value, key: str) -> float | None:
     return float(value)
 
 
+def _number_maps(raw, key: str) -> dict[str, dict]:
+    """{name: {field: number}} from the raw response (BRAIN units, never converted)."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or not all(isinstance(v, dict) for v in raw.values()):
+        raise SchemaError(f"raw {key!r} must be an object of name to object")
+    return {str(k): {str(f): _to_float(x, f"{key}.{k}.{f}") for f, x in v.items()}
+            for k, v in raw.items()}
+
+
 def _pct(value: float | None) -> float | None:
     return None if value is None else value / 100.0
 
@@ -207,6 +217,8 @@ def normalize(raw: dict, candidate_id: str, brain_sim_id: str | None) -> ResultR
         daily_pnl=series_from_dict(raw.get("daily_pnl")),
         checks={str(k): bool(v) for k, v in checks.items()},
         notes=[str(n) for n in raw.get("notes") or []],
+        check_values=_number_maps(raw.get("check_values"), "check_values"),
+        alt_stats=_number_maps(raw.get("alt_stats"), "alt_stats"),
         **values,
     )
     result.validate()

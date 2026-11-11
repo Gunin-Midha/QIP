@@ -348,6 +348,16 @@ def test_system_prompt_lists_rules_operators_and_relevant_fields(spec, cfg):
     assert "zzz_other" not in prompt and "2 of 5 shown" in prompt
     nocat = build_system_prompt(spec, None, "", cfg)
     assert "No datafield catalog was supplied" in nocat
+    assert "Neutralizations allowed" not in nocat
+
+
+def test_system_prompt_lists_the_regions_neutralizations(spec, settings, cfg):
+    llm = ScriptedLLMClient([alphas(E1)])
+    make(llm, spec, settings, cfg).generate(Source("hypothesis", HYP), 1, batch_id="b1")
+    line = next(l for l in llm.calls[0]["system"].splitlines() if l.startswith("Neutralizations allowed"))
+    assert "CROWDING" in line and "SUBINDUSTRY" in line and "COUNTRY" not in line   # USA has no COUNTRY
+    assert "factor neutralizations" in line
+    assert "one of the neutralizations allowed above" in llm.calls[0]["user"]
 
 
 def test_exploration_fields_span_other_datasets_and_carry_hints(spec, cfg):

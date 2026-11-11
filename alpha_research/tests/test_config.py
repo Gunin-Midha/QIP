@@ -6,7 +6,7 @@ from conftest import MAIN_CONFIG, TEST_CONFIG
 
 def test_main_config_loads_with_nulls():
     cfg = load_config(MAIN_CONFIG)
-    assert cfg.gates.sharpe_min == 1.25
+    assert cfg.gates.sharpe_min == 1.58  # consultant LOW_SHARPE limit (2026-11-10)
     assert cfg.gates.turnover_max == 0.70
     assert cfg.risk.max_drawdown is None
     assert cfg.diversity.min_marginal_pool_sharpe_gain is None

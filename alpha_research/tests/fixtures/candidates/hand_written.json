@@ -85,7 +85,7 @@
   },
   {
     "region": "EUR",
-    "universe": "TOP3000",
+    "universe": "TOP2500",
     "delay": 1,
     "decay": 4,
     "neutralization": "SUBINDUSTRY",
@@ -190,7 +190,7 @@
   },
   {
     "region": "EUR",
-    "universe": "TOP3000",
+    "universe": "TOP2500",
     "delay": 1,
     "decay": 4,
     "neutralization": "SUBINDUSTRY",
@@ -421,7 +421,7 @@
   },
   {
     "region": "EUR",
-    "universe": "TOP3000",
+    "universe": "TOP2500",
     "delay": 1,
     "decay": 4,
     "neutralization": "SUBINDUSTRY",

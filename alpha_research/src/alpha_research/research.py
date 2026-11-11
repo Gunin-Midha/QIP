@@ -86,7 +86,7 @@ from .repair import Playbook
 from .lever_stats import LeverStats, RepairLearningConfig, distance, repair_events
 from .repair_agent import RepairAgent
 from .schemas import CandidateRecord
-from .strategy import StrategyConfig, StrategyEvolution
+from .strategy import StrategyConfig, StrategyEvolution, region_notes
 
 DECIDED = ("accept", "reject", "repair")
 
@@ -214,6 +214,8 @@ class AgentsConfig:
     models: ModelsConfig
     max_arm_share: float | None = None
     refill_passes: int = 0   # extra allocation passes per round for slots emptied by drops
+    region_floor_share: float | None = None   # each region's minimum share of a round
+    max_region_share: float | None = None     # no region above this share while others are below
     repair: RepairLearningConfig = field(default_factory=RepairLearningConfig)
 
     def used_models(self) -> list[str]:
@@ -326,6 +328,8 @@ def agents_config_from_dict(raw) -> AgentsConfig:
         models=models_config_from_dict(raw.get("models")),
         repair=RepairLearningConfig.from_dict(secs["repair"]),
         max_arm_share=_opt_num(secs["director"], "director", "max_arm_share", 0, 1),
+        region_floor_share=_opt_num(secs["director"], "director", "region_floor_share", 0, 1),
+        max_region_share=_opt_num(secs["director"], "director", "max_region_share", 0, 1),
         refill_passes=(_pos_int(secs["director"], "director", "refill_passes", lo=0)
                        if "refill_passes" in secs["director"] else 0),
     )
@@ -339,6 +343,10 @@ def load_agents_config(path: str | Path) -> AgentsConfig:
     agents = agents_config_from_dict(raw)
     agents.check_models()
     return agents
+
+
+def _lever_tables(stats: LeverStats) -> dict:
+    return {"lever_stats": stats.table(), "lever_stats_by_region": stats.region_table()}
 
 
 @dataclass
@@ -427,7 +435,8 @@ class ResearchRun:
         self.pipeline = Pipeline(config, playbook, client, memory, sleep=sleep, clock=clock,
                                  out=out)
         limits, mo = generator_config.limits, agents.max_output
-        ctx = brain_context(config)  # thresholds from config, shown to every agent's model
+        # thresholds from config and the plan's regions, shown to every agent's model
+        ctx = brain_context(config, sorted({p.settings.region for p in plans}))
         m = self.models
         pf_llm = self.fallback(m.prefilter) if agents.prefilter.use_model else None
         self.prefilter = PreFilter(agents.prefilter, spec, memory, llm=pf_llm,
@@ -513,13 +522,16 @@ class ResearchRun:
             print(text, file=self.out)
 
     def _generator(self, key: tuple) -> AlphaGenerator:
+        plan = self.arms[key]
         if key not in self.generators:
-            plan = self.arms[key]
             cfg = dataclasses.replace(self.generator_config, prompt_version=key[2])
             self.generators[key] = AlphaGenerator(self.llm(key[3]), self.spec, plan.settings,
                                                   cfg, datafields=self.datafields,
-                                                  guidance=plan.guidance,
                                                   field_meta=self.field_meta)
+        # the region's own evidence from memory, refreshed every time, then the arm's guidance
+        notes = region_notes(self.memory.candidate_outcomes(), plan.settings.region)
+        parts = [p for p in (notes, plan.guidance) if p]
+        self.generators[key].guidance = "\n".join(parts) or None
         return self.generators[key]
 
     # ------------------------------------------------------------------ run
@@ -620,8 +632,7 @@ class ResearchRun:
             self.stop_reason = "every generator model is down: " + "; ".join(
                 f"{m}: {why}" for m, why in self.counter.down.items())
             return
-        alloc = (self.director.allocate(slots, self.agents.floor_share, self.agents.max_arm_share,
-                                        only=live) if slots > 0 else {})
+        alloc = self._allocate(slots, live) if slots > 0 else {}
         entry["allocation"] = {"/".join(map(str, k)): n for k, n in alloc.items()}
         self._emit(f"--- round {r}: {slots} slots after {sum(len(c) for c in first.values())} "
                    f"queued repair(s), allocation {entry['allocation']}")
@@ -636,12 +647,17 @@ class ResearchRun:
             live = self._live_arms()
             if spare <= 0 or not live:
                 return
-            alloc = self.director.allocate(spare, self.agents.floor_share,
-                                           self.agents.max_arm_share, only=live)
+            alloc = self._allocate(spare, live)
             entry.setdefault("refills", []).append(
                 {"/".join(map(str, k)): n for k, n in alloc.items() if n})
             self._emit(f"--- round {r}: refill {spare} unused slot(s): {entry['refills'][-1]}")
             lost, emptied = self._run_allocation(r, alloc, entry, f"f{len(entry['refills'])}")
+
+    def _allocate(self, slots: int, live: list[tuple]) -> dict:
+        a = self.agents
+        return self.director.allocate(slots, a.floor_share, a.max_arm_share, only=live,
+                                      region_floor_share=a.region_floor_share,
+                                      max_region_share=a.max_region_share)
 
     def _live_arms(self) -> list[tuple]:
         return [k for k in self.arms if k[3] not in self.counter.down]
@@ -778,8 +794,8 @@ class ResearchRun:
             for ds, text in evo.hypotheses:
                 if ds is None or ds == key[0] or (ds not in arm_datasets and ds not in new_ds):
                     sources.appendleft(Source("hypothesis", text))
-            self._add_arm(new_key, ArmPlan(plan.dataset, plan.settings, sources, evo.guidance),
-                          added)
+            self._add_arm(new_key, ArmPlan(plan.dataset, plan.settings, sources,
+                                           evo.guidance_for(plan.settings.region)), added)
         templates = {k[3]: p for k, p in base}   # one plan per generator model for the settings
         for ds, texts in new_ds.items():
             for model, plan in templates.items():
@@ -787,9 +803,10 @@ class ResearchRun:
                 settings = dataclasses.replace(plan.settings, dataset=ds)
                 sources = deque(Source("hypothesis", t) for t in texts)
                 self._add_arm((ds, region, evo.prompt_version, model),
-                              ArmPlan(ds, settings, sources, evo.guidance), added)
+                              ArmPlan(ds, settings, sources, evo.guidance_for(region)), added)
         self.log[-1]["evolution"] = {"prompt_version": evo.prompt_version, "source": evo.source,
                                      "guidance": evo.guidance, "hypotheses": evo.hypotheses,
+                                     "region_guidance": evo.region_guidance,
                                      "new_arms": added, "notes": evo.notes}
         self._emit(f"--- strategy evolution: {evo.prompt_version} ({evo.source}), new arms {added}")
 
@@ -828,9 +845,9 @@ class ResearchRun:
             "pool_size": self.pipeline.pool.count(),
             "arms": arms,
             "resumed_repairs": self.resumed,
-            "lever_stats": LeverStats.from_events(
+            **_lever_tables(LeverStats.from_events(
                 repair_events(self.memory.candidate_outcomes(), self.agents.repair),
-                self.agents.repair.prior).table(),
+                self.agents.repair.prior, self.agents.repair.region_prior_strength)),
             "comparison": model_comparison(self.memory.candidate_outcomes(),
                                            self.memory.critic_reviews()),
             "rounds": self.log,

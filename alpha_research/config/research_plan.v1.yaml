@@ -24,7 +24,7 @@ arms:
       decay: 4
       neutralization: SUBINDUSTRY
       truncation: 0.08
-      start_date: "2019-01-01"
+      start_date: "2014-01-01"
       end_date: "2023-12-31"
     hypotheses:
       - "Implied volatility spread (Cremers and Weinbaum 2010): stocks whose at-the-money call implied volatility is high relative to put implied volatility (implied_volatility_call_60 minus implied_volatility_put_60) outperform over the next 1-4 weeks, because informed traders buy calls before good news and puts before bad news. Rank the spread within subindustry."
@@ -39,7 +39,7 @@ arms:
       decay: 3
       neutralization: SUBINDUSTRY
       truncation: 0.08
-      start_date: "2019-01-01"
+      start_date: "2014-01-01"
       end_date: "2023-12-31"
     hypotheses:
       - "Earnings estimate revisions (Chan, Jegadeesh and Lakonishok 1996): stocks whose consensus EPS estimate (est_eps) has risen over the last 20-60 trading days, scaled by the absolute estimate or by price (close), keep outperforming for weeks because analysts and investors adjust slowly. Rank within subindustry."
@@ -54,7 +54,7 @@ arms:
       decay: 5
       neutralization: INDUSTRY
       truncation: 0.08
-      start_date: "2019-01-01"
+      start_date: "2014-01-01"
       end_date: "2023-12-31"
     hypotheses:
       - "Idiosyncratic volatility puzzle (Ang, Hodrick, Xing and Zhang 2006): stocks with low idiosyncratic risk (unsystematic_risk_last_90_days) relative to industry peers earn higher risk-adjusted returns over the following months. Use a slow-moving, ranked signal."

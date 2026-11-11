@@ -1,11 +1,13 @@
+import json
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from alpha_research.schemas import (
-    CandidateRecord, DecisionRecord, GateResult, ResultRecord, SchemaError, YearRow,
-    experiment_hash, normalize_expression,
+    REGION_SETTINGS, CandidateRecord, DecisionRecord, GateResult, ResultRecord, SchemaError,
+    YearRow, experiment_hash, normalize_expression,
 )
 
 
@@ -45,6 +47,38 @@ def test_candidate_domain_rules(candidate, field, value):
 @pytest.mark.parametrize("universe", ["TOP2000", "TOPSP500"])
 def test_universes_from_brain_options_are_valid(candidate, universe):
     candidate(universe=universe).validate()
+
+
+def test_region_settings_match_brain_options():
+    # the consultant account's OPTIONS /simulations response (cli brain options, 2026-11-10)
+    opts = json.loads((Path(__file__).parent / "fixtures" / "brain_api_capture_consultant"
+                       / "simulation_options.json").read_text())["common"]
+    eq = lambda key: opts[key]["choices"]["instrumentType"]["EQUITY"]
+    regions = [c["value"] for c in eq("region")]
+    assert set(regions) == set(REGION_SETTINGS)
+    for r in regions:
+        s = REGION_SETTINGS[r]
+        assert [c["value"] for c in eq("universe")["region"][r]] == list(s["universes"])
+        assert sorted(c["value"] for c in eq("delay")["region"][r]) == list(s["delays"])
+        assert {c["value"] for c in eq("neutralization")["region"][r]} == set(s["neutralizations"])
+
+
+@pytest.mark.parametrize("region,universe,delay,neutralization,ok", [
+    ("EUR", "TOP2500", 0, "COUNTRY", True),
+    ("GLB", "TOPDIV3000", 1, "STATISTICAL", True),
+    ("USA", "TOP3000", 1, "SLOW_AND_FAST", True),
+    ("USA", "TOP3000", 1, "COUNTRY", False),      # COUNTRY only in multi-country regions
+    ("GLB", "TOP3000", 0, "MARKET", False),       # GLB has delay 1 only
+    ("EUR", "TOP3000", 1, "MARKET", False),       # TOP3000 is not an EUR universe
+    ("AMR", "TOP600", 1, "CROWDING", False),      # AMR has no factor neutralizations
+])
+def test_settings_are_checked_per_region(candidate, region, universe, delay, neutralization, ok):
+    c = candidate(region=region, universe=universe, delay=delay, neutralization=neutralization)
+    if ok:
+        c.validate()
+    else:
+        with pytest.raises(SchemaError):
+            c.validate()
 
 
 def test_candidate_roundtrip(candidate):

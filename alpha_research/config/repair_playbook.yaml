@@ -1,8 +1,18 @@
 # Levers per failure class (one per repair). repair_agent.py applies them. Mechanical
 # rewrites (no model): increase_decay, tighten_truncation, lengthen_ts_window,
 # wrap_in_smoothing, hump, rank_transform, volatility_scale, flip_sign, set_neutralization,
-# backfill_fields, liquidity_tilt, winsorize, change_universe. Any other lever is handed to
-# the model and its answer must pass the Fast Expression validator.
+# backfill_fields, liquidity_tilt, winsorize, change_universe, and one lever per
+# neutralization off the group scale: neutralize_statistical, neutralize_crowding,
+# neutralize_reversion_and_momentum, neutralize_fast, neutralize_slow,
+# neutralize_slow_and_fast, neutralize_country (each applies only where the alpha's region
+# allows it). Any other lever is handed to the model and its answer must pass the Fast
+# Expression validator.
+#
+# Consultant level (2026-11-11, builder's priors, OQ-18): the factor neutralizations are
+# listed after the group levers they compete with, so the learner tries them and keeps them
+# where they work. Lever statistics are kept per region too (lever_stats.py), so the order
+# can differ between USA, EUR, ... as evidence comes in. The repair model also sees BRAIN's
+# risk-neutralized Sharpe, which says whether removing BRAIN's risk factors would help.
 #
 # The order below is the starting prior only (builder's choice 2026-11-04, from the first
 # three research runs). lever_stats.py reorders the levers from what each one did in past
@@ -18,6 +28,10 @@ sharpe:
     step: {}
   - lever: set_neutralization       # e.g. NONE -> SUBINDUSTRY: removes market/sector bets
     step: {to: SUBINDUSTRY}
+  - lever: neutralize_statistical   # removes the common statistical factors
+    step: {}
+  - lever: neutralize_country       # GLB/EUR/ASI/AMR: removes country bets
+    step: {}
   - lever: backfill_fields          # sparse fundamentals/options: more names carry a value
     step: {lookback: 63}
   - lever: rank_transform
@@ -35,6 +49,8 @@ fitness:                            # fitness = Sharpe * sqrt(|returns| / max(tu
     step: {operator: ts_decay_linear, window: 10}
   - lever: set_neutralization
     step: {to: SUBINDUSTRY}
+  - lever: neutralize_slow          # slow factors: removes slow-moving exposures, keeps turnover
+    step: {}
   - lever: hump
     step: {threshold: 0.01}
   - lever: model_repair
@@ -66,6 +82,10 @@ self_correlation:
     step: {}
   - lever: set_neutralization
     step: {to: SUBINDUSTRY}
+  - lever: neutralize_statistical   # strip what our alphas have in common with the market's factors
+    step: {}
+  - lever: neutralize_crowding
+    step: {}
   - lever: lengthen_ts_window       # a different horizon of the same idea
     step: {factor: 3}
   - lever: model_repair
@@ -88,7 +108,38 @@ drawdown:
     step: {window: 20}
   - lever: set_neutralization
     step: {to: SUBINDUSTRY}
+  - lever: neutralize_reversion_and_momentum   # momentum crashes and reversal swings
+    step: {}
+  - lever: neutralize_country
+    step: {}
   - lever: rank_transform
     step: {}
+  - lever: model_repair
+    step: {}
+recent_sharpe:                      # BRAIN's LOW_2Y_SHARPE / IS_LADDER_SHARPE: the signal
+                                    # weakened in the last in-sample years
+  - lever: neutralize_crowding      # a once-good signal decays when it gets crowded
+    step: {}
+  - lever: neutralize_reversion_and_momentum
+    step: {}
+  - lever: neutralize_statistical
+    step: {}
+  - lever: set_neutralization
+    step: {to: SUBINDUSTRY}
+  - lever: restore_recent_performance
+    step: {}
+  - lever: model_repair
+    step: {}
+prod_correlation:                   # BRAIN's PROD_CORRELATION: too close to production alphas
+  - lever: neutralize_statistical   # (which we cannot see, so no pool to orthogonalize against)
+    step: {}
+  - lever: neutralize_crowding
+    step: {}
+  - lever: neutralize_reversion_and_momentum
+    step: {}
+  - lever: differentiate_from_production
+    step: {}
+  - lever: lengthen_ts_window       # a different horizon of the same idea
+    step: {factor: 3}
   - lever: model_repair
     step: {}

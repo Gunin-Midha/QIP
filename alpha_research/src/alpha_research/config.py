@@ -7,6 +7,8 @@ Missing keys are an error; ``null`` values are not.
 
 from __future__ import annotations
 
+import dataclasses
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -30,6 +32,17 @@ class GatesConfig:
     turnover_max: float | None
     self_correlation_max: float | None
     use_brain_checks: bool = False   # BRAIN's PASS/FAIL checks as hard gates (evaluator.py)
+    brain_checks_ignored: tuple[str, ...] = ()   # BRAIN checks that are never gates
+    # our own gates use the limit BRAIN reports for that alpha's check when it has one
+    # (LOW_SHARPE -> sharpe_min, ...): BRAIN's limits differ by region and delay
+    limits_from_brain: bool = False
+
+
+# gate keys a region override may set, with their allowed range
+REGION_GATE_KEYS = {"sharpe_min": (None, None), "fitness_min": (None, None),
+                    "turnover_min": (0.0, 1.0), "turnover_max": (0.0, 1.0),
+                    "self_correlation_max": (-1.0, 1.0)}
+_REGION_KEY = re.compile(r"^[A-Z]{3}(/D\d)?$")
 
 
 @dataclass(frozen=True)
@@ -83,7 +96,7 @@ class SimulatorConfig:
 
 
 # failure classes whose repair can be limited to near misses, and the gate each one reads
-NEAR_MISS_CLASSES = ("sharpe", "fitness")
+NEAR_MISS_CLASSES = ("sharpe", "fitness", "recent_sharpe")
 
 
 @dataclass(frozen=True)
@@ -104,6 +117,15 @@ class Config:
     simulator: SimulatorConfig
     source: str = field(default="<dict>", compare=False)
     repair: RepairPolicy = field(default_factory=RepairPolicy)
+    # "USA" or "USA/D0" -> gate overrides ({key: value}); the region/delay key wins
+    regions: dict = field(default_factory=dict, compare=False)
+
+    def for_settings(self, region: str, delay: int | None = None) -> "Config":
+        """This config with the gate overrides for ``region`` (then ``region/D<delay>``)."""
+        over = {**self.regions.get(region, {}), **self.regions.get(f"{region}/D{delay}", {})}
+        if not over:
+            return self
+        return dataclasses.replace(self, gates=dataclasses.replace(self.gates, **over))
 
     def require_holdout(self) -> HoldoutConfig:
         if not self.holdout.configured:
@@ -169,6 +191,14 @@ def _opt_bool(sec: dict, section: str, key: str) -> bool:
     return v
 
 
+def _opt_names(sec: dict, section: str, key: str) -> tuple[str, ...]:
+    """Optional list of names; missing means none."""
+    v = sec.get(key) or []
+    if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
+        raise ConfigError(f"{section}.{key} must be a list of names")
+    return tuple(v)
+
+
 def _date(sec: dict, section: str, key: str) -> date | None:
     v = _key(sec, section, key)
     if v is None:
@@ -195,6 +225,8 @@ def config_from_dict(raw: Any, source: str = "<dict>") -> Config:
         turnover_max=_num(g, "gates", "turnover_max", lo=0.0, hi=1.0),
         self_correlation_max=_num(g, "gates", "self_correlation_max", lo=-1.0, hi=1.0),
         use_brain_checks=_opt_bool(g, "gates", "use_brain_checks"),
+        brain_checks_ignored=_opt_names(g, "gates", "brain_checks_ignored"),
+        limits_from_brain=_opt_bool(g, "gates", "limits_from_brain"),
     )
     if (gates.turnover_min is not None and gates.turnover_max is not None
             and gates.turnover_min > gates.turnover_max):
@@ -276,8 +308,22 @@ def config_from_dict(raw: Any, source: str = "<dict>") -> Config:
         if v is not None:
             near_miss[cls] = v
 
+    # optional section: per-region (or region/delay) gate overrides
+    rg = raw.get("regions") or {}
+    if not isinstance(rg, dict):
+        raise ConfigError("section 'regions' must be a mapping of REGION or REGION/D<delay>")
+    regions = {}
+    for key, over in rg.items():
+        if not isinstance(key, str) or not _REGION_KEY.match(key):
+            raise ConfigError(f"regions: key {key!r} must look like USA or USA/D0")
+        over = over or {}
+        if not isinstance(over, dict) or set(over) - set(REGION_GATE_KEYS):
+            raise ConfigError(f"regions.{key} may set only {sorted(REGION_GATE_KEYS)}")
+        regions[key] = {k: _num(over, f"regions.{key}", k, lo=lo, hi=hi)
+                        for k, (lo, hi) in REGION_GATE_KEYS.items() if k in over}
+
     return Config(gates, risk, diversity, auditor, holdout, simulator, source=source,
-                  repair=RepairPolicy(near_miss))
+                  repair=RepairPolicy(near_miss), regions=regions)
 
 
 def load_config(path: str | Path) -> Config:

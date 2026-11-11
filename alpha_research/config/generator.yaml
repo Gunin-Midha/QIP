@@ -1,7 +1,7 @@
 # Alpha Generator settings (Phase 3). Technical limits have values. Policy limits are
 # null (= not configured, the check is skipped) until the owner decides (OQ-11).
 generator:
-  prompt_version: gen-v2       # written to CandidateRecord.prompt_version; bump when prompts change
+  prompt_version: gen-v3       # written to CandidateRecord.prompt_version; bump when prompts change
   max_repair_rounds: 1         # times rejected expressions are sent back to the model for a fix
   max_paper_chars: 120000      # longer papers are cut to this many characters (null = no cut)
   max_hypotheses_per_paper: 5  # hypotheses extracted from one paper

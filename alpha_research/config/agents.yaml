@@ -32,6 +32,9 @@ repair:
   max_depth: 2                     # repair generations below the original candidate
   max_trials_per_root: 4           # repair simulations per original candidate
   patience: 2                      # stop a lineage after this many children that do not get closer
+  # Per region (2026-11-11, OQ-18): lever estimates are also kept per region, starting from
+  # the all-region estimate worth this many repairs, so each region learns its own order.
+  region_prior_strength: 2
   unmeasured_failure_penalty: 0.5  # distance to accept added by a failure with no value
 
 strategy:
@@ -43,6 +46,11 @@ director:
   floor_share: 0.2                 # spec 13.1 default: share of each round reserved as floor slots
   max_arm_share: 0.4               # no arm gets more than this share of a round while others are below it
   refill_passes: 1                 # slots emptied by Pre-Filter/Critic drops go back to the Director this many extra times per round (slots of a model that went down always do)
+  # Regions (consultant level, builder defaults 2026-11-11, OQ-18): each region in the plan
+  # gets at least floor(region_floor_share x slots / n_regions) slots per round, and none
+  # gets more than max_region_share of a round while another region is below it.
+  region_floor_share: 0.5
+  max_region_share: 0.6
 
 max_output: 4096                   # output cap for one model call
 

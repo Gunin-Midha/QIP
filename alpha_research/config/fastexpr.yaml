@@ -1,7 +1,8 @@
 # Fast Expression language spec used by fastexpr.py to validate generated alphas.
 #
-# Checked against our account's operator list (`cli brain operators`, 66 operators,
-# 2026-11-03; OQ-10). Every operator here exists on BRAIN for this account, with the
+# Checked against our account's operator list (`cli brain operators`): 66 operators at
+# user level (2026-11-03; OQ-10), 82 after the upgrade to consultant (2026-11-10; the 16
+# added are marked "consultant"). Every operator here exists on BRAIN for this account, with the
 # argument list from BRAIN's own definitions. Rerun `cli brain operators` if the account
 # level changes, since BRAIN shows different operators at different levels. The validator
 # is strict on purpose: an operator missing from this file makes the generator discard the
@@ -36,6 +37,11 @@ operators:
   - kth_element(x, d, k, ignore="NaN")
   - days_from_last_change(x)
   - last_diff_value(x, d)
+  - ts_max(x, d)                  # consultant
+  - ts_min(x, d)                  # consultant
+  - jump_decay(x, d, sensitivity=0.5, force=0.1)                                 # consultant
+  - ts_target_tvr_decay(x, lambda_min=0, lambda_max=1, target_tvr=0.1)           # consultant
+  - ts_target_tvr_delta_limit(x, y, lambda_min=0, lambda_max=1, target_tvr=0.1)  # consultant
   # cross sectional
   - rank(x, rate=2)
   - zscore(x)
@@ -43,6 +49,8 @@ operators:
   - normalize(x, useStd=false, limit=0.0)
   - winsorize(x, std=4)
   - quantile(x, driver=gaussian, sigma=1.0)
+  - scale_down(x, constant=0)     # consultant
+  - vector_neut(x, y)             # consultant
   # group
   - group_neutralize(x, group)
   - group_rank(x, group)
@@ -50,6 +58,9 @@ operators:
   - group_scale(x, group)
   - group_mean(x, weight, group)
   - group_backfill(x, group, d, std=4.0)
+  - group_max(x, group)           # consultant
+  - group_min(x, group)           # consultant
+  - group_cartesian_product(g1, g2)   # consultant
   # bucket takes one of range="start, end, step" or buckets="2,5,6" (quoted); the defaults
   # below are placeholders because a signature default cannot contain a comma
   - bucket(x, range=none, buckets=none, skipBoth=false, NaNGroup=false)
@@ -81,10 +92,16 @@ operators:
   - less_equal(a, b)
   - trade_when(trigger, alpha, exit)
   - is_nan(x)
+  - to_nan(x, value=0, reverse=false)   # consultant
   - densify(x)
   - hump(x, hump=0.01)
   - vec_avg(x)
   - vec_sum(x)
+  - vec_count(x)                  # consultant
+  - vec_max(x)                    # consultant
+  - vec_min(x)                    # consultant
+  - vec_range(x)                  # consultant
+  - vec_stddev(x)                 # consultant
 
 # Group identifiers that may be passed to group_* operators.
 groups: [sector, industry, subindustry, market, exchange, country]

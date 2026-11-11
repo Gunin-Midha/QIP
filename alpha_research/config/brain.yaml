@@ -19,4 +19,9 @@ request_timeout_seconds: 60
 recordset_max_wait_seconds: 300     # waiting on Retry-After for PnL, yearly stats, correlations
 rate_limit_max_wait_seconds: 900    # total wait on 429 (too many concurrent simulations) per request
 fetch_self_correlation: true
+# GET /alphas/<id>/check after each simulation: BRAIN's final submission checks. At consultant
+# level the checks inside a fresh simulation are provisional (LOW_SHARPE WARNING there, FAIL
+# here; SELF_CORRELATION PENDING there, a value here), so these replace them.
+fetch_submission_check: true
+check_max_wait_seconds: 600
 

@@ -29,8 +29,13 @@ Endpoints used (relative to API_ROOT; every request sends Accept: application/js
                                               "records": [[...]]}; names: pnl (cumulative),
                                               daily-pnl, sharpe, turnover, yearly-stats
     GET     /alphas/<alpha id>/correlations/self   {"max", "min", ...} (Retry-After while computing)
+    GET     /alphas/<alpha id>/check          {"is": {"checks": [...]}}: the final submission
+                                              checks (Retry-After while computing; consultant)
     GET     /operators                        [{name, category, definition, ...}]
-    GET     /data-fields?...                  {"count", "results": [{id, ...}]}
+    GET     /data-sets?...                    {"count", "results": [{id, fieldCount, ...}]}
+    GET     /data-fields?...                  {"count", "results": [{id, ...}]}; BRAIN serves at
+                                              most 10,000 per query (offset cap), so a larger
+                                              catalog is fetched one dataset at a time
 
 Units: turnover, returns and drawdown are fractions (schema type "percent") and margin is a
 fraction (schema type "permyriad", shown as bps). ``translate`` keeps fractions (marking the
@@ -69,6 +74,7 @@ ACCEPT = "application/json;version=2.0"
 DATES_NOTE = ("brain_dates: candidate start/end dates are not sent; BRAIN simulates its own "
               "period, which the simulator checks against the holdout (OQ-12)")
 DATAFIELD_PAGE_SIZE = 50
+DATAFIELD_OFFSET_CAP = 10_000      # BRAIN returns nothing past this offset (live, 2026-11-10)
 
 _DONE_STATUSES = {"COMPLETE", "WARNING"}
 _FAILED_STATUSES = {"ERROR", "FAIL", "TIMEOUT"}
@@ -93,6 +99,8 @@ class BrainApiConfig:
     recordset_max_wait_seconds: float = 300.0
     rate_limit_max_wait_seconds: float = 900.0
     fetch_self_correlation: bool = True
+    fetch_submission_check: bool = True      # GET /alphas/<id>/check: BRAIN's final checks
+    check_max_wait_seconds: float = 600.0
 
 
 _CANDIDATE_SETTINGS = {"region", "universe", "delay", "decay", "neutralization", "truncation"}
@@ -110,13 +118,13 @@ def brain_config_from_dict(raw, source: str = "<dict>") -> BrainApiConfig:
                           "remove them from the brain config")
     kw = {}
     for key in ("request_timeout_seconds", "recordset_max_wait_seconds",
-                "rate_limit_max_wait_seconds"):
+                "rate_limit_max_wait_seconds", "check_max_wait_seconds"):
         if key in raw:
             v = raw[key]
             if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
                 raise ConfigError(f"{source}: {key} must be a positive number, got {v!r}")
             kw[key] = float(v)
-    for key in ("fetch_self_correlation",):
+    for key in ("fetch_self_correlation", "fetch_submission_check"):
         if key in raw:
             if not isinstance(raw[key], bool):
                 raise ConfigError(f"{source}: {key} must be true or false")
@@ -224,8 +232,10 @@ class BrainSession:
 
     def __init__(self, transport: Transport, email: str, secret: str, *,
                  sleep: Callable[[float], None] = time.sleep,
-                 rate_limit_max_wait: float = 900.0, api_root: str = API_ROOT):
+                 rate_limit_max_wait: float = 900.0, api_root: str = API_ROOT,
+                 on_biometric: Callable[[str], None] | None = None):
         self.transport = transport
+        self.on_biometric = on_biometric
         self._email = email
         self._secret = secret
         self.sleep = sleep
@@ -253,8 +263,19 @@ class BrainSession:
             return
         if resp.status == 401 and resp.headers.get("www-authenticate", "").lower() == "persona":
             where = urllib.parse.urljoin(self.url("/authentication"), resp.headers.get("location", ""))
-            raise BrainAuthError(f"BRAIN asks for biometric verification, which this client "
-                                 f"does not do. Complete it in a browser ({where}) and retry.")
+            if self.on_biometric is None:
+                raise BrainAuthError(f"BRAIN asks for biometric verification, which needs an "
+                                     f"interactive terminal. Open {where} in a browser, or run "
+                                     f"the command in a terminal to be prompted.")
+            # The web app's flow: the person verifies at the link, then the same session
+            # POSTs to it to finish the login (each new login asks again).
+            self.on_biometric(where)
+            done = self._send("POST", where)
+            if done.status in (200, 201):
+                self.authenticated = True
+                return
+            raise BrainAuthError(f"biometric verification not completed ({done.status}): "
+                                 f"{done.detail()}")
         if resp.status >= 500:
             raise ConnectionError(f"authentication returned {resp.status}")
         raise BrainAuthError(f"authentication failed ({resp.status}): {resp.detail()}")
@@ -299,11 +320,15 @@ class BrainSession:
 
 
 def make_session(config: BrainApiConfig, *, sleep: Callable[[float], None] = time.sleep,
-                 transport: Transport | None = None) -> BrainSession:
-    """The real session. Fails fast (before any request) when credentials are missing."""
+                 transport: Transport | None = None,
+                 on_biometric: Callable[[str], None] | None = None) -> BrainSession:
+    """The real session. Fails fast (before any request) when credentials are missing.
+    ``on_biometric(url)`` is called when BRAIN asks for biometric verification and must
+    return once the person has verified at ``url``; without it that login fails."""
     email, secret = credentials_from_env()
     return BrainSession(transport or UrllibTransport(config.request_timeout_seconds), email,
-                        secret, sleep=sleep, rate_limit_max_wait=config.rate_limit_max_wait_seconds)
+                        secret, sleep=sleep, rate_limit_max_wait=config.rate_limit_max_wait_seconds,
+                        on_biometric=on_biometric)
 
 
 def _expect(resp: Response, what: str, *ok: int):
@@ -434,10 +459,15 @@ def _failure_message(simulation: dict) -> str | None:
 
 def translate(simulation: dict, alpha: dict | None, yearly: dict | None = None,
               pnl: dict | None = None, self_corr: dict | None = None, *,
-              daily_pnl: dict | None = None) -> dict:
+              daily_pnl: dict | None = None, check: dict | None = None) -> dict:
     """Turn BRAIN responses into the raw dict ``simulator.normalize`` reads. Pure.
     Anything missing stays None; BRAIN checks that are neither PASS nor FAIL are left out
-    of ``checks`` (missing is not false) and listed in notes."""
+    of ``checks`` (missing is not false) and listed in notes.
+
+    ``check`` is ``GET /alphas/<id>/check`` (the web app's "Check submission"). At
+    consultant level the checks inside the alpha are provisional (live capture 2026-11-10:
+    LOW_SHARPE was WARNING there and FAIL in the check, SELF_CORRELATION PENDING there and
+    FAIL 0.7003 in the check), so the check's list replaces the alpha's when it has one."""
     simulation = simulation or {}
     notes = [DATES_NOTE]
     failure = _failure_message(simulation)
@@ -448,18 +478,28 @@ def translate(simulation: dict, alpha: dict | None, yearly: dict | None = None,
         notes.append(f"brain_simulation_warning: {simulation.get('message')}")
 
     is_ = alpha.get("is") or {}
-    checks, by_name = {}, {}
-    for c in is_.get("checks") or []:
+    final = ((check or {}).get("is") or {}).get("checks")
+    if isinstance(final, list) and final:
+        notes.append("brain_checks_from: submission check")
+    else:
+        final = is_.get("checks")
+        notes.append("brain_checks_from: simulation (provisional)")
+    checks, by_name, check_values = {}, {}, {}
+    for c in final or []:
         if not isinstance(c, dict) or not isinstance(c.get("name"), str):
             continue
         by_name[c["name"]] = c
+        vl = {k: _num(c.get(k), f"checks.{c['name']}.{k}", notes) for k in ("value", "limit")}
+        if any(v is not None for v in vl.values()):
+            check_values[c["name"]] = vl
         result = c.get("result")
         if result == "PASS":
             checks[c["name"]] = True
         elif result == "FAIL":
             checks[c["name"]] = False
         else:
-            notes.append(f"brain_check_not_counted: {c['name']}={result!r}")
+            extra = "".join(f" {k} {c[k]}" for k in ("value", "limit") if c.get(k) is not None)
+            notes.append(f"brain_check_not_counted: {c['name']}={result!r}{extra}")
 
     def check_field(name: str, key: str) -> float | None:
         return _num((by_name.get(name) or {}).get(key), f"checks.{name}.{key}", notes)
@@ -477,6 +517,17 @@ def translate(simulation: dict, alpha: dict | None, yearly: dict | None = None,
                      f"fitness {test.get('fitness')} (not gated)")
     if is_.get("startDate"):
         notes.append(f"brain_is_start: {is_['startDate']}")
+    # consultant level: the same in-sample stats under BRAIN's investability constraints and
+    # with its risk factors neutralized. Recorded, not gated.
+    alt_stats = {}
+    for key, label in (("investabilityConstrained", "investability_constrained"),
+                       ("riskNeutralized", "risk_neutralized")):
+        if isinstance(is_.get(key), dict):
+            v = is_[key]
+            alt_stats[label] = {k: _num(v.get(k), f"is.{key}.{k}", notes)
+                                for k in ("sharpe", "fitness", "turnover", "returns", "drawdown")}
+            notes.append(f"brain_{label}: sharpe {v.get('sharpe')} fitness {v.get('fitness')} "
+                         f"turnover {v.get('turnover')} returns {v.get('returns')} (not gated)")
     if settings.get("startDate") and settings.get("endDate"):
         # read by simulator.brain_period, which checks it against the holdout
         notes.append(f"brain_period: {settings['startDate']}..{settings['endDate']}")
@@ -501,6 +552,8 @@ def translate(simulation: dict, alpha: dict | None, yearly: dict | None = None,
         "long_pnl": None,           # TODO(open-question) OQ-2: no long/short PnL in BRAIN's sample
         "short_pnl": None,
         "checks": checks,
+        "check_values": check_values,
+        "alt_stats": alt_stats,
         "yearly": _yearly(recordset_rows(yearly), notes),
         "daily_pnl": _daily_pnl(recordset_rows(daily_pnl), recordset_rows(pnl), notes),
         "notes": notes,
@@ -562,15 +615,19 @@ class RealBrainClient:
                else self._fetch(brain_sim_id, "pnl", f"{base}/recordsets/pnl", notes))
         corr = (self._fetch(brain_sim_id, "self_correlation", f"{base}/correlations/self", notes)
                 if self.config.fetch_self_correlation else None)
-        raw = translate(sim, alpha, yearly, pnl, corr, daily_pnl=daily)
+        check = (self._fetch(brain_sim_id, "check", f"{base}/check", notes,
+                             max_wait=self.config.check_max_wait_seconds)
+                 if self.config.fetch_submission_check else None)
+        raw = translate(sim, alpha, yearly, pnl, corr, daily_pnl=daily, check=check)
         raw["notes"] = raw["notes"] + [f"brain_alpha_id: {alpha_id}"] + notes
         self._capture(brain_sim_id, "translated", raw)
         return raw
 
-    def _fetch(self, sim_id: str, name: str, path: str, notes: list[str]):
+    def _fetch(self, sim_id: str, name: str, path: str, notes: list[str],
+               max_wait: float | None = None):
         """A missing piece becomes None plus a note; it never fails the whole result."""
         try:
-            resp = self.session.get_ready(path, self.config.recordset_max_wait_seconds)
+            resp = self.session.get_ready(path, max_wait or self.config.recordset_max_wait_seconds)
         except TimeoutError as exc:
             notes.append(f"brain_fetch_timeout: {name}: {exc}")
             return None
@@ -608,19 +665,60 @@ def list_operators(session: BrainSession) -> list[dict]:
     return [o for o in body if isinstance(o, dict) and isinstance(o.get("name"), str)]
 
 
-def list_datafields(session: BrainSession, *, region: str, universe: str, delay: int,
-                    instrument_type: str = "EQUITY", dataset: str | None = None) -> list[dict]:
+def _paged(session: BrainSession, path: str, params: dict, what: str,
+           progress: Callable[[str], None] | None = None) -> tuple[list[dict], int | None]:
+    """All pages of a ``{"count", "results"}`` listing, up to BRAIN's offset cap."""
+    items, offset, count = [], 0, None
+    while offset < DATAFIELD_OFFSET_CAP:
+        body = _expect(session.request("GET", path, params={**params, "limit": DATAFIELD_PAGE_SIZE,
+                                                            "offset": offset}), what, 200) or {}
+        page = [f for f in body.get("results") or [] if isinstance(f, dict) and f.get("id")]
+        items.extend(page)
+        offset += DATAFIELD_PAGE_SIZE
+        count = body.get("count") if isinstance(body.get("count"), int) else count
+        if progress and (offset // DATAFIELD_PAGE_SIZE) % 20 == 0:
+            total = f"{count:,}" if count is not None else "?"
+            progress(f"{what}: {len(items):,} of {total} so far")
+        if not page or (count is not None and offset >= count):
+            break
+    return items, count
+
+
+def list_datasets(session: BrainSession, *, region: str, universe: str, delay: int,
+                  instrument_type: str = "EQUITY") -> list[dict]:
     params = {"instrumentType": instrument_type, "region": region, "delay": delay,
-              "universe": universe, "limit": DATAFIELD_PAGE_SIZE}
+              "universe": universe}
+    return _paged(session, "/data-sets", params, "datasets")[0]
+
+
+def list_datafields(session: BrainSession, *, region: str, universe: str, delay: int,
+                    instrument_type: str = "EQUITY", dataset: str | None = None,
+                    progress: Callable[[str], None] | None = None) -> list[dict]:
+    """Every datafield for these settings. When BRAIN counts more than one query can page
+    through (``DATAFIELD_OFFSET_CAP``; consultant catalogs do), it fetches one dataset at a
+    time. ``progress(message)`` gets a line now and then for long downloads."""
+    params = {"instrumentType": instrument_type, "region": region, "delay": delay,
+              "universe": universe}
     if dataset:
         params["dataset.id"] = dataset
-    fields_, offset = [], 0
-    while True:
-        body = _expect(session.request("GET", "/data-fields", params={**params, "offset": offset}),
-                       "GET data-fields", 200) or {}
-        page = [f for f in body.get("results") or [] if isinstance(f, dict) and f.get("id")]
-        fields_.extend(page)
-        offset += DATAFIELD_PAGE_SIZE
-        count = body.get("count")
-        if not page or (isinstance(count, int) and offset >= count):
-            return fields_
+    fields_, count = _paged(session, "/data-fields", params, "datafields", progress)
+    if dataset or count is None or count <= len(fields_):
+        return fields_
+    datasets = list_datasets(session, region=region, universe=universe, delay=delay,
+                             instrument_type=instrument_type)
+    if progress:
+        progress(f"BRAIN has {count:,} fields, more than one query returns "
+                 f"({DATAFIELD_OFFSET_CAP:,}); fetching {len(datasets)} datasets one by one")
+    out, seen = [], set()
+    for i, ds in enumerate(datasets, 1):
+        part, part_count = _paged(session, "/data-fields", {**params, "dataset.id": ds["id"]},
+                                  f"datafields {ds['id']}")
+        if part_count is not None and part_count > len(part) and progress:
+            progress(f"dataset {ds['id']}: only {len(part):,} of {part_count:,} fields returned")
+        for f in part:
+            if f["id"] not in seen:
+                seen.add(f["id"])
+                out.append(f)
+        if progress and (i % 10 == 0 or i == len(datasets)):
+            progress(f"datasets {i} of {len(datasets)} done, {len(out):,} fields so far")
+    return out

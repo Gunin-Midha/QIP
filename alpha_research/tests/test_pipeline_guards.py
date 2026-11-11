@@ -48,6 +48,37 @@ def test_brain_checks_can_be_switched_off(config, playbook):
     assert d.decision == "accept" and not any(g.name.startswith("brain:") for g in d.gate_results)
 
 
+def test_consultant_checks_map_to_classes(config, playbook):
+    # live consultant checks (2026-11-10): recent-years Sharpe and correlation with
+    # production alphas are classes of their own, each with its own levers
+    d = evaluate(passing(checks={"LOW_2Y_SHARPE": False}), config, playbook)
+    assert d.failure_class == "recent_sharpe"
+    d = evaluate(passing(checks={"IS_LADDER_SHARPE": False}), config, playbook)
+    assert d.failure_class == "recent_sharpe"
+    d = evaluate(passing(checks={"PROD_CORRELATION": False}), config, playbook)
+    assert d.failure_class == "prod_correlation"
+
+
+def test_ignored_brain_checks_are_not_gates(config, playbook):
+    # REGULAR_SUBMISSION is the daily submission quota: failing it says nothing about the alpha
+    ignoring = dataclasses.replace(config, gates=dataclasses.replace(
+        config.gates, brain_checks_ignored=("REGULAR_SUBMISSION",)))
+    d = evaluate(passing(checks={"REGULAR_SUBMISSION": False, "LOW_SHARPE": True}), ignoring, playbook)
+    assert d.decision == "accept"
+    assert not any(g.name == "brain:REGULAR_SUBMISSION" for g in d.gate_results)
+    d = evaluate(passing(checks={"REGULAR_SUBMISSION": False}), config, playbook)
+    assert d.decision == "reject"
+
+
+def test_main_config_ignores_submission_only_checks():
+    from alpha_research.config import load_config
+    g = load_config(ROOT / "config" / "thresholds.yaml").gates
+    assert g.sharpe_min == 1.58 and g.use_brain_checks
+    assert {"REGULAR_SUBMISSION", "MATCHES_THEMES", "OSMOSIS_ALLOCATION"} <= set(g.brain_checks_ignored)
+    for alpha_check in ("LOW_SHARPE", "LOW_2Y_SHARPE", "SELF_CORRELATION", "PROD_CORRELATION"):
+        assert alpha_check not in g.brain_checks_ignored
+
+
 # ---------------------------------------------------------------- overfitting guard
 
 def lineage(memory, candidate, n_children, root_id="root"):

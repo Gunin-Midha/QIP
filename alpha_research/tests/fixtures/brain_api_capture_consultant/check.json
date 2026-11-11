@@ -1,0 +1,200 @@
+{
+  "is": {
+    "checks": [
+      {
+        "name": "LOW_SHARPE",
+        "result": "FAIL",
+        "limit": 1.58,
+        "value": 1.34
+      },
+      {
+        "name": "LOW_FITNESS",
+        "result": "FAIL",
+        "limit": 1.0,
+        "value": 0.62
+      },
+      {
+        "name": "LOW_TURNOVER",
+        "result": "PASS",
+        "limit": 0.01,
+        "value": 0.3993
+      },
+      {
+        "name": "HIGH_TURNOVER",
+        "result": "PASS",
+        "limit": 0.7,
+        "value": 0.3993
+      },
+      {
+        "name": "CONCENTRATED_WEIGHT",
+        "result": "PASS"
+      },
+      {
+        "name": "LOW_SUB_UNIVERSE_SHARPE",
+        "result": "PASS",
+        "limit": 0.58,
+        "value": 1.02
+      },
+      {
+        "name": "CLUSTER_TEST",
+        "result": "WARNING",
+        "limit": 1.58,
+        "value": 1.17
+      },
+      {
+        "name": "SELF_CORRELATION",
+        "result": "FAIL",
+        "limit": 0.7,
+        "value": 0.7003
+      },
+      {
+        "name": "DATA_DIVERSITY",
+        "result": "PASS"
+      },
+      {
+        "name": "PROD_CORRELATION",
+        "result": "PENDING",
+        "limit": 0.7
+      },
+      {
+        "name": "REGULAR_SUBMISSION",
+        "result": "PASS",
+        "limit": 4,
+        "value": 0
+      },
+      {
+        "name": "LOW_2Y_SHARPE",
+        "result": "FAIL",
+        "value": 1.05,
+        "limit": 1.58
+      },
+      {
+        "name": "POWER_POOL_CORRELATION",
+        "result": "PASS",
+        "limit": 0.5
+      },
+      {
+        "result": "PASS",
+        "name": "MATCHES_PYRAMID",
+        "effective": 1,
+        "multiplier": 1.1,
+        "pyramids": [
+          {
+            "name": "USA/D1/PV",
+            "multiplier": 1.1
+          }
+        ]
+      },
+      {
+        "name": "OSMOSIS_ALLOCATION",
+        "result": "WARNING"
+      },
+      {
+        "name": "POWER_POOL_DESCRIPTION_LENGTH",
+        "result": "WARNING",
+        "limit": 100,
+        "value": 0
+      },
+      {
+        "name": "POWER_POOL_DESCRIPTION_FORMAT",
+        "result": "WARNING"
+      },
+      {
+        "result": "WARNING",
+        "name": "MATCHES_THEMES",
+        "themes": [
+          {
+            "id": "9B3qVP4",
+            "multiplier": 1.0,
+            "name": "GLB/D1 Power Pool Nov`26"
+          },
+          {
+            "id": "ZDXgR5B",
+            "multiplier": 2.0,
+            "name": "GLB/D1 TOPDIV3000 Theme"
+          }
+        ]
+      }
+    ],
+    "selfCorrelated": {
+      "schema": {
+        "name": "selfCorrelation",
+        "title": "Self Correlated",
+        "properties": [
+          {
+            "name": "id",
+            "title": "Id",
+            "type": "string"
+          },
+          {
+            "name": "name",
+            "title": "Name",
+            "type": "string"
+          },
+          {
+            "name": "instrumentType",
+            "title": "Instrument Type",
+            "type": "string"
+          },
+          {
+            "name": "region",
+            "title": "Region",
+            "type": "string"
+          },
+          {
+            "name": "universe",
+            "title": "Universe",
+            "type": "string"
+          },
+          {
+            "name": "correlation",
+            "title": "Correlation",
+            "type": "decimal"
+          },
+          {
+            "name": "sharpe",
+            "title": "Sharpe",
+            "type": "decimal"
+          },
+          {
+            "name": "returns",
+            "title": "Returns",
+            "type": "percent"
+          },
+          {
+            "name": "turnover",
+            "title": "Turnover",
+            "type": "percent"
+          },
+          {
+            "name": "fitness",
+            "title": "Fitness",
+            "type": "decimal"
+          },
+          {
+            "name": "margin",
+            "title": "Margin",
+            "type": "permyriad"
+          }
+        ]
+      },
+      "records": [
+        [
+          "e7QGg58O",
+          null,
+          "EQUITY",
+          "USA",
+          "TOP3000",
+          0.7003,
+          1.66,
+          0.1791,
+          0.472,
+          1.02,
+          0.000759
+        ]
+      ],
+      "min": null,
+      "max": 0.7003
+    }
+  }
+}

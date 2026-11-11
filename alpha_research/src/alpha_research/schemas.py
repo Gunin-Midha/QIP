@@ -26,11 +26,42 @@ class SchemaError(ValueError):
     """Raised when a record does not match its contract."""
 
 
-REGIONS = {"USA", "EUR", "ASI", "CHN", "JPN", "GLB"}
-# Universes our account offers for USA (`cli brain options`, 2026-11-03). Only USA is
-# enabled on the account, so other regions' universes are not listed yet.
-UNIVERSES = {"TOP3000", "TOP2000", "TOP1000", "TOP500", "TOP200", "TOPSP500"}
-NEUTRALIZATIONS = {"NONE", "MARKET", "SECTOR", "INDUSTRY", "SUBINDUSTRY"}
+# Settings our account allows per region (`cli brain options`, consultant level,
+# 2026-11-10; the response is tests/fixtures/brain_api_capture_consultant/
+# simulation_options.json and test_schemas checks this table against it).
+_NEUTS = ("NONE", "REVERSION_AND_MOMENTUM", "STATISTICAL", "CROWDING", "FAST", "SLOW",
+          "SLOW_AND_FAST", "MARKET", "SECTOR", "INDUSTRY", "SUBINDUSTRY")
+_NEUTS_COUNTRY = _NEUTS + ("COUNTRY",)
+# neutralize within a group; the rest (STATISTICAL, CROWDING, ...) are BRAIN's factor neutralizations
+GROUP_NEUTRALIZATIONS = ("MARKET", "SECTOR", "INDUSTRY", "SUBINDUSTRY", "COUNTRY")
+REGION_SETTINGS = {
+    # region: {"universes", "delays", "neutralizations"}
+    "ALL": {"universes": ("LARGE", "MEDIUM", "SMALL"), "delays": (1,), "neutralizations": _NEUTS},
+    "USA": {"universes": ("TOP3000", "TOP2000", "TOP1000", "TOP500", "TOP200", "TOPSP500"),
+            "delays": (0, 1), "neutralizations": _NEUTS},
+    "GLB": {"universes": ("TOP3000", "MINVOL1M", "MINVOL10M", "TOPDIV3000"), "delays": (1,),
+            "neutralizations": _NEUTS_COUNTRY},
+    "EUR": {"universes": ("TOP2500", "TOP1200", "TOP800", "TOP400", "TOPCS1600"),
+            "delays": (0, 1), "neutralizations": _NEUTS_COUNTRY},
+    "ASI": {"universes": ("MINVOL1M", "MINVOL10M", "TOP500"), "delays": (1,),
+            "neutralizations": _NEUTS_COUNTRY},
+    "CHN": {"universes": ("TOP2000U",), "delays": (0, 1), "neutralizations": _NEUTS},
+    "JPN": {"universes": ("TOP1600", "TOP1200"), "delays": (0, 1), "neutralizations": _NEUTS},
+    "AMR": {"universes": ("TOP600",), "delays": (0, 1),
+            "neutralizations": ("NONE", "STATISTICAL", "MARKET", "SECTOR", "INDUSTRY",
+                                "SUBINDUSTRY", "COUNTRY")},
+    "IND": {"universes": ("TOP500",), "delays": (1,), "neutralizations": _NEUTS},
+    "DEU": {"universes": ("TOP500",), "delays": (0, 1), "neutralizations": _NEUTS},
+    "GBR": {"universes": ("TOP700",), "delays": (0, 1), "neutralizations": _NEUTS},
+}
+REGIONS = set(REGION_SETTINGS)
+UNIVERSES = {u for s in REGION_SETTINGS.values() for u in s["universes"]}
+NEUTRALIZATIONS = {n for s in REGION_SETTINGS.values() for n in s["neutralizations"]}
+
+
+def neutralizations_for(region: str) -> tuple[str, ...]:
+    """The neutralizations BRAIN allows in ``region`` (empty for an unknown region)."""
+    return REGION_SETTINGS.get(region, {}).get("neutralizations", ())
 RESULT_STATUSES = {"complete", "failed", "timeout", "invalid"}
 DECISIONS = {"accept", "repair", "reject", "pending"}
 FAILURE_CLASSES = (
@@ -44,6 +75,8 @@ FAILURE_CLASSES = (
     "drawdown",
     "leg_imbalance",
     "weak_year",
+    "recent_sharpe",      # BRAIN's LOW_2Y_SHARPE / IS_LADDER_SHARPE (consultant level)
+    "prod_correlation",   # BRAIN's PROD_CORRELATION: too close to production alphas
     "incomplete",
     "other",
 )
@@ -211,16 +244,18 @@ class CandidateRecord:
             raise SchemaError("expression must be non-empty")
         if self.region not in REGIONS:
             raise SchemaError(f"region {self.region!r} not in {sorted(REGIONS)}")
-        if self.universe not in UNIVERSES:
-            raise SchemaError(f"universe {self.universe!r} not in {sorted(UNIVERSES)}")
-        if self.delay not in (0, 1):
-            raise SchemaError(f"delay must be 0 or 1, got {self.delay}")
+        allowed = REGION_SETTINGS[self.region]
+        if self.universe not in allowed["universes"]:
+            raise SchemaError(f"universe {self.universe!r} not in {self.region}'s "
+                              f"{list(allowed['universes'])}")
+        if self.delay not in allowed["delays"]:
+            raise SchemaError(f"delay {self.delay} not allowed in {self.region} "
+                              f"({list(allowed['delays'])})")
         if self.decay < 0:
             raise SchemaError(f"decay must be >= 0, got {self.decay}")
-        if self.neutralization not in NEUTRALIZATIONS:
-            raise SchemaError(
-                f"neutralization {self.neutralization!r} not in {sorted(NEUTRALIZATIONS)}"
-            )
+        if self.neutralization not in allowed["neutralizations"]:
+            raise SchemaError(f"neutralization {self.neutralization!r} not in {self.region}'s "
+                              f"{list(allowed['neutralizations'])}")
         if self.truncation is None or not (0 < self.truncation <= 1):
             raise SchemaError(f"truncation must be in (0, 1], got {self.truncation}")
         if self.end_date <= self.start_date:
@@ -318,6 +353,12 @@ class ResultRecord:
     checks: dict[str, bool] = field(default_factory=dict)
     # Not in the spec table: metric-validator notes (section 4.2 step 6, "attach notes").
     notes: list[str] = field(default_factory=list)
+    # Not in the spec table (consultant level, live capture 2026-11-10): BRAIN's value and
+    # limit per check, {name: {"value": x, "limit": y}} (either may be None), whatever the
+    # result; and the same in-sample stats under BRAIN's risk neutralization and investability
+    # constraints, {"risk_neutralized": {"sharpe": ..., ...}, "investability_constrained": ...}.
+    check_values: dict[str, dict] = field(default_factory=dict)
+    alt_stats: dict[str, dict] = field(default_factory=dict)
 
     def validate(self) -> None:
         if not self.candidate_id:
@@ -338,10 +379,14 @@ class ResultRecord:
             isinstance(k, str) and isinstance(v, bool) for k, v in self.checks.items()
         ):
             raise SchemaError("checks must be a dict of str to bool")
+        for name in ("check_values", "alt_stats"):
+            _check_number_maps(getattr(self, name), name)
 
     def to_dict(self) -> dict:
         d = {f.name: getattr(self, f.name) for f in fields(self)}
         d["drawdown_date"] = self.drawdown_date.isoformat() if self.drawdown_date else None
+        d["check_values"] = {k: dict(v) for k, v in self.check_values.items()}
+        d["alt_stats"] = {k: dict(v) for k, v in self.alt_stats.items()}
         d["yearly"] = [r.to_dict() for r in self.yearly]
         d["daily_pnl"] = series_to_dict(self.daily_pnl)
         d["checks"] = dict(self.checks)
@@ -359,10 +404,24 @@ class ResultRecord:
             daily_pnl=series_from_dict(d.get("daily_pnl")),
             checks=dict(d.get("checks") or {}),
             notes=list(d.get("notes") or []),
+            check_values={k: dict(v) for k, v in (d.get("check_values") or {}).items()},
+            alt_stats={k: dict(v) for k, v in (d.get("alt_stats") or {}).items()},
             **{name: _opt_float(d.get(name), name) for name in _RESULT_FLOATS},
         )
         rec.validate()
         return rec
+
+
+def _check_number_maps(d, name: str) -> None:
+    """{str: {str: number or None}}"""
+    if not isinstance(d, dict) or not all(
+        isinstance(k, str) and isinstance(v, dict) and all(
+            isinstance(kk, str) and (vv is None or (isinstance(vv, (int, float))
+                                                    and not isinstance(vv, bool)))
+            for kk, vv in v.items())
+        for k, v in d.items()
+    ):
+        raise SchemaError(f"{name} must be a dict of str to {{str: number or None}}")
 
 
 def series_to_dict(s: pd.Series | None) -> dict | None:

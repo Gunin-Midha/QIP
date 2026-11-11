@@ -32,7 +32,12 @@ Method
    liquidity_tilt      final expression -> expr * rank(step.field), tilting weight to
                        liquid names (sub-universe test)
    winsorize           final expression -> winsorize(expr, std=step.std)
-   change_universe     universe -> step.to, if the current universe is larger
+   change_universe     universe -> step.to if it is a smaller universe of the alpha's
+                       region, else the region's next smaller one
+                       (UNIVERSE_ORDER_BY_REGION; regions not listed: never)
+   neutralize_<name>   neutralization -> NAME (STATISTICAL, CROWDING,
+                       REVERSION_AND_MOMENTUM, FAST, SLOW, SLOW_AND_FAST, COUNTRY),
+                       when the region allows it and the alpha does not use it
    ==================  ===========================================================
 
    Only the final statement is rewritten; ``name = ...;`` statements are kept.
@@ -47,7 +52,9 @@ Method
    or one added to the playbook later) goes to the model with the metrics, every class
    the alpha fails, the lever, the past repairs of this class that worked (from memory)
    and, for orthogonalization, the pool's expressions. Its expression passes through
-   ``fastexpr.analyze`` like everything the Generator writes; it may also set decay and
+   ``fastexpr.analyze`` like everything the Generator writes. The metrics it sees include
+   BRAIN's failed checks with value and limit and BRAIN's risk-neutralized stats, and the
+   past repairs from the alpha's own region come first. It may also set decay and
    neutralization (validated; bad values are ignored with a note). An invalid reply means
    the lever does not apply. The prompts (with per-lever instructions) are in prompts.py.
 5. The child gets ``parent_id``, ``generation + 1`` and ``lever`` (``assign_lineage``) and
@@ -74,8 +81,8 @@ from .memory import MemoryStore
 from .prompts import repair_system, repair_user
 from .repair import Lever, Playbook
 from .research_loop import assign_lineage
-from .schemas import (NEUTRALIZATIONS, CandidateRecord, DecisionRecord, ResultRecord,
-                      SchemaError, experiment_hash)
+from .schemas import (CandidateRecord, DecisionRecord, ResultRecord, SchemaError,
+                      experiment_hash, neutralizations_for)
 
 MODEL_LEVERS_NOTE = "lever has no mechanical rewrite; the model was asked"
 
@@ -208,29 +215,69 @@ def _flip_sign(c, step, spec, result=None):
     return _with_final(c, Unary("-", final))
 
 
-# coarse -> fine; a repair only moves to a finer group
+# coarse -> fine; a repair only moves to a finer group. The factor neutralizations
+# (STATISTICAL, CROWDING, ...; consultant level) and COUNTRY are not on this scale: each has
+# its own lever, neutralize_<name> (below), so the learner scores each one apart.
 NEUTRALIZATION_ORDER = ("NONE", "MARKET", "SECTOR", "INDUSTRY", "SUBINDUSTRY")
-# large -> small
-UNIVERSE_ORDER = ("TOP3000", "TOP2000", "TOP1000", "TOP500", "TOPSP500", "TOP200")
+# large -> small per region, only where the sizes are known from the names (TOP<n>;
+# TOPSP500 and TOPCS1600 are index universes of about that size; MINVOL10M is the more
+# liquid subset of MINVOL1M). Regions not listed have no change_universe.
+UNIVERSE_ORDER_BY_REGION = {
+    "USA": ("TOP3000", "TOP2000", "TOP1000", "TOP500", "TOPSP500", "TOP200"),
+    "EUR": ("TOP2500", "TOPCS1600", "TOP1200", "TOP800", "TOP400"),
+    "JPN": ("TOP1600", "TOP1200"),
+    "ASI": ("MINVOL1M", "MINVOL10M"),
+}
+UNIVERSE_ORDER = UNIVERSE_ORDER_BY_REGION["USA"]
 
 
 def _set_neutralization(c, step, spec, result=None):
     to = step.get("to")
-    if to not in NEUTRALIZATION_ORDER or to not in NEUTRALIZATIONS:
+    if to not in NEUTRALIZATION_ORDER:
         raise LeverNotApplicable(f"set_neutralization needs step.to in {list(NEUTRALIZATION_ORDER)}")
+    if to not in neutralizations_for(c.region):
+        raise LeverNotApplicable(f"neutralization {to} is not allowed in {c.region}")
+    if c.neutralization not in NEUTRALIZATION_ORDER:
+        raise LeverNotApplicable(f"neutralization {c.neutralization} is not on the group scale")
     if NEUTRALIZATION_ORDER.index(c.neutralization) >= NEUTRALIZATION_ORDER.index(to):
         raise LeverNotApplicable(f"neutralization is already {c.neutralization} (target {to})")
     return dataclasses.replace(c, neutralization=to)
 
 
 def _change_universe(c, step, spec, result=None):
+    """universe -> step.to when it is a smaller universe of the alpha's region; otherwise
+    (step.to is another region's, or not given) the next smaller one in the region."""
+    order = UNIVERSE_ORDER_BY_REGION.get(c.region)
+    if not order or c.universe not in order:
+        raise LeverNotApplicable(f"no known smaller universe than {c.universe} in {c.region}")
+    at = order.index(c.universe)
     to = step.get("to")
-    if to not in UNIVERSE_ORDER:
-        raise LeverNotApplicable(f"change_universe needs step.to in {list(UNIVERSE_ORDER)}")
-    if c.universe not in UNIVERSE_ORDER or \
-            UNIVERSE_ORDER.index(c.universe) >= UNIVERSE_ORDER.index(to):
-        raise LeverNotApplicable(f"universe {c.universe} is not larger than {to}")
+    if to in order:
+        if order.index(to) <= at:
+            raise LeverNotApplicable(f"universe {c.universe} is not larger than {to}")
+    elif at + 1 < len(order):
+        to = order[at + 1]
+    else:
+        raise LeverNotApplicable(f"{c.universe} is already the smallest known in {c.region}")
     return dataclasses.replace(c, universe=to)
+
+
+def _neutralize_to(target: str):
+    """Lever ``neutralize_<target>``: neutralization -> target, when the region allows it
+    and the alpha does not use it already. The step is unused."""
+    def lever(c, step, spec, result=None):
+        if target not in neutralizations_for(c.region):
+            raise LeverNotApplicable(f"neutralization {target} is not allowed in {c.region}")
+        if c.neutralization == target:
+            raise LeverNotApplicable(f"neutralization is already {target}")
+        return dataclasses.replace(c, neutralization=target)
+    return lever
+
+
+# one lever per neutralization off the group scale (consultant level, 2026-11-10)
+NEUTRALIZE_LEVERS = {f"neutralize_{n.lower()}": n for n in (
+    "STATISTICAL", "CROWDING", "REVERSION_AND_MOMENTUM", "FAST", "SLOW", "SLOW_AND_FAST",
+    "COUNTRY")}
 
 
 def _backfill(node, spec, variables: set, lookback: Num, changed: list):
@@ -304,6 +351,7 @@ MECHANICAL = {
     "liquidity_tilt": _liquidity_tilt,
     "winsorize": _winsorize,
     "change_universe": _change_universe,
+    **{name: _neutralize_to(target) for name, target in NEUTRALIZE_LEVERS.items()},
 }
 
 
@@ -317,7 +365,18 @@ def _metrics(result: ResultRecord | None) -> dict:
     keys = ("sharpe", "fitness", "turnover", "returns", "max_drawdown", "margin_bps",
             "sub_universe_sharpe", "sub_universe_cutoff", "weight_concentration",
             "self_correlation")
-    return {k: getattr(result, k) for k in keys if getattr(result, k) is not None}
+    out = {k: getattr(result, k) for k in keys if getattr(result, k) is not None}
+    # BRAIN's own check values (LOW_2Y_SHARPE, IS_LADDER_SHARPE, ...) and the same stats with
+    # BRAIN's risk factors neutralized: evidence for or against a factor neutralization
+    failed = {k for k, ok in result.checks.items() if ok is False}
+    checks = {k: v for k, v in result.check_values.items() if k in failed}
+    if checks:
+        out["failed_brain_checks"] = checks
+    for name, stats in result.alt_stats.items():
+        kept = {k: v for k, v in stats.items() if v is not None}
+        if kept:
+            out[name] = kept
+    return out
 
 
 class RepairAgent:
@@ -341,13 +400,14 @@ class RepairAgent:
         """Repair events, lever statistics and the outcome rows, read fresh from memory."""
         outcomes = self.memory.candidate_outcomes()
         events = repair_events(outcomes, self.learning)
-        return events, LeverStats.from_events(events, self.learning.prior), outcomes
+        return events, LeverStats.from_events(events, self.learning.prior,
+                                              self.learning.region_prior_strength), outcomes
 
     def ranked(self, candidate: CandidateRecord, decision: DecisionRecord,
                result: ResultRecord | None, stats: LeverStats) -> list[tuple[Lever, float]]:
         failing = failing_classes(decision, result) | {decision.failure_class}
         return rank_levers(self.playbook, decision.failure_class, failing, stats,
-                           self.learning, self.rng)
+                           self.learning, self.rng, region=candidate.region)
 
     def repair(self, candidate: CandidateRecord, decision: DecisionRecord,
                result: ResultRecord | None = None,
@@ -480,7 +540,7 @@ class RepairAgent:
         out.notes.append(f"{lever.name}: {MODEL_LEVERS_NOTE}")
         pool = pool if lever.name == "orthogonalize_against_pool" else None
         examples = successful_examples(events, decision.failure_class,
-                                       self.learning.examples_in_prompt)
+                                       self.learning.examples_in_prompt, region=c.region)
         failing = sorted(failing_classes(decision, result) | {decision.failure_class})
         user = repair_user(c, lever, decision, _metrics(result), pool, self.spec.operators,
                            failing=failing, examples=examples)
@@ -507,7 +567,7 @@ class RepairAgent:
             else:
                 out.notes.append(f"{lever.name}: ignored model decay {decay!r}")
         if neut is not None:
-            if neut in NEUTRALIZATIONS:
+            if neut in neutralizations_for(c.region):
                 changes["neutralization"] = neut
             else:
                 out.notes.append(f"{lever.name}: ignored model neutralization {neut!r}")

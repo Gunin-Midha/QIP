@@ -219,6 +219,60 @@ def test_live_capture_from_our_account_translates_to_website_values():
     assert r.daily_pnl.sum() == pytest.approx(5_809_502, rel=0.005)
 
 
+CONSULTANT_DIR = FIXTURES / "brain_api_capture_consultant"
+
+
+def _consultant(name):
+    return json.loads((CONSULTANT_DIR / f"{name}.json").read_text())
+
+
+def test_consultant_capture_takes_final_checks_from_submission_check():
+    # tests/fixtures/brain_api_capture_consultant: acc_01 again after the upgrade (2026-11-10)
+    args = (_consultant("simulation"), _consultant("alpha"), _consultant("yearly_stats"), None,
+            _consultant("self_correlation"))
+    provisional = normalize(translate(*args, daily_pnl=_consultant("daily_pnl")), "acc_01", "s")
+    # inside the alpha, LOW_SHARPE is only a WARNING: it would not count as a failure
+    assert "LOW_SHARPE" not in provisional.checks
+    assert "brain_checks_from: simulation (provisional)" in provisional.notes
+
+    r = normalize(translate(*args, daily_pnl=_consultant("daily_pnl"), check=_consultant("check")),
+                  "acc_01", "KZi083UV4Tcad27VuxcXSm")
+    assert "brain_checks_from: submission check" in r.notes
+    assert r.checks["LOW_SHARPE"] is False and r.checks["LOW_FITNESS"] is False
+    assert r.checks["LOW_2Y_SHARPE"] is False and r.checks["SELF_CORRELATION"] is False
+    assert r.checks["DATA_DIVERSITY"] is True and r.checks["REGULAR_SUBMISSION"] is True
+    assert "PROD_CORRELATION" not in r.checks          # still PENDING in the check
+    assert "brain_check_not_counted: PROD_CORRELATION='PENDING' limit 0.7" in r.notes
+    assert "brain_check_not_counted: CLUSTER_TEST='WARNING' value 1.17 limit 1.58" in r.notes
+    assert (r.sharpe, r.fitness, r.turnover) == (1.34, 0.62, 0.3993)
+    assert (r.sub_universe_sharpe, r.sub_universe_cutoff) == (1.02, 0.58)
+    assert r.self_correlation == 0.7003
+    # the consultant in-sample period is ten years
+    assert "brain_period: 2014-01-01..2023-12-31" in r.notes
+    assert [y.year for y in r.yearly] == list(range(2014, 2024))
+    assert any(n.startswith("brain_risk_neutralized: sharpe ") for n in r.notes)
+    assert any(n.startswith("brain_investability_constrained: sharpe ") for n in r.notes)
+
+
+def test_consultant_capture_fails_the_sharpe_gate(config, playbook):
+    from alpha_research.config import load_config
+    from alpha_research.evaluator import evaluate
+    main = load_config(ROOT / "config" / "thresholds.yaml")
+    r = normalize(translate(_consultant("simulation"), _consultant("alpha"), check=_consultant("check")),
+                  "acc_01", "s")
+    d = evaluate(r, main, playbook)
+    assert d.decision in ("repair", "reject") and d.failure_class == "self_correlation"
+    failed = {g.name for g in d.gate_results if g.passed is False}
+    assert {"sharpe", "brain:LOW_SHARPE", "brain:LOW_2Y_SHARPE", "brain:SELF_CORRELATION"} <= failed
+
+
+def test_iv_spread_check_has_ladder_and_units():
+    r = normalize(translate(_consultant("simulation"), _consultant("alpha"),
+                            check=_consultant("check_iv_spread")), "iv", "s")
+    assert r.checks["IS_LADDER_SHARPE"] is False
+    assert any(n.startswith("brain_check_not_counted: UNITS='WARNING'") for n in r.notes)
+
+
 def test_cumulative_pnl_is_differenced():
     body = {"schema": {"properties": [{"name": "date"}, {"name": "pnl"}]},
             "records": [["2020-01-02", 100.0], ["2020-01-03", 150.0], ["2020-01-06", None],
@@ -307,6 +361,32 @@ def test_biometric_login_is_reported(bcfg):
         client.session.authenticate()
 
 
+def test_biometric_login_completes_in_the_same_session(bcfg):
+    routes = {("POST", "/authentication"): [
+                  ok(status=401, www_authenticate="persona", location="/authentication/persona?inquiry=x")],
+              ("POST", "/authentication/persona"): [ok(status=201)],
+              ("GET", "/operators"): [ok([{"name": "rank"}])]}
+    client, transport, _ = make_client(routes, bcfg)
+    shown = []
+    client.session.on_biometric = shown.append
+    assert brain_api.list_operators(client.session) == [{"name": "rank"}]
+    assert shown == [f"{brain_api.API_ROOT}/authentication/persona?inquiry=x"]
+    persona = [c for c in transport.calls if c["path"] == "/authentication/persona"]
+    assert len(persona) == 1 and persona[0]["method"] == "POST" and persona[0]["query"] == "inquiry=x"
+    assert SECRET not in shown[0]
+
+
+def test_biometric_not_completed_is_an_auth_error(bcfg):
+    routes = {("POST", "/authentication"): [
+                  ok(status=401, www_authenticate="persona", location="/authentication/persona?inquiry=x")],
+              ("POST", "/authentication/persona"): [ok({"detail": "Inquiry not completed."}, status=401)]}
+    client, _, _ = make_client(routes, bcfg)
+    client.session.on_biometric = lambda url: None
+    with pytest.raises(BrainAuthError, match="not completed"):
+        client.session.authenticate()
+    assert not client.session.authenticated
+
+
 def test_rate_limit_waits_then_succeeds(bcfg):
     routes = brain_routes({("GET", "/alphas/A1"): [ok(status=429, retry_after=30), ok(ALPHA)]})
     client, _, vc = make_client(routes, bcfg)
@@ -376,6 +456,32 @@ def test_simulator_runs_end_to_end_on_real_client(bcfg, config, memory, candidat
     body = transport.calls[1]["body"]
     assert transport.calls[1]["path"] == "/simulations" and body["regular"] == candidate().expression
     assert memory.pending() == []
+
+
+def test_poll_uses_the_submission_check(bcfg, config, memory, candidate):
+    check = {"is": {"checks": [{"name": "LOW_SHARPE", "result": "FAIL", "limit": 1.58, "value": 1.4},
+                               {"name": "SELF_CORRELATION", "result": "PASS", "limit": 0.7,
+                                "value": 0.2}]}}
+    routes = brain_routes({("GET", "/alphas/A1/check"): [ok(None, retry_after=4), ok(check)]})
+    client, transport, vc = make_client(routes, bcfg)
+    r = Simulator(client, memory, config, sleep=vc.sleep, clock=vc.clock).run(candidate())
+    assert r.checks == {"LOW_SHARPE": False, "SELF_CORRELATION": True}
+    assert "brain_checks_from: submission check" in r.notes
+    assert transport.paths("GET").count("/alphas/A1/check") == 2 and 4.0 in vc.sleeps
+
+
+def test_missing_submission_check_falls_back_to_the_alpha(bcfg, config, memory, candidate):
+    client, _, vc = make_client(brain_routes(), bcfg)        # /check answers 404
+    r = Simulator(client, memory, config, sleep=vc.sleep, clock=vc.clock).run(candidate())
+    assert r.status == "complete" and "brain_fetch_failed: check returned 404" in r.notes
+    assert "brain_checks_from: simulation (provisional)" in r.notes
+
+
+def test_submission_check_can_be_switched_off(bcfg, config, memory, candidate):
+    client, transport, vc = make_client(brain_routes(), dataclasses.replace(
+        bcfg, fetch_submission_check=False))
+    Simulator(client, memory, config, sleep=vc.sleep, clock=vc.clock).run(candidate())
+    assert "/alphas/A1/check" not in transport.paths()
 
 
 def test_rejected_submission_becomes_failed_result(bcfg, config, memory, candidate):
@@ -472,6 +578,50 @@ def test_list_datafields_paginates(bcfg):
     assert queries[0]["dataset.id"] == ["fundamental6"] and queries[0]["region"] == ["USA"]
 
 
+class CatalogTransport(FakeTransport):
+    """data-fields answers by dataset.id and offset, like BRAIN (count, then pages)."""
+
+    def __init__(self, datasets, total):
+        super().__init__({("GET", "/data-sets"): [ok({"count": len(datasets), "results": [
+            {"id": d} for d in datasets]})]})
+        self.datasets, self.total = datasets, total
+
+    def request(self, method, url, body, headers):
+        parts = urllib.parse.urlsplit(url)
+        if parts.path != "/data-fields":
+            return super().request(method, url, body, headers)
+        q = urllib.parse.parse_qs(parts.query)
+        self.calls.append({"method": method, "path": parts.path, "query": parts.query,
+                           "headers": dict(headers), "body": None})
+        ds, offset, limit = q.get("dataset.id", [None])[0], int(q["offset"][0]), int(q["limit"][0])
+        ids = ([f"{ds}_{i}" for i in range(self.datasets[ds])] if ds else
+               [f"{d}_{i}" for d, n in self.datasets.items() for i in range(n)])
+        count = len(ids) if ds else self.total
+        return ok({"count": count, "results": [{"id": i} for i in ids[offset:offset + limit]]})
+
+
+def test_large_catalog_is_fetched_one_dataset_at_a_time(bcfg, monkeypatch):
+    monkeypatch.setattr(brain_api, "DATAFIELD_OFFSET_CAP", 100)   # BRAIN's is 10,000
+    transport = CatalogTransport({"pv1": 60, "news5": 70, "model9": 30}, total=160)
+    session = BrainSession(transport, "me@example.com", SECRET, sleep=lambda s: None)
+    lines = []
+    fields = list_datafields(session, region="USA", universe="TOP3000", delay=1,
+                             progress=lines.append)
+    assert len(fields) == 160 and len({f["id"] for f in fields}) == 160
+    queried = {urllib.parse.parse_qs(c["query"]).get("dataset.id", [None])[0]
+               for c in transport.calls if c["path"] == "/data-fields"}
+    assert queried == {None, "pv1", "news5", "model9"}
+    assert any("fetching 3 datasets one by one" in l for l in lines)
+    assert lines[-1] == "datasets 3 of 3 done, 160 fields so far"
+
+
+def test_small_catalog_is_one_query(bcfg):
+    transport = CatalogTransport({"pv1": 60}, total=60)
+    session = BrainSession(transport, "me@example.com", SECRET, sleep=lambda s: None)
+    assert len(list_datafields(session, region="USA", universe="TOP3000", delay=1)) == 60
+    assert "/data-sets" not in transport.paths()
+
+
 def test_list_operators_and_errors(bcfg):
     ops = [{"name": "rank", "definition": "rank(x, rate=2)"}, {"category": "no name"}]
     client, _, _ = make_client({("GET", "/operators"): [ok(ops)]}, bcfg)
@@ -492,8 +642,8 @@ def fake_cli_session(monkeypatch, bcfg):
     def _install(routes):
         transport = FakeTransport(routes)
         holder["transport"] = transport
-        monkeypatch.setattr(cli, "make_session", lambda cfg: BrainSession(
-            transport, "me@example.com", SECRET, sleep=lambda s: None))
+        monkeypatch.setattr(cli, "make_session", lambda cfg, on_biometric=None: BrainSession(
+            transport, "me@example.com", SECRET, sleep=lambda s: None, on_biometric=on_biometric))
         monkeypatch.setattr(cli.time, "sleep", lambda s: None)
         return transport
 
@@ -548,6 +698,21 @@ def test_cli_brain_datafields_feeds_generator(fake_cli_session, tmp_path):
     rc = cli.main(["brain", "datafields", "--region", "USA", "--universe", "TOP3000",
                    "--delay", "1", "--out", str(out), "--brain-config", str(BRAIN_CONFIG)])
     assert rc == cli.EXIT_OK and load_datafields(out) == ["close", "volume"]
+
+
+def test_cli_brain_datasets_lists_field_counts(fake_cli_session, tmp_path, capsys):
+    rows = [{"id": "pv1", "category": {"id": "pv"}, "fieldCount": 40, "coverage": 0.95,
+             "alphaCount": 900, "pyramidMultiplier": 1.0},
+            {"id": "model51", "fieldCount": None}]
+    fake_cli_session({("GET", "/data-sets"): [ok({"count": 2, "results": rows})]})
+    out = tmp_path / "datasets.json"
+    rc = cli.main(["brain", "datasets", "--region", "USA", "--universe", "TOP3000",
+                   "--delay", "1", "--out", str(out), "--brain-config", str(BRAIN_CONFIG)])
+    assert rc == cli.EXIT_OK and json.loads(out.read_text()) == rows
+    text = capsys.readouterr().out
+    assert "pv1 | pv | 40 fields | coverage 95% | 900 alphas | pyramid 1.0" in text
+    assert "model51 | ? | ? fields" in text
+    assert "2 datasets for USA/TOP3000/delay 1, 40 fields (some counts missing)" in text
 
 
 def test_cli_brain_api_error_exits_7(fake_cli_session, tmp_path, capsys):

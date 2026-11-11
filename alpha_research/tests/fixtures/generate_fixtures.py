@@ -78,6 +78,10 @@ def metrics(sharpe, turnover_pct, returns_pct, *, sub=1.10, cutoff=0.80, drawdow
     return m
 
 
+# EUR settings our account offers (TOP3000 is a USA/GLB universe, not EUR)
+EUR = {"region": "EUR", "universe": "TOP2500"}
+
+
 def cand(cid, expression, dataset, family, hypothesis, fixture_id, expected, failure_class,
          **overrides):
     c = dict(BASE)
@@ -117,7 +121,7 @@ def main() -> None:
         m["daily_pnl_file"] = write_pnl(fid, acc_pnl[cid])
         fixtures[fid] = m
         cands.append(cand(cid, expr, ds, fam, hyp, fid, "accept", "none",
-                          region="EUR" if ds == "news12" else "USA"))
+                          **(EUR if ds == "news12" else {})))
 
     # ---- 5 sharpe failures: near misses (|sharpe| >= 0.6 x 1.25, repair.near_miss_share in
     # thresholds_test.yaml) go to repair, far misses are rejected ------------------------
@@ -133,7 +137,7 @@ def main() -> None:
         fixtures[fid] = metrics(s, t, r)
         cands.append(cand(cid, expr, ds, fam, None, fid,
                           "repair" if abs(s) >= 0.6 * 1.25 else "reject", "sharpe",
-                          region="EUR" if ds == "news12" else "USA"))
+                          **(EUR if ds == "news12" else {})))
 
     # ---- 5 turnover failures (playbook has turnover -> repair) ----------------------
     turnover_fails = [
@@ -173,7 +177,7 @@ def main() -> None:
         fid = f"sim_{cid}"
         fixtures[fid] = metrics(1.58, 21.0, 12.5, sub=sub, cutoff=cutoff, self_corr=0.25)
         cands.append(cand(cid, expr, ds, fam, None, fid, "repair", "sub_universe",
-                          region="EUR" if ds == "news12" else "USA"))
+                          **(EUR if ds == "news12" else {})))
 
     # ---- 3 self-correlation failures (fixture provides the correlation) -------------
     for cid, expr, ds, fam, sc in [

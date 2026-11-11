@@ -181,6 +181,9 @@ python -m alpha_research.cli brain capture --candidates generated/batch1.json --
 python -m alpha_research.cli brain operators                 # diff against config/fastexpr.yaml (OQ-10)
 python -m alpha_research.cli brain datafields --region USA --universe TOP3000 --delay 1 \
     --out captures/datafields_usa.json                       # then: generate --datafields ...
+python -m alpha_research.cli brain datasets --region USA --universe TOP3000 --delay 1 \
+    --out captures/datasets_usa.json                         # datasets with field counts
+python scripts/brain_discovery.py --max-datasets 20         # every region/delay, one login (see below)
 python -m alpha_research.cli run --client real --candidates generated/batch1.json \
     --config <config with a holdout set>
 ```
@@ -202,7 +205,9 @@ sends `Retry-After` or a `progress` value, treats `ERROR`, `FAIL`, `TIMEOUT` and
 stats, yearly stats, daily PnL and self-correlation. A missing piece becomes `None` with a note, never zero. A 401 triggers
 one fresh login, a 429 waits (up to `rate_limit_max_wait_seconds`), and 5xx or network
 errors are retried by the simulator. A submission BRAIN rejects (400) becomes a `failed`
-result. Accounts that require biometric login are not supported; the error says so.
+result. When BRAIN asks for biometric verification (our consultant account does on every
+new login), the CLI prints the link and waits for Enter in a terminal; without a terminal
+the login fails with an error that says so.
 
 Mapping (matches BRAIN's samples): `is.sharpe/fitness/turnover/returns/drawdown` as
 fractions, `is.margin` times 10,000 into bps, sub-universe Sharpe and cutoff from the
@@ -214,8 +219,8 @@ only for stage `IS`. Checks that are neither PASS nor FAIL are left out. Long an
 PnL and the drawdown date are not in BRAIN's response and stay `None`. The test-period
 stats (`alpha.test`) are recorded in the notes, not gated.
 
-BRAIN does not take start and end dates; it simulates its own period (2019-01-01 to
-2023-12-31 on our account). The result notes record it as `brain_period: start..end`, and
+BRAIN does not take start and end dates; it simulates its own period (2014-01-01 to
+2023-12-31 on our consultant account; 2019-01-01 to 2023-12-31 at user level). The result notes record it as `brain_period: start..end`, and
 the simulator marks a result `invalid` if that period overlaps the holdout, so a change in
 BRAIN's default period cannot leak the holdout (OQ-12). BRAIN's `testPeriod` setting is
 not used. Fixed settings sent with every simulation (instrument type,
@@ -429,6 +434,88 @@ set, so the results of a hand rescue become evidence for the learner too.
 - A Strategy hypothesis on a catalog dataset no arm covers gets its own arms; a candidate's `dataset` follows its fields (`generator.signal_dataset`).
 - Critic and judge (`critic-v3`, `judge-v3`) revise fixable defects instead of dropping them.
 
+## Consultant account (2026-11-10)
+
+The account moved to consultant level (`level` GOLD). A discovery run (one login, saved in
+`captures/consultant_20261110/`, git-ignored) found what changed, and the code follows it:
+
+- **Regions and settings.** 11 regions (ALL, USA, GLB, EUR, ASI, CHN, JPN, AMR, IND, DEU,
+  GBR), each with its own universes and delays: `schemas.REGION_SETTINGS`, checked by a test
+  against `tests/fixtures/brain_api_capture_consultant/simulation_options.json`. New
+  neutralizations: the factor ones (REVERSION_AND_MOMENTUM, STATISTICAL, CROWDING, FAST,
+  SLOW, SLOW_AND_FAST) and COUNTRY (GLB, EUR, ASI, AMR). `neutralizations_for(region)`
+  is what the Generator and Repair Agent accept, and the Generator (`gen-v3`) and Repair
+  (`repair-v5`) prompts list the region's set. `set_neutralization` only moves along the
+  group scale and leaves a factor neutralization alone.
+- **Operators.** 82 (16 more); `config/fastexpr.yaml` matches `brain operators`.
+- **Limits and period.** In-sample 2014-01-01..2023-12-31; LOW_SHARPE limit 1.58 (was 1.25),
+  so `gates.sharpe_min` is 1.58.
+- **Checks.** A fresh simulation's checks are provisional (LOW_SHARPE is a WARNING there,
+  SELF_CORRELATION PENDING). `RealBrainClient` therefore fetches `GET /alphas/<id>/check`
+  (`brain.yaml` `fetch_submission_check`) and `translate(check=)` prefers its results. New
+  checks LOW_2Y_SHARPE, IS_LADDER_SHARPE, PROD_CORRELATION, DATA_DIVERSITY and others map to
+  failure classes in `evaluator.check_class`. Checks about submitting rather than the alpha
+  (quota, themes, pyramid, Osmosis, Power Pool) are listed in `gates.brain_checks_ignored`
+  and never gate. WARNING checks are noted with value and limit, not gated.
+- **Datafields.** USA/TOP3000/D1 alone has 289 datasets and more than 10,000 fields, and
+  BRAIN returns nothing past offset 10,000. `list_datafields` then fetches one dataset at a
+  time (`brain datafields` prints progress). `brain datasets` lists datasets with field
+  counts. `scripts/brain_discovery.py` covers every region and delay (largest universe each)
+  in one login: it saves each full dataset list, then fields for `--max-datasets` datasets
+  (default 20; 0 = all, more than a day since USA D1 alone has ~80,600 fields). `pick_datasets`
+  takes the most-used dataset per category, then the most used, with `--explore-share` (0.3)
+  of the slots for the least-explored datasets (lowest alphaCount, coverage >= 0.5). Each
+  dataset's fields go to `parts/<tag>/<dataset>.json` as they arrive and
+  `datafields_<tag>.json` is rebuilt from all parts, so a rerun or a larger cap only fetches
+  what is missing. BRAIN's 502s are retried.
+- **Fixture.** `tests/fixtures/brain_api_capture_consultant/` (acc_01 again, plus the
+  submission checks and `brain options`; see SOURCE.md there).
+
+## Regions, new checks and repairs (2026-11-11)
+
+Owner's request: every agent knows the consultant features, the Repair Agent repairs the
+new checks, and each agent is tuned per region, because what works in one region may not
+work in another.
+
+- **BRAIN's values are kept.** `ResultRecord.check_values` holds every check's value and
+  limit (LOW_2Y_SHARPE 1.05 / 1.58, ...); `ResultRecord.alt_stats` holds BRAIN's
+  risk-neutralized and investability-constrained stats. The `brain:<CHECK>` gates carry
+  them, so near-miss limits apply to the new checks too.
+- **New failure classes.** `recent_sharpe` (LOW_2Y_SHARPE, IS_LADDER_SHARPE: the signal faded
+  in the last in-sample years) and `prod_correlation` (PROD_CORRELATION: too close to
+  BRAIN's production alphas, which we cannot see). Priority: self_correlation,
+  prod_correlation, turnover, sharpe, fitness, recent_sharpe, sub_universe, ...
+  `repair.near_miss_share.recent_sharpe` 0.6.
+- **New levers.** One mechanical lever per neutralization off the group scale
+  (`neutralize_statistical`, `neutralize_crowding`, `neutralize_reversion_and_momentum`,
+  `neutralize_fast`, `neutralize_slow`, `neutralize_slow_and_fast`, `neutralize_country`),
+  each only where the region allows it, so the learner scores each one separately.
+  Model levers `restore_recent_performance` and `differentiate_from_production`.
+  `change_universe` knows each region's universe sizes. The playbook lists the factor
+  levers as priors for sharpe, fitness, self_correlation, drawdown and the two new classes.
+  The repair model sees BRAIN's failed checks and its risk-neutralized Sharpe (a much higher
+  one says a factor neutralization should help).
+- **Per-region limits.** `gates.limits_from_brain: true`: our Sharpe, fitness, turnover and
+  self-correlation gates use the limit BRAIN reports for that alpha's own check, so they
+  follow BRAIN per region and delay. `regions:` in thresholds.yaml (`USA` or `USA/D0` keys)
+  overrides a limit where needed; `Config.for_settings(region, delay)` applies it, and the
+  pipeline uses the candidate's region.
+- **Per-region lever learning.** Every repair is also evidence for the child's region. A
+  region's estimate starts at the all-region estimate, worth `repair.region_prior_strength`
+  repairs (agents.yaml, 2), and moves with the region's own results; the ranking and the
+  past repairs shown to the model use the alpha's region. `cli levers` prints
+  `lever_stats_by_region`.
+- **Region-aware prompts.** `brain_context(config, regions)` (every agent) explains group and
+  factor neutralizations, the recent-Sharpe and production-correlation checks, and lists
+  each plan region's universes, delays, neutralizations and limit overrides. The Generator
+  is told its market and gets `region_notes` from memory each round (accepts, top failures,
+  how each neutralization fared and which repairs worked in that region). Strategy sees a
+  per-region breakdown and may write `region_guidance`, which only that region's new arms
+  get. Versions: prefilter-v3, critic-v4, judge-v4, repair-v5, strategy-v4, gen-v3.
+- **Director per region.** `director.region_floor_share` (0.5) gives every plan region at
+  least floor(share x slots / regions) slots a round; `director.max_region_share` (0.6)
+  caps a region while another is below it. Arm posteriors are already per region.
+
 ## Regenerating fixtures
 
 ```bash
@@ -486,6 +573,17 @@ screenshot values (aggregate plus yearly rows for 2019 to 2023).
 - **OQ-16 Overfitting and repair budget defaults.** `auditor.min_deflated_sharpe` 0.0 with
   `trials_scope: dataset`; repair `max_depth` 2, `max_trials_per_root` 4, `patience` 2;
   `director.max_arm_share` 0.4; generator `datafield_exploration_share` 0.3. Review them.
+- **OQ-17 Consultant checks.** Builder defaults (2026-11-10): `gates.brain_checks_ignored`
+  skips the submission-only checks, including POWER_POOL_CORRELATION (applies to Power Pool
+  submissions only?); WARNING checks (CLUSTER_TEST, ...) are not gated; what CLUSTER_TEST
+  measures is unknown; BRAIN's limits outside USA delay 1 (e.g. Sharpe for delay 0 or other
+  regions) are unknown, so `gates.sharpe_min` is the USA D1 value and BRAIN's own check
+  decides per alpha. Confirm or correct.
+- **OQ-18 Region and new-check defaults.** Builder defaults (2026-11-11): the factor-lever
+  priors in the playbook, `near_miss_share.recent_sharpe` 0.6, `region_prior_strength` 2,
+  `region_floor_share` 0.5, `max_region_share` 0.6, `limits_from_brain: true`, and the
+  `change_universe` size order per region (GLB, ALL, CHN, AMR, IND, DEU, GBR have none).
+  What DATA_DIVERSITY measures is unknown, so it stays class "other" (no repair).
 - **OQ-14 Data Scientist input.** The datafield audit needs a dates × instruments matrix
   per field. BRAIN's API (as far as the web app shows) does not provide raw data, so decide
   the source: BRAIN's per-field statistics, an outside data source, or probe simulations.

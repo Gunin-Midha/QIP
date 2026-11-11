@@ -8,7 +8,9 @@ BRAIN's own checks (owner's choice 2026-11-04: "use BRAIN's checks only"). With
 LOW_SHARPE, CONCENTRATED_WEIGHT, LOW_SUB_UNIVERSE_SHARPE, ...) becomes a hard gate named
 ``brain:<CHECK>``, so whatever BRAIN fails is a definite failure of its class, even where
 our own limit is null (concentration, OQ-4). We set no limits of our own for those checks.
-A check BRAIN reports as WARNING or PENDING is not a PASS/FAIL and is not a gate.
+A check BRAIN reports as WARNING or PENDING is not a PASS/FAIL and is not a gate, and
+neither is a check listed in ``gates.brain_checks_ignored`` (checks about submitting, such as
+the daily submission quota, not about the alpha).
 
 Decision precedence (owner's choice: a definite failure beats "not evaluable"):
 1. status != complete             -> reject / incomplete
@@ -24,6 +26,7 @@ Decision precedence (owner's choice: a definite failure beats "not evaluable"):
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Iterable
 
 from .config import NOT_CONFIGURED, Config
@@ -35,9 +38,11 @@ SOFT_GATES = ("weight_concentration", "drawdown")
 
 FAILURE_PRIORITY = (
     "self_correlation",
+    "prod_correlation",
     "turnover",
     "sharpe",
     "fitness",
+    "recent_sharpe",
     "sub_universe",
     "concentration",
     "drawdown",
@@ -55,6 +60,11 @@ BRAIN_CHECK_TO_CLASS = {
     "CONCENTRATED_WEIGHT": "concentration",
     "LOW_SUB_UNIVERSE_SHARPE": "sub_universe",
     "SELF_CORRELATION": "self_correlation",
+    # consultant level (live capture 2026-11-10)
+    "LOW_2Y_SHARPE": "recent_sharpe",       # Sharpe of the last two in-sample years
+    "IS_LADDER_SHARPE": "recent_sharpe",    # Sharpe over the last N in-sample years
+    "PROD_CORRELATION": "prod_correlation",  # correlation with BRAIN's production alphas
+    "POWER_POOL_CORRELATION": "prod_correlation",
 }
 BRAIN_GATE_PREFIX = "brain:"
 
@@ -87,6 +97,10 @@ def is_hard(name: str) -> bool:
 
 
 def _brain_value(name: str, r: ResultRecord):
+    """(value, limit) of a BRAIN check: BRAIN's own when it sent them, else our fields."""
+    own = r.check_values.get(name) or {}
+    if own.get("value") is not None or own.get("limit") is not None:
+        return own.get("value"), own.get("limit")
     return {"LOW_SHARPE": (r.sharpe, None), "LOW_FITNESS": (r.fitness, None),
             "LOW_TURNOVER": (r.turnover, None), "HIGH_TURNOVER": (r.turnover, None),
             "CONCENTRATED_WEIGHT": (r.weight_concentration, None),
@@ -102,8 +116,25 @@ def _gt_gate(name: str, value, threshold) -> GateResult:
     return GateResult(name, value > threshold, value, threshold, f"> {threshold}")
 
 
-def run_gates(result: ResultRecord, config: Config) -> list[GateResult]:
+# BRAIN check whose limit replaces our gate key when gates.limits_from_brain is on
+BRAIN_LIMIT_FOR = {"sharpe_min": "LOW_SHARPE", "fitness_min": "LOW_FITNESS",
+                   "turnover_min": "LOW_TURNOVER", "turnover_max": "HIGH_TURNOVER",
+                   "self_correlation_max": "SELF_CORRELATION"}
+
+
+def gates_for(result: ResultRecord, config: Config):
+    """The gate limits for this result: config (with its region overrides, applied by the
+    caller), then BRAIN's reported limit per check when ``gates.limits_from_brain``."""
     g = config.gates
+    if not g.limits_from_brain:
+        return g
+    limits = {key: (result.check_values.get(check) or {}).get("limit")
+              for key, check in BRAIN_LIMIT_FOR.items()}
+    return dataclasses.replace(g, **{k: v for k, v in limits.items() if v is not None})
+
+
+def run_gates(result: ResultRecord, config: Config) -> list[GateResult]:
+    g = gates_for(result, config)
     gates = [
         _gt_gate("sharpe", result.sharpe, g.sharpe_min),
         _gt_gate("fitness", result.fitness, g.fitness_min),
@@ -136,7 +167,10 @@ def run_gates(result: ResultRecord, config: Config) -> list[GateResult]:
                                 ">= cutoff from result"))
 
     if g.use_brain_checks:
+        ignored = set(g.brain_checks_ignored)
         for name, ok in sorted((result.checks or {}).items()):
+            if name in ignored:
+                continue
             value, threshold = _brain_value(name, result)
             gates.append(GateResult(BRAIN_GATE_PREFIX + name, ok, value, threshold,
                                     "BRAIN check " + ("PASS" if ok else "FAIL")))

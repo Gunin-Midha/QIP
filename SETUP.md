@@ -43,7 +43,7 @@ Qwen or BRAIN.
 PYTHONPATH=src python3 -m pytest -q
 ```
 
-You should see about 488 tests pass in a few seconds. The tests never use the internet or
+You should see about 579 tests pass in a few seconds. The tests never use the internet or
 any key. If they fail, stop here and ask in the group.
 
 ## 4. Get your free API keys
@@ -81,6 +81,10 @@ To check one is set without printing it: `[ -n "$GROQ_API_KEY" ] && echo set`
 Run these one at a time. Each saves its output under `captures/` (ignored by git, so it
 stays on your laptop).
 
+BRAIN may ask for biometric verification on every new login (our consultant account
+does). The command then prints a link: open it in a browser, verify, come back to the
+terminal and press Enter. Each command below logs in again, so expect one check per command.
+
 ```bash
 PYTHONPATH=src python3 -m alpha_research.cli brain auth          # login works?
 PYTHONPATH=src python3 -m alpha_research.cli brain options       # what your account allows
@@ -89,6 +93,14 @@ PYTHONPATH=src python3 -m alpha_research.cli brain datafields \
     --region USA --universe TOP3000 --delay 1 \
     --out captures/datafields_usa_top3000_d1.json               # needed by later steps
 ```
+
+The datafield download can take 10-30 minutes: the consultant catalog has more than
+10,000 fields, so it goes one dataset at a time and prints progress. For every region
+and delay in one login (one biometric check), run `PYTHONPATH=src python3
+scripts/brain_discovery.py` instead. It saves every dataset list but downloads fields
+for only 20 datasets per region/delay (the most used per category plus a few little-explored
+ones; `--max-datasets N` changes it, 0 = all, which takes more than a day). Each dataset is
+saved as it arrives, so Ctrl+C loses nothing; rerun it to fill in anything that failed.
 
 `brain operators` should report no differences. If it lists operators that are "in seed
 list, not on BRAIN" or "on BRAIN, not in seed list", your account level differs from ours:

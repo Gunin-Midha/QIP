@@ -34,6 +34,12 @@ Method
                 1/3 of the above, so the playbook's single levers learn from combinations
 4. Per (failure class, lever), the weighted rewards update a Beta(prior_a, prior_b)
    posterior: a = prior_a + sum(w x reward), b = prior_b + sum(w x (1 - reward)).
+   Per region (the child's), the same evidence also builds a region posterior whose prior
+   is the all-region estimate m worth ``region_prior_strength`` (k) events:
+   a = k x m + sum(w x reward), b = k x (1 - m) + sum(w x (1 - reward)). A region with no
+   evidence ranks like all regions together; as its own repairs accumulate they take over,
+   so a lever that works in USA is a starting guess in EUR, not a rule. Ranking and the
+   past repairs shown to the model use the alpha's region.
 5. Family budget (``family_budget``), so repairs never concentrate on the few alphas that
    came close: a lineage (an original candidate and all its repair descendants) may be
    repaired only while the next child's generation is at most ``max_depth``, fewer than
@@ -91,6 +97,7 @@ class RepairLearningConfig:
     max_trials_per_root: int = 4         # repair simulations per original candidate
     patience: int = 2                    # stop a lineage after this many non-improving children
     unmeasured_failure_penalty: float = 0.5   # distance added by a failure with no value
+    region_prior_strength: float = 2.0   # events the all-region estimate counts for in a region
 
     @classmethod
     def from_dict(cls, sec: dict) -> "RepairLearningConfig":
@@ -130,7 +137,8 @@ class RepairLearningConfig:
                    max_depth=count("max_depth", 1),
                    max_trials_per_root=count("max_trials_per_root", 1),
                    patience=count("patience", 1),
-                   unmeasured_failure_penalty=float(num("unmeasured_failure_penalty", 0, 10)))
+                   unmeasured_failure_penalty=float(num("unmeasured_failure_penalty", 0, 10)),
+                   region_prior_strength=float(num("region_prior_strength", 0, 1000)))
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +251,7 @@ class RepairEvent:
     settings_change: dict           # setting -> [parent value, child value], only changed ones
     role: str = "target"            # target | secondary | part
     weight: float = 1.0
+    region: str | None = None       # the child's region
 
 
 _SETTINGS = ("universe", "decay", "neutralization", "truncation")
@@ -305,7 +314,7 @@ def repair_events(outcomes: Iterable[dict],
                         reward=reward, fixed=fixed, improved=improved, collateral=collateral,
                         slack_before=before, slack_after=after,
                         parent_expression=p.expression, child_expression=c.expression,
-                        settings_change=change)
+                        settings_change=change, region=c.region)
             events.append(RepairEvent(lever=c.lever, role=role, weight=w, **base))
             for part in parts:
                 events.append(RepairEvent(lever=part, role="part", weight=w / len(parts),
@@ -355,26 +364,39 @@ class LeverRecord:
 class LeverStats:
     prior: tuple[float, float] = (1.0, 1.0)
     records: dict = field(default_factory=dict)   # (failure class, lever) -> LeverRecord
+    by_region: dict = field(default_factory=dict)  # (region, failure class, lever) -> LeverRecord
+    region_strength: float = 2.0
 
     @classmethod
-    def from_events(cls, events: Iterable[RepairEvent],
-                    prior: tuple[float, float] = (1.0, 1.0)) -> "LeverStats":
-        stats = cls(prior)
+    def from_events(cls, events: Iterable[RepairEvent], prior: tuple[float, float] = (1.0, 1.0),
+                    region_strength: float = 2.0) -> "LeverStats":
+        stats = cls(prior, region_strength=region_strength)
         for e in events:
-            rec = stats.records.setdefault((e.failure_class, e.lever), LeverRecord())
-            rec.n += e.weight
-            rec.reward += e.weight * e.reward
-            rec.events += 1
-            rec.fixed += e.fixed
-            rec.improved += e.improved
+            keys = [(stats.records, (e.failure_class, e.lever))]
+            if e.region:
+                keys.append((stats.by_region, (e.region, e.failure_class, e.lever)))
+            for table, key in keys:
+                rec = table.setdefault(key, LeverRecord())
+                rec.n += e.weight
+                rec.reward += e.weight * e.reward
+                rec.events += 1
+                rec.fixed += e.fixed
+                rec.improved += e.improved
         return stats
 
-    def posterior(self, failure_class: str, lever: str) -> tuple[float, float]:
+    def posterior(self, failure_class: str, lever: str,
+                  region: str | None = None) -> tuple[float, float]:
         rec = self.records.get((failure_class, lever), LeverRecord())
-        return self.prior[0] + rec.reward, self.prior[1] + rec.n - rec.reward
+        a, b = self.prior[0] + rec.reward, self.prior[1] + rec.n - rec.reward
+        own = self.by_region.get((region, failure_class, lever)) if region else None
+        if own is None:
+            return a, b
+        m, k = a / (a + b), self.region_strength
+        # floor keeps a valid Beta when k = 0 and the region's evidence is all 0 or all 1
+        return max(k * m + own.reward, 1e-6), max(k * (1 - m) + own.n - own.reward, 1e-6)
 
-    def mean(self, failure_class: str, lever: str) -> float:
-        a, b = self.posterior(failure_class, lever)
+    def mean(self, failure_class: str, lever: str, region: str | None = None) -> float:
+        a, b = self.posterior(failure_class, lever, region)
         return a / (a + b)
 
     def learned_combos(self, failure_class: str) -> list[Lever]:
@@ -392,12 +414,21 @@ class LeverStats:
                 for (cls, lever), r in self.records.items()]
         return sorted(rows, key=lambda x: (x["failure_class"], -x["posterior_mean"]))
 
+    def region_table(self) -> list[dict]:
+        """Like ``table`` per (region, class, lever), with the region's shrunk estimate."""
+        rows = [{"region": reg, "failure_class": cls, "lever": lever, "events": r.events,
+                 "evidence_weight": round(r.n, 3), "fixed": r.fixed, "improved": r.improved,
+                 "mean_reward": round(r.reward / r.n, 3) if r.n else None,
+                 "posterior_mean": round(self.mean(cls, lever, reg), 3)}
+                for (reg, cls, lever), r in self.by_region.items()]
+        return sorted(rows, key=lambda x: (x["region"], x["failure_class"], -x["posterior_mean"]))
+
 
 def rank_levers(playbook: Playbook, primary: str, failing: Iterable[str], stats: LeverStats,
-                config: RepairLearningConfig,
-                rng: random.Random | None = None) -> list[tuple[Lever, float]]:
+                config: RepairLearningConfig, rng: random.Random | None = None,
+                region: str | None = None) -> list[tuple[Lever, float]]:
     """The primary class's levers plus its learned combinations, best first, each with its
-    score (see module doc)."""
+    score (see module doc), using the region's estimates when ``region`` is given."""
     if config.order == "playbook":
         return _pin([(lv, 0.0) for lv in playbook.entries.get(primary, [])])
 
@@ -419,9 +450,9 @@ def rank_levers(playbook: Playbook, primary: str, failing: Iterable[str], stats:
             if lv.name not in names_by_class[cls]:
                 continue
             if config.order == "thompson":
-                score += w * rng.betavariate(*stats.posterior(cls, lv.name))
+                score += w * rng.betavariate(*stats.posterior(cls, lv.name, region))
             else:
-                score += w * stats.mean(cls, lv.name)
+                score += w * stats.mean(cls, lv.name, region)
         scored.append((-score, pos, lv))
     scored.sort(key=lambda t: (t[0], t[1]))
     return _pin([(lv, round(-s, 4)) for s, _, lv in scored])
@@ -440,11 +471,12 @@ def _pin(ranked: list[tuple[Lever, float]]) -> list[tuple[Lever, float]]:
 
 
 def successful_examples(events: Iterable[RepairEvent], failure_class: str,
-                        limit: int) -> list[dict]:
-    """The best past repairs of this class (reward >= 0.5), newest first, for the prompt."""
+                        limit: int, region: str | None = None) -> list[dict]:
+    """The best past repairs of this class (reward >= 0.5) for the prompt: the region's
+    own first, then by reward, newest first among equals."""
     good = [e for e in reversed(list(events))
             if e.failure_class == failure_class and e.reward >= 0.5 and e.role == "target"]
-    good.sort(key=lambda e: -e.reward)  # stable: newest first among equal rewards
-    return [{"lever": e.lever, "before": e.parent_expression, "after": e.child_expression,
-             "settings_change": e.settings_change,
+    good.sort(key=lambda e: (region is not None and e.region != region, -e.reward))  # stable
+    return [{"lever": e.lever, "region": e.region, "before": e.parent_expression,
+             "after": e.child_expression, "settings_change": e.settings_change,
              "result": "fixed" if e.fixed else "improved"} for e in good[:limit]]
