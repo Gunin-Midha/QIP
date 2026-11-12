@@ -65,6 +65,10 @@ class GeneratorConfig:
     # relevance, so the model sees more than the obvious inputs (owner 2026-11-04: keep
     # the search diverse)
     datafield_exploration_share: float = 0.0
+    # field roles from the start of BRAIN's own description (config/generator.yaml
+    # field_roles): identifier/text fields are not listed, date/time fields are tagged
+    id_patterns: tuple = ()
+    time_patterns: tuple = ()
 
 
 def _cfg_int(d: dict, key: str, *, nullable: bool = False, minimum: int = 0) -> int | None:
@@ -103,7 +107,25 @@ def load_generator_config(path: str | Path) -> GeneratorConfig:
             max_chars=_cfg_int(g, "max_expression_chars", nullable=True, minimum=1),
         ),
         datafield_exploration_share=_cfg_share(g, "datafield_exploration_share"),
+        **_cfg_roles(g.get("field_roles")),
     )
+
+
+def _cfg_roles(raw) -> dict:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or set(raw) - {"id", "time"}:
+        raise ConfigError("generator config: 'field_roles' must map 'id' and 'time' to lists")
+    out = {}
+    for role in ("id", "time"):
+        pats = raw.get(role) or []
+        if not isinstance(pats, list) or not all(isinstance(p, str) and p for p in pats):
+            raise ConfigError(f"generator config: field_roles.{role} must be a list of patterns")
+        try:
+            out[f"{role}_patterns"] = tuple(re.compile(p, re.I) for p in pats)
+        except re.error as exc:
+            raise ConfigError(f"generator config: bad field_roles.{role} pattern: {exc}") from exc
+    return out
 
 
 def _cfg_share(d: dict, key: str) -> float:
@@ -193,7 +215,7 @@ def load_datafield_meta(path: str | Path) -> dict[str, dict]:
             ds = x.get("dataset")
             meta[x["id"]] = {"coverage": x.get("coverage"), "alpha_count": x.get("alphaCount"),
                              "dataset": ds.get("id") if isinstance(ds, dict) else ds,
-                             "type": x.get("type")}
+                             "type": x.get("type"), "description": x.get("description")}
     return meta
 
 
@@ -286,22 +308,52 @@ def _rank_datafields(catalog: Collection[str], text: str, limit: int,
 
 NOT_SIGNALS = {"SYMBOL", "UNIVERSE"}   # identifiers and universe flags: never sampled
 TYPE_HINTS = {"VECTOR": "vector: wrap in vec_avg or vec_sum", "GROUP": "group"}
+TIME_HINT = "date/time: for event timing, e.g. days_from_last_change, not as a score"
+
+
+def field_role(name: str, meta: dict, config: "GeneratorConfig | None") -> str:
+    """'id' (identifier, code, name or raw text: no ordering information), 'time' (a date
+    or time of day) or 'signal'. From BRAIN's type and the start of its description;
+    GROUP fields are groups, never ids."""
+    m = meta.get(name) or {}
+    if m.get("type") in NOT_SIGNALS:
+        return "id"
+    if m.get("type") == "GROUP" or config is None:
+        return "signal"
+    desc = (m.get("description") or "").strip()
+    if any(p.match(desc) for p in config.id_patterns):
+        return "id"
+    if any(p.match(desc) for p in config.time_patterns):
+        return "time"
+    return "signal"
+
+
+def named_fields(catalog: Collection[str], text: str) -> list[str]:
+    """Catalog fields written out in the task text, in the order they appear."""
+    found = {m.group(): m.start() for m in re.finditer(r"[A-Za-z_][A-Za-z0-9_]*", text)
+             if m.group() in catalog}
+    return sorted(found, key=found.get)
 
 
 def select_datafields(catalog: Collection[str], text: str, limit: int,
-                      explore_share: float = 0.0,
-                      meta: dict | None = None) -> tuple[list[str], list[str]]:
-    """(relevant, exploration) fields for the prompt. The relevant part is
-    ``_rank_datafields``; the exploration part (``explore_share`` of ``limit``) is drawn
-    from the rest of the catalog one dataset at a time in turn, so every dataset can show
-    up, in an order fixed by the text (the same task always sees the same fields)."""
+                      explore_share: float = 0.0, meta: dict | None = None,
+                      config: "GeneratorConfig | None" = None) -> tuple[list[str], list[str]]:
+    """(relevant, exploration) fields for the prompt. Fields the task names come first;
+    then ``_rank_datafields``; the exploration part (``explore_share`` of ``limit``) is
+    drawn from the rest of the catalog one dataset at a time in turn, so every dataset can
+    show up, in an order fixed by the text (the same task always sees the same fields).
+    Identifier/text fields (``field_role`` 'id') are left out unless the task names them."""
     meta = meta or {}
-    n_explore = round(limit * explore_share) if len(catalog) > limit else 0
-    relevant = _rank_datafields(catalog, text, limit - n_explore, meta)
+    catalog = set(catalog)
+    named = named_fields(catalog, text)
+    pool = [f for f in catalog if f in named or field_role(f, meta, config) != "id"]
+    n_explore = round(limit * explore_share) if len(pool) > limit else 0
+    ranked = [f for f in _rank_datafields(pool, text, len(pool), meta) if f not in named]
+    relevant = (named + ranked)[:max(limit - n_explore, len(named))]
     chosen = set(relevant)
     rng = random.Random(hashlib.sha1(text.encode()).hexdigest())
     by_ds: dict[str, list[str]] = {}
-    for f in sorted(catalog):
+    for f in sorted(pool):
         if f not in chosen and (meta.get(f) or {}).get("type") not in NOT_SIGNALS:
             by_ds.setdefault((meta.get(f) or {}).get("dataset") or "unknown", []).append(f)
     for fields in by_ds.values():
@@ -316,9 +368,12 @@ def select_datafields(catalog: Collection[str], text: str, limit: int,
     return relevant, explore
 
 
-def _annotate(name: str, meta: dict) -> str:
+def _annotate(name: str, meta: dict, config: "GeneratorConfig | None" = None) -> str:
     m = meta.get(name) or {}
     bits = [TYPE_HINTS[m["type"]]] if m.get("type") in TYPE_HINTS else []
+    role = field_role(name, meta, config)
+    if role != "signal":
+        bits.append(TIME_HINT if role == "time" else "identifier/text: no ranking information")
     if isinstance(m.get("coverage"), (int, float)):
         bits.append(f"cov {m['coverage'] * 100:.0f}%")
     if isinstance(m.get("alpha_count"), (int, float)):
@@ -361,26 +416,39 @@ def build_system_prompt(spec: FastExprSpec, datafields: Collection[str] | None,
         lines.append(f"Market: {market}. Fields, liquidity and what works differ between "
                      "regions; write for this market.")
     if neutralizations:
+        # any neutralization the region allows; a factor one or NONE needs a reason, which
+        # the Critic reviews (a factor one can remove the signal itself; NONE keeps a market
+        # bet), and the region's results in the lessons below show what worked there
         groups = [n for n in neutralizations if n in GROUP_NEUTRALIZATIONS]
         factors = [n for n in neutralizations if n not in GROUP_NEUTRALIZATIONS and n != "NONE"]
-        lines.append(f"Neutralizations allowed (optional per alpha; otherwise the settings' "
-                     f"default): {', '.join(neutralizations)}. "
-                     f"{', '.join(groups)} neutralize within that group"
-                     + (f"; {', '.join(factors)} are BRAIN's factor neutralizations" if factors else "")
-                     + ".")
+        parts = [f"group: {', '.join(groups)} (neutralize within that group; the usual choice)"]
+        if factors:
+            parts.append(f"factor: {', '.join(factors)} (BRAIN's risk models; they can remove "
+                         "the signal itself when the signal is close to the factor)")
+        if "NONE" in neutralizations:
+            parts.append("NONE (keeps a market bet)")
+        lines.append("Neutralization (optional per alpha; otherwise the settings' default): "
+                     + "; ".join(parts) + ". A factor neutralization or NONE needs "
+                     "\"neutralization_reason\": one line on why this signal needs it. The "
+                     "region's results in the lessons below (if any) show what worked there.")
     if datafields is not None:
         meta = meta or {}
         shown, explore = select_datafields(datafields, relevance_text,
                                            config.max_datafields_in_prompt,
-                                           config.datafield_exploration_share, meta)
+                                           config.datafield_exploration_share, meta, config)
+        named = named_fields(set(datafields), relevance_text)
+        if named:
+            lines.append("Fields named in the task (build the signal on these; use other "
+                         "fields only to condition, scale or combine): "
+                         + ", ".join(_annotate(f, meta, config) for f in named))
         lines.append(f"Datafields (use only these and the base fields; "
                      f"{len(shown) + len(explore)} of {len(datafields)} shown). Most relevant "
                      f"to this task:")
-        lines.append("  " + ", ".join(_annotate(f, meta) for f in shown))
+        lines.append("  " + ", ".join(_annotate(f, meta, config) for f in shown if f not in named))
         if explore:
             lines.append("From across the other datasets (optional; for combinations or "
                          "conditioning beyond the obvious inputs):")
-            lines.append("  " + ", ".join(_annotate(f, meta) for f in explore))
+            lines.append("  " + ", ".join(_annotate(f, meta, config) for f in explore))
         if meta:
             lines.append("In brackets: cov = share of stocks with a value (for a low-coverage "
                          "field consider ts_backfill or group_backfill so more stocks carry a "
@@ -419,7 +487,8 @@ _ALPHA_FORMAT = (
     'this expression expresses the idea", "rationale": "why it should predict returns and '
     'why the sign is right", "family": "price_volume | fundamentals | analyst | sentiment | '
     'other (snake_case, your best label)", "decay": <optional integer >= 0>, '
-    '"neutralization": "<optional: one of the neutralizations allowed above>"}]}')
+    '"neutralization": "<optional: one of the neutralizations listed above>", '
+    '"neutralization_reason": "<one line; required for a factor neutralization or NONE>"}]}')
 
 
 def _generate_prompt(hypothesis: str, context: str | None, k: int) -> str:
@@ -668,11 +737,21 @@ class AlphaGenerator:
             expr = expr.strip()
             a = analyze(expr, self.spec, datafields=self.catalog,
                         limits=self.config.limits)
-            if a.ok:
+            errors = list(a.errors) or self._role_errors(a)
+            if not errors:
                 good.append(_Draft(expr, raw, a))
             else:
-                bad.append(Rejected(expr, unit.hypothesis, list(a.errors)))
+                bad.append(Rejected(expr, unit.hypothesis, errors))
         return good, bad
+
+    def _role_errors(self, a: Analysis) -> list[str]:
+        """An alpha whose only datafields are identifiers or text carries no signal."""
+        own = [f for f in a.fields_used if f not in self.spec.base_fields]
+        ids = [f for f in own if field_role(f, self.field_meta, self.config) == "id"]
+        if own and len(ids) == len(own):
+            return [f"uses only identifier/text fields ({', '.join(ids)}): they carry no ranking "
+                    "information; build the signal on a measured quantity"]
+        return []
 
     def _admit(self, draft: _Draft, unit: _Unit, result: GenerationResult) -> int:
         """Add one candidate. Returns 1 if it was added, 0 if rejected or a duplicate."""
@@ -686,13 +765,22 @@ class AlphaGenerator:
                 decay = d
             else:
                 warnings.append(f"ignored invalid decay {d!r}; used {s.decay}")
-        neut = s.neutralization
+        neut, neut_reason = s.neutralization, None
         if raw.get("neutralization") is not None:
             nz = raw["neutralization"]
-            if isinstance(nz, str) and nz.upper() in neutralizations_for(s.region):
-                neut = nz.upper()
+            nz = nz.upper() if isinstance(nz, str) else nz
+            reason = raw.get("neutralization_reason")
+            reason = reason.strip() if isinstance(reason, str) and reason.strip() else None
+            if nz not in neutralizations_for(s.region):
+                warnings.append(f"ignored neutralization {nz!r} (not allowed in {s.region}); "
+                                f"used {s.neutralization}")
+            elif nz not in GROUP_NEUTRALIZATIONS and reason is None:
+                warnings.append(f"ignored neutralization {nz} (a factor neutralization or NONE "
+                                f"needs a neutralization_reason); used {s.neutralization}")
             else:
-                warnings.append(f"ignored invalid neutralization {nz!r}; used {s.neutralization}")
+                neut = nz
+                if nz not in GROUP_NEUTRALIZATIONS:
+                    neut_reason = f"Neutralization {nz}: {reason}"
 
         hyp = raw.get("hypothesis")
         hyp = hyp.strip() if isinstance(hyp, str) and hyp.strip() else unit.hypothesis
@@ -727,6 +815,9 @@ class AlphaGenerator:
         if warnings:
             result.warnings[cid] = warnings
         rationale = raw.get("rationale")
-        if isinstance(rationale, str) and rationale.strip():
-            result.rationales[cid] = rationale.strip()
+        rationale = rationale.strip() if isinstance(rationale, str) else ""
+        # the Critic sees the reason for a factor neutralization or NONE with the rationale
+        rationale = " ".join(x for x in (rationale, neut_reason) if x)
+        if rationale:
+            result.rationales[cid] = rationale
         return 1

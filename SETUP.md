@@ -83,7 +83,9 @@ stays on your laptop).
 
 BRAIN may ask for biometric verification on every new login (our consultant account
 does). The command then prints a link: open it in a browser, verify, come back to the
-terminal and press Enter. Each command below logs in again, so expect one check per command.
+terminal and press Enter. The session is then saved (outside the repo, in
+`~/.config/qip/brain_session.txt`, readable only by you) and the next commands reuse it, so
+you verify again only when BRAIN ends the session. `brain logout` deletes it.
 
 ```bash
 PYTHONPATH=src python3 -m alpha_research.cli brain auth          # login works?

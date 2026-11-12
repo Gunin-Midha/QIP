@@ -161,6 +161,68 @@ def test_crash_after_submit_resumes_without_resubmitting(tmp_path, config, candi
     store.close()
 
 
+def test_retryable_failure_is_submitted_once_more(tmp_path, memory, config, candidate):
+    d = write_fixture(tmp_path, "b", {"responses": [
+        {"status": "failed", "retryable": True, "notes": ["brain_simulation_failed: ERROR"]},
+        {"status": "complete", "sharpe": 1.4}]})
+    client = FixtureBrainClient(d, {"c1": "b"})
+    sim, _ = make_sim(client, memory, config)
+    r = sim.run(candidate())
+    assert r.status == "complete" and len(client.submit_calls) == 2
+    assert "retried once" in r.notes[0]
+    assert [x.status for x in memory.results_for("c1")] == ["complete"]
+
+
+def test_plain_failure_is_not_resubmitted(tmp_path, memory, config, candidate):
+    d = write_fixture(tmp_path, "f", {"status": "failed", "notes": ["bad field"]})
+    client = FixtureBrainClient(d, {"c1": "f"})
+    sim, _ = make_sim(client, memory, config)
+    assert sim.run(candidate()).status == "failed"
+    assert len(client.submit_calls) == 1
+
+
+def test_recover_fetches_a_result_brain_finished_after_our_timeout(tmp_path, memory, config,
+                                                                   candidate):
+    # BRAIN keeps running after we stop waiting: 'slow' is running past max_poll_seconds,
+    # then complete when the next run asks
+    d = write_fixture(tmp_path, "slow", {"responses": [{"status": "running"}] * 300
+                                         + [{"status": "complete", "sharpe": 1.4}]})
+    client = FixtureBrainClient(d, {"c1": "slow"})
+    sim, _ = make_sim(client, memory, config)
+    assert sim.run(candidate()).status == "timeout"
+    assert memory.unfinished_submissions() == [{"candidate_id": "c1", "brain_sim_id": "slow"}]
+    client._cursor["slow"] = 300
+    r = sim.recover(candidate(), "slow")
+    assert r.status == "complete" and r.sharpe == 1.4 and r.notes[0].startswith("recovered")
+    assert memory.results_for("c1")[-1].status == "complete"
+    assert memory.unfinished_submissions() == []
+
+
+def test_recover_leaves_running_and_unknown_simulations(tmp_path, memory, config, candidate):
+    d = write_fixture(tmp_path, "run", {"status": "running"})
+    d = write_fixture(tmp_path, "gone", {"status": "failed",
+                                         "notes": ["brain_simulation_failed: simulation not found"]})
+    sim, _ = make_sim(FixtureBrainClient(d, {}), memory, config)
+    memory.put_candidate(candidate())
+    assert sim.recover(candidate(), "run") is None
+    assert sim.recover(candidate(), "gone") is None
+    assert memory.results_for("c1") == []
+
+
+def test_unfinished_submissions_lists_timeouts_and_crashes(memory, candidate):
+    from alpha_research.schemas import ResultRecord
+    for cid in ("t", "crash", "done", "t_no_id"):
+        memory.put_candidate(candidate(candidate_id=cid))
+    memory.put_result(ResultRecord("t", "timeout", brain_sim_id="s_t"))
+    memory.put_pending("crash", "s_crash")
+    memory.put_result(ResultRecord("done", "timeout", brain_sim_id="s_done"))
+    memory.put_result(ResultRecord("done", "complete", brain_sim_id="s_done", sharpe=1.0))
+    memory.put_result(ResultRecord("t_no_id", "timeout"))
+    assert memory.unfinished_submissions() == [
+        {"candidate_id": "crash", "brain_sim_id": "s_crash"},
+        {"candidate_id": "t", "brain_sim_id": "s_t"}]
+
+
 def test_fraction_units_skip_percent_conversion_and_notes_are_kept():
     raw = {"status": "complete", "units": "fraction", "turnover": 0.2578, "returns": 0.1119,
            "drawdown": 0.0704, "notes": ["from client"],

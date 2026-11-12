@@ -2,7 +2,8 @@
 
 Steps per candidate: validate locally, submit (or resume a pending submission), poll with
 retries, normalize the raw dict into a ResultRecord, run the metric validator, persist,
-return.
+return. A failure the client marks ``retryable`` (BRAIN's own error) is submitted once more.
+``recover`` polls an earlier submission once, for results BRAIN finished after our wait.
 
 Time is injected (``sleep`` and ``clock``) so fixture runs can use ``VirtualClock`` and
 never wait in real time. Single-threaded; ``simulator.max_concurrent`` is not used yet
@@ -253,25 +254,63 @@ class Simulator:
         if sim_id is not None:
             log.info("resuming pending submission %s for %s", sim_id, candidate.candidate_id)
         else:
-            try:
-                sim_id = self._with_retry(lambda: self.client.submit(candidate))
-            except TRANSIENT_ERRORS as exc:
-                return self._persist(self._failure(candidate.candidate_id, None, exc, "submit"))
-            except SubmissionRejected as exc:
-                return self._persist(ResultRecord(candidate_id=candidate.candidate_id,
-                                                  status="failed", notes=[f"submit_rejected: {exc}"]))
+            sim_id = self._submit(candidate)
+            if isinstance(sim_id, ResultRecord):
+                return self._persist(sim_id)
             self.memory.put_pending(candidate.candidate_id, sim_id)
 
-        result = self._poll_until_done(candidate.candidate_id, sim_id)
+        result, retryable = self._poll_until_done(candidate.candidate_id, sim_id)
+        if retryable:
+            # BRAIN's own error, not the alpha's: submit once more. The new simulation id
+            # is on the result (pending_submissions keeps the first; it is append-only).
+            first = sim_id
+            log.info("BRAIN error on %s for %s, submitting once more", first,
+                     candidate.candidate_id)
+            sim_id = self._submit(candidate)
+            if isinstance(sim_id, ResultRecord):
+                result = sim_id
+            else:
+                result, _ = self._poll_until_done(candidate.candidate_id, sim_id)
+            result.notes.insert(0, f"retried once after BRAIN's error on simulation {first}")
+        return self._persist(self._finish(result))
+
+    def recover(self, candidate: CandidateRecord, sim_id: str) -> ResultRecord | None:
+        """One poll of an earlier submission (one that timed out on our side, or a crash
+        before its result): BRAIN keeps running a simulation after we stop waiting. Returns
+        the persisted result when BRAIN has finished it, None while it is still running or
+        when BRAIN no longer knows the simulation."""
+        try:
+            raw = self._with_retry(lambda: self.client.poll(sim_id))
+        except TRANSIENT_ERRORS:
+            return None
+        if raw.get("status") not in ("complete", "failed"):
+            return None
+        result = normalize(raw, candidate.candidate_id, sim_id)
+        if result.status == "failed" and any("simulation not found" in n for n in result.notes):
+            return None
+        result.notes.insert(0, f"recovered: result fetched after our wait ended ({sim_id})")
+        return self._persist(self._finish(result))
+
+    # --------------------------------------------------------------- internals
+
+    def _submit(self, candidate: CandidateRecord) -> str | ResultRecord:
+        """BRAIN's simulation id, or the failed/timeout result when submitting fails."""
+        try:
+            return self._with_retry(lambda: self.client.submit(candidate))
+        except TRANSIENT_ERRORS as exc:
+            return self._failure(candidate.candidate_id, None, exc, "submit")
+        except SubmissionRejected as exc:
+            return ResultRecord(candidate_id=candidate.candidate_id, status="failed",
+                                notes=[f"submit_rejected: {exc}"])
+
+    def _finish(self, result: ResultRecord) -> ResultRecord:
         leak = holdout_leak(result, self.config) if result.status == "complete" else None
         if leak:
             result.status = "invalid"  # never decide on numbers that saw the holdout
             result.notes.append(f"invalid: {leak}")
         if result.status in ("complete", "failed"):
             result.notes.extend(metric_validator.validate_result(result))
-        return self._persist(result)
-
-    # --------------------------------------------------------------- internals
+        return result
 
     def _persist(self, result: ResultRecord) -> ResultRecord:
         self.memory.put_result(result)
@@ -294,23 +333,25 @@ class Simulator:
                     raise
                 self.sleep(BACKOFF_BASE_SECONDS * (2 ** attempt))
 
-    def _poll_until_done(self, candidate_id: str, sim_id: str) -> ResultRecord:
+    def _poll_until_done(self, candidate_id: str, sim_id: str) -> tuple[ResultRecord, bool]:
+        """(result, retryable): retryable when BRAIN failed with one of its own errors."""
         cfg = self.config.simulator
         started = self.clock()
         while True:
             try:
                 raw = self._with_retry(lambda: self.client.poll(sim_id))
             except TRANSIENT_ERRORS as exc:
-                return self._failure(candidate_id, sim_id, exc, "poll")
+                return self._failure(candidate_id, sim_id, exc, "poll"), False
             if raw.get("status") in ("complete", "failed"):
-                return normalize(raw, candidate_id, sim_id)
+                retryable = raw.get("status") == "failed" and bool(raw.get("retryable"))
+                return normalize(raw, candidate_id, sim_id), retryable
             elapsed = self.clock() - started
             if elapsed >= cfg.max_poll_seconds:
                 return ResultRecord(
                     candidate_id=candidate_id, status="timeout", brain_sim_id=sim_id,
                     notes=[f"timeout: no completion after {elapsed:.0f}s "
                            f"(max_poll_seconds={cfg.max_poll_seconds:g})"],
-                )
+                ), False
             wait = raw.get("retry_after")
             wait = float(wait) if isinstance(wait, (int, float)) and wait > 0 else cfg.poll_interval_seconds
             self.sleep(wait)

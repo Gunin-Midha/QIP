@@ -1,12 +1,44 @@
 # Alpha Generator settings (Phase 3). Technical limits have values. Policy limits are
 # null (= not configured, the check is skipped) until the owner decides (OQ-11).
 generator:
-  prompt_version: gen-v3       # written to CandidateRecord.prompt_version; bump when prompts change
+  prompt_version: gen-v5       # written to CandidateRecord.prompt_version; bump when prompts change
   max_repair_rounds: 1         # times rejected expressions are sent back to the model for a fix
   max_paper_chars: 120000      # longer papers are cut to this many characters (null = no cut)
   max_hypotheses_per_paper: 5  # hypotheses extracted from one paper
   max_datafields_in_prompt: 120  # catalog fields listed in the prompt (was 300; a shorter prompt fits Groq's free per-minute limit)
   datafield_exploration_share: 0.3  # of those, drawn across all datasets, not by relevance (diversity)
+
+  # Field roles, matched (case-insensitive) at the START of BRAIN's description of a field.
+  # id: identifiers, codes, names and raw text, which carry no ranking information. They are
+  # not listed in the prompt (unless the hypothesis names them), and an alpha built only
+  # from them is sent back. time: dates and times of day, listed with a hint to use them for
+  # event timing. Checked against all 17 downloaded catalogs (2026-11-11): 621 id and 1,291
+  # time fields of ~78,000; "List of ..." and "Financial item" left out (they also name
+  # real scores and heavily used anl4 fields). Run rs20261111162604 built two news alphas
+  # on nws20_rp_story_event_count ("Identifies which content set the record came from").
+  field_roles:
+    id:
+      - 'identifies\b'
+      - '(a |the )?unique (\w+ )?identifier'
+      - '(a |the )?mapping identifier'
+      - '(the )?iso[- ]?(4217 )?currency code'
+      - 'currency \(iso\)'
+      - '(the )?(two|three)[- ]?(letter|character) iso'
+      - '(the )?name of (the )?(company|entity|analyst|broker|issuer)'
+      - '(the )?canonical name'
+      - '(the )?(headline|raw text|free[- ]text)\b'
+      - '(the )?passcode'
+      - 'time zone\b'
+      - 'replicator\b'
+      - 'technical helper'
+      - 'employer identification'
+    time:
+      - '(the )?(effective |expected |scheduled |latest |most recent )*(earnings report )?date\b'
+      - '(the )?(utc |vendor )?timestamp'
+      - '(the )?(utc )?time (when|at which|the|of day)'
+      - '(the )?expected (earnings report )?(date|time)'
+      - 'date (when|of|on which|representing)'
+      - '(current )?fiscal (quarter|year|semi[- ]annual) (period )?(end )?date'
   max_output: 4096             # output cap for one model call
 
   # Complexity limits for generated expressions (OQ-11, policy choice)

@@ -108,7 +108,7 @@ def main() -> int:
     instrument = cfg.settings.get("instrumentType", "EQUITY")
     try:
         session = make_session(cfg, on_biometric=biometric)
-        session.authenticate()
+        session.ensure_login()   # reuses a saved session (config/brain.yaml session_file)
     except BrainApiError as exc:
         say(f"Could not log in to BRAIN: {exc}")
         say("Set them in this terminal first:\n  export BRAIN_EMAIL=\"you@example.com\"\n"

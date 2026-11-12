@@ -118,7 +118,16 @@ class Pipeline:
         result = self.simulator.run(candidate)
         if result.status != "invalid":
             self.auditor.register_variant(candidate.family, candidate.candidate_id)
+        return self._evaluate(candidate, result)
 
+    def recover(self, candidate: CandidateRecord, sim_id: str) -> Outcome | None:
+        """Decide an earlier submission that BRAIN finished after our wait ended (its
+        variant was registered when it was first simulated). None while BRAIN is still
+        running it or no longer knows it."""
+        result = self.simulator.recover(candidate, sim_id)
+        return None if result is None else self._evaluate(candidate, result)
+
+    def _evaluate(self, candidate: CandidateRecord, result: ResultRecord) -> Outcome:
         config = self.config.for_settings(candidate.region, candidate.delay)
         gates = evaluator.run_gates(result, config)
         if result.status == "complete":

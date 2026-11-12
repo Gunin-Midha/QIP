@@ -21,11 +21,15 @@
 #
 # Settings: largest universe per region (the one the catalog was fetched for); group
 # neutralization by default, COUNTRY in multi-country regions, coarser groups in the
-# ~500-name universes; a few arms use BRAIN's factor neutralizations (CROWDING,
-# STATISTICAL, REVERSION_AND_MOMENTUM; AMR has none). Lower decay at delay 0, where the
-# signals are fast news and flows. The model may still suggest decay and neutralization.
+# ~500-name universes. Every arm starts from a group neutralization: the loader refuses NONE
+# and BRAIN's factor neutralizations as starting settings, since the Repair Agent tries them
+# when a result calls for it (that is how the skew+VRP seed got STATISTICAL; the GLB revision
+# arm that started under REVERSION_AND_MOMENTUM lost its signal). Lower decay at delay 0,
+# where the signals are fast news and flows. The model may suggest decay and a group
+# neutralization per alpha.
 #
-# Size: 37 arms x 4 generator models = 148 Director arms, far more than one free-tier run
+# Size: 35 arms in use (ALL is off: BRAIN won't simulate regular alphas there) x 4
+# generator models = 140 Director arms; was 37 x 4 = 148 Director arms, far more than one free-tier run
 # can simulate; memory carries the Director's evidence from run to run. Use `enabled` to
 # run a subset of regions.
 
@@ -67,9 +71,8 @@ regions:
     arms:
       - dataset: option8
         delay: 1
-        settings: {neutralization: CROWDING}
         hypotheses:
-          - "Implied volatility spread (Cremers and Weinbaum 2010): stocks whose at-the-money call implied volatility exceeds put implied volatility (implied_volatility_call_60 minus implied_volatility_put_60, scaled by implied_volatility_mean_60) outperform over 1-4 weeks, because informed traders buy calls before good news. The plain version is crowded on BRAIN, so differentiate it: combine the 30- and 60-day spreads, or condition on the volatility skew (implied_volatility_mean_skew_120)."
+          - "Implied volatility spread (Cremers and Weinbaum 2010): stocks whose at-the-money call implied volatility exceeds put implied volatility (implied_volatility_call_60 minus implied_volatility_put_60, scaled by implied_volatility_mean_60) outperform over 1-4 weeks, because informed traders buy calls before good news. The plain version is crowded on BRAIN (production-correlation risk), so differentiate it: combine the 30- and 60-day spreads, or condition on the volatility skew (implied_volatility_mean_skew_120)."
           - "Volatility risk premium: stocks whose implied volatility (implied_volatility_mean_30) is high relative to their own realised volatility (historical_volatility_30 or parkinson_volatility_30) are priced for risk that rarely arrives and underperform over the next month. Rank the implied-minus-realised gap within subindustry and smooth it."
       - dataset: shortinterest3
         delay: 1
@@ -97,7 +100,9 @@ regions:
           - "Key-driver tone: the balance of positive and negative events for a company's key business driver (key_factor_positive_event_count_section_2 versus key_factor_negative_event_count_section_2, through vec_sum) predicts returns over the following 1-2 weeks; scale the net count by the total so busy news days do not dominate."
 
   ALL:
-    enabled: true
+    # BRAIN refuses regular alphas in ALL ("Region ALL is not available for simulation type
+    # REGULAR", run rs20261111162604: 7 of 20 simulations); the loader refuses it while enabled.
+    enabled: false
     settings: {universe: LARGE, neutralization: INDUSTRY, decay: 4}
     catalogs:
       1: ../captures/consultant_catalogs/datafields_all_large_d1.json
@@ -122,9 +127,8 @@ regions:
     arms:
       - dataset: analyst69
         delay: 1
-        settings: {neutralization: REVERSION_AND_MOMENTUM}
         hypotheses:
-          - "Global revision breadth: the share of analysts raising EPS estimates over 4 weeks (anl69_best_eps_4wk_up minus anl69_best_eps_4wk_dn, divided by anl69_epss_best_eps_numest) predicts returns over the next 1-3 months in every country. VECTOR fields: aggregate with vec_avg. Neutralizing momentum and reversion tests whether revisions add something beyond price trends."
+          - "Global revision breadth: the share of analysts raising EPS estimates over 4 weeks (anl69_best_eps_4wk_up minus anl69_best_eps_4wk_dn, divided by anl69_epss_best_eps_numest) predicts returns over the next 1-3 months in every country. VECTOR fields: aggregate with vec_avg."
           - "Consensus EPS change: the 4-week change in consensus EPS (anl69_epss_best_eps_4wk_chg) scaled by the absolute consensus (anl69_epss_best_eps) is a standardized revision signal; stocks with upward revisions outperform within their country."
       - dataset: news20
         delay: 1
@@ -153,9 +157,8 @@ regions:
           - "New positions: the number of new position initiations (boundary_transaction_total, vec_sum) relative to its own average signals fresh conviction buying that predicts returns over the next month."
       - dataset: sentiment21
         delay: 1
-        settings: {neutralization: STATISTICAL}
         hypotheses:
-          - "Sentiment balance: European stocks whose mean positive news sentiment (snt21_2pos_mean_96) exceeds mean negative sentiment (snt21_2neg_mean_103), relative to the stock's own 20-day level, outperform over the next 1-2 weeks. Statistical neutralization strips common factor moves out of the sentiment signal."
+          - "Sentiment balance: European stocks whose mean positive news sentiment (snt21_2pos_mean_96) exceeds mean negative sentiment (snt21_2neg_mean_103), relative to the stock's own 20-day level, outperform over the next 1-2 weeks."
           - "Sentiment persistence: a 10-day average of the positive-minus-negative median sentiment (snt21_2pos_median_99 minus snt21_2neg_median_105) predicts a slower drift over the following month."
       - dataset: shortinterest3
         delay: 1

@@ -6,7 +6,11 @@ the screenshot's numbers. They are not a capture from the account.
 """
 
 import base64
+import http.cookiejar
 import json
+import os
+import stat
+import time
 import urllib.error
 import urllib.parse
 
@@ -503,6 +507,41 @@ def test_error_simulation_is_failed(bcfg, config, memory, candidate):
     assert not any(p.startswith("/alphas") for p in transport.paths())
 
 
+def test_brain_internal_error_is_submitted_once_more(bcfg, config, memory, candidate):
+    # run rs20261111174623: BRAIN's generic error is BRAIN's trouble, not the alpha's
+    generic = ok({"id": "sim1", "status": "ERROR",
+                  "message": "There was an error while running the simulation."})
+    routes = brain_routes({("GET", "/simulations/sim1"): [
+        generic, ok({"id": "sim1", "status": "COMPLETE", "alpha": "A1"})]})
+    client, transport, vc = make_client(routes, bcfg)
+    r = Simulator(client, memory, config, sleep=vc.sleep, clock=vc.clock).run(candidate())
+    assert r.status == "complete"
+    assert transport.paths("POST").count("/simulations") == 2
+    assert r.notes[0].startswith("retried once after BRAIN's error")
+
+
+def test_brain_internal_error_twice_stays_failed(bcfg, config, memory, candidate):
+    routes = brain_routes({("GET", "/simulations/sim1"): [ok(
+        {"id": "sim1", "status": "ERROR",
+         "message": "There was an error while running the simulation."})]})
+    client, transport, vc = make_client(routes, bcfg)
+    r = Simulator(client, memory, config, sleep=vc.sleep, clock=vc.clock).run(candidate())
+    assert r.status == "failed"
+    assert transport.paths("POST").count("/simulations") == 2   # one retry only
+
+
+def test_retry_error_messages_config(bcfg):
+    raw = {"settings": {"language": "FASTEXPR"}, "retry_error_messages": ["busy"]}
+    assert brain_config_from_dict(raw).retry_error_messages == ("busy",)
+    with pytest.raises(ConfigError):
+        brain_config_from_dict({**raw, "retry_error_messages": "busy"})
+    # an alpha's own error is not retried
+    routes = brain_routes({("GET", "/simulations/sim1"): [
+        ok({"id": "sim1", "status": "ERROR", "message": "unknown variable"})]})
+    client, _, _ = make_client(routes, bcfg)
+    assert "retryable" not in client.poll("sim1")
+
+
 def test_missing_recordset_leaves_field_none(bcfg, config, memory, candidate):
     routes = brain_routes()
     del routes[("GET", "/alphas/A1/recordsets/pnl")]
@@ -837,3 +876,101 @@ def test_cli_brain_options(fake_cli_session, tmp_path, capsys):
     assert "neutralization: ['NONE', 'MARKET']" in text
     assert "universe: depends on instrumentType" in text
     assert "types: ['REGULAR']" in text
+
+
+# ---------------------------------------------------------------- saved session
+
+def _cookie(name="t", value="abc", expires=None):
+    return http.cookiejar.Cookie(0, name, value, None, False, "api.worldquantbrain.com", True, False,
+                      "/", True, True, expires, expires is None, None, None, {})
+
+
+def _saved(tmp_path, expires=None):
+    path = tmp_path / "cfg" / "brain_session.txt"
+    t = brain_api.UrllibTransport(session_file=path)
+    t._jar.set_cookie(_cookie(expires=expires))
+    t.save_session()
+    return path
+
+
+def test_session_file_is_saved_private_and_reloaded(tmp_path):
+    path = _saved(tmp_path)
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(path.parent).st_mode) == 0o700
+    again = brain_api.UrllibTransport(session_file=path)
+    assert again.restored and [c.value for c in again._jar] == ["abc"]
+    assert again.forget_session() and not path.exists()
+    assert not brain_api.UrllibTransport(session_file=path).restored
+
+
+def test_an_expired_or_broken_session_file_is_not_restored(tmp_path):
+    path = _saved(tmp_path, expires=int(time.time()) - 60)
+    assert not brain_api.UrllibTransport(session_file=path).restored
+    path.write_text("not a cookie file")
+    assert not brain_api.UrllibTransport(session_file=path).restored
+
+
+def test_session_file_config(tmp_path):
+    raw = {"settings": {"instrumentType": "EQUITY"}}
+    assert brain_api.brain_config_from_dict(raw).session_file is None
+    cfg = brain_api.brain_config_from_dict({**raw, "session_file": "~/x/brain_session.txt"})
+    assert cfg.session_file == (brain_api.Path.home() / "x" / "brain_session.txt").resolve()
+    with pytest.raises(ConfigError, match="inside the repository"):
+        brain_api.brain_config_from_dict({**raw, "session_file": str(ROOT / "s.txt")})
+    with pytest.raises(ConfigError, match="session_file"):
+        brain_api.brain_config_from_dict({**raw, "session_file": 3})
+    main = brain_api.load_brain_config(ROOT / "config" / "brain.yaml").session_file
+    assert main is not None and brain_api.REPO_ROOT not in main.parents
+
+
+class SavedFake(FakeTransport):
+    def __init__(self, routes=None, restored=True):
+        super().__init__(routes)
+        self.restored, self.saves = restored, 0
+
+    def save_session(self):
+        self.saves += 1
+
+
+def test_a_saved_session_is_used_without_logging_in():
+    t = SavedFake({("GET", "/operators"): [ok([])]})
+    s = BrainSession(t, "me@example.com", SECRET)
+    s.request("GET", "/operators")
+    assert t.paths() == ["/operators"] and t.saves == 0
+
+
+def test_a_session_brain_no_longer_accepts_logs_in_again_and_is_saved():
+    t = SavedFake({("GET", "/operators"): [ok(status=401), ok([])]})
+    s = BrainSession(t, "me@example.com", SECRET)
+    s.request("GET", "/operators")
+    assert t.paths() == ["/operators", "/authentication", "/operators"] and t.saves == 1
+
+
+def test_ensure_login_logs_in_only_without_a_saved_session():
+    t = SavedFake(restored=True)
+    BrainSession(t, "me@example.com", SECRET).ensure_login()
+    assert t.paths() == []
+    t = SavedFake(restored=False)
+    BrainSession(t, "me@example.com", SECRET).ensure_login()
+    assert t.paths() == ["/authentication"] and t.saves == 1
+
+
+def test_credentials_are_needed_only_for_a_new_login(monkeypatch):
+    monkeypatch.delenv(brain_api.EMAIL_ENV_VAR, raising=False)
+    monkeypatch.delenv(brain_api.SECRET_ENV_VAR, raising=False)
+    cfg = brain_api.brain_config_from_dict({"settings": {"instrumentType": "EQUITY"}})
+    s = brain_api.make_session(cfg, transport=SavedFake({("GET", "/operators"): [ok(status=401)]}))
+    with pytest.raises(BrainAuthError, match="needs a new login"):
+        s.request("GET", "/operators")
+    with pytest.raises(BrainAuthError):
+        brain_api.make_session(cfg, transport=SavedFake(restored=False))
+
+
+def test_cli_brain_logout(tmp_path, capsys):
+    path = _saved(tmp_path)
+    cfg = tmp_path / "brain.yaml"
+    cfg.write_text(f"settings: {{instrumentType: EQUITY}}\nsession_file: {path}\n")
+    assert cli.main(["brain", "logout", "--brain-config", str(cfg)]) == 0
+    assert not path.exists() and "deleted the saved BRAIN session" in capsys.readouterr().out
+    assert cli.main(["brain", "logout", "--brain-config", str(cfg)]) == 0
+    assert "no saved BRAIN session" in capsys.readouterr().out

@@ -44,6 +44,12 @@ margin into bps.
 
 Credentials are read from the BRAIN_EMAIL and BRAIN_PASSWORD environment variables and
 nowhere else. They are never stored, logged or written to a capture.
+
+Saved session (``session_file`` in config/brain.yaml): after a login (with its biometric
+check) the session cookie is saved to that file, outside the repository, readable only by
+the user (0600), and the next command reuses it, so BRAIN asks for verification again only
+when it no longer accepts the session (a 401 logs in again). ``cli brain logout`` deletes
+it. The file holds the session cookie only, never the email or password.
 """
 
 from __future__ import annotations
@@ -101,6 +107,10 @@ class BrainApiConfig:
     fetch_self_correlation: bool = True
     fetch_submission_check: bool = True      # GET /alphas/<id>/check: BRAIN's final checks
     check_max_wait_seconds: float = 600.0
+    session_file: Path | None = None         # saved session cookie (outside the repo); None = off
+    # BRAIN failure messages that are BRAIN's own trouble, not the alpha's: the simulator
+    # submits such a candidate once more (run rs20261111174623)
+    retry_error_messages: tuple[str, ...] = ("There was an error while running the simulation",)
 
 
 _CANDIDATE_SETTINGS = {"region", "universe", "delay", "decay", "neutralization", "truncation"}
@@ -129,10 +139,31 @@ def brain_config_from_dict(raw, source: str = "<dict>") -> BrainApiConfig:
             if not isinstance(raw[key], bool):
                 raise ConfigError(f"{source}: {key} must be true or false")
             kw[key] = raw[key]
-    unknown = set(raw) - {"settings", *kw}
+    if raw.get("session_file") is not None:
+        kw["session_file"] = session_path(raw["session_file"], source)
+    if "retry_error_messages" in raw:
+        msgs = raw["retry_error_messages"] or []
+        if not isinstance(msgs, list) or not all(isinstance(m, str) and m for m in msgs):
+            raise ConfigError(f"{source}: retry_error_messages must be a list of strings")
+        kw["retry_error_messages"] = tuple(msgs)
+    unknown = set(raw) - {"settings", "session_file", *kw}
     if unknown:
         raise ConfigError(f"{source}: unknown keys {sorted(unknown)}")
     return BrainApiConfig(settings=dict(settings), **kw)
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def session_path(value, source: str = "<dict>") -> Path:
+    """The saved-session file: ``~`` expanded, and never inside the repository (rule 4)."""
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{source}: session_file must be a path or null")
+    path = Path(value).expanduser().resolve()
+    if path == REPO_ROOT or REPO_ROOT in path.parents:
+        raise ConfigError(f"{source}: session_file {path} is inside the repository; "
+                          "put it outside, e.g. ~/.config/qip/brain_session.txt")
+    return path
 
 
 def load_brain_config(path: str | Path) -> BrainApiConfig:
@@ -187,13 +218,40 @@ class Transport(Protocol):
 
 
 class UrllibTransport:
-    """Keeps the session cookie in a CookieJar. Network failures become ConnectionError
-    or TimeoutError, which the simulator retries."""
+    """Keeps the session cookie in a CookieJar, loaded from and saved to ``session_file``
+    when one is given. Network failures become ConnectionError or TimeoutError, which the
+    simulator retries."""
 
-    def __init__(self, timeout: float = 60.0):
+    def __init__(self, timeout: float = 60.0, session_file: Path | None = None):
         self.timeout = timeout
-        self._opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.session_file = session_file
+        self._jar = http.cookiejar.LWPCookieJar()
+        self.restored = False   # a saved session was loaded
+        if session_file is not None and session_file.exists():
+            try:
+                self._jar.load(str(session_file), ignore_discard=True)  # expired ones dropped
+                self.restored = len(self._jar) > 0
+            except (OSError, http.cookiejar.LoadError):
+                self._jar.clear()
+        self._opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self._jar))
+
+    def save_session(self) -> None:
+        """Write the session cookie to ``session_file``, readable by the user only."""
+        if self.session_file is None:
+            return
+        self.session_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(self.session_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.close(fd)   # created 0600 before anything is written
+        self._jar.save(str(self.session_file), ignore_discard=True)
+        os.chmod(self.session_file, 0o600)
+
+    def forget_session(self) -> bool:
+        """Delete the saved session. Returns whether there was one."""
+        self._jar.clear()
+        if self.session_file is not None and self.session_file.exists():
+            self.session_file.unlink()
+            return True
+        return False
 
     def request(self, method: str, url: str, body: bytes | None, headers: dict) -> Response:
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
@@ -241,7 +299,9 @@ class BrainSession:
         self.sleep = sleep
         self.rate_limit_max_wait = rate_limit_max_wait
         self.api_root = api_root.rstrip("/")
-        self.authenticated = False
+        # a saved session counts as logged in; BRAIN's 401 on the first request logs in again
+        self.authenticated = bool(getattr(transport, "restored", False))
+        self.restored = self.authenticated
 
     def url(self, path: str, params: dict | None = None) -> str:
         url = path if path.startswith(self.api_root) else self.api_root + "/" + path.lstrip("/")
@@ -256,10 +316,13 @@ class BrainSession:
         return self.transport.request(method, url, body, headers)
 
     def authenticate(self) -> None:
+        if self._email is None or self._secret is None:
+            raise BrainAuthError(f"BRAIN needs a new login (the saved session is no longer "
+                                 f"accepted): set {EMAIL_ENV_VAR} and {SECRET_ENV_VAR}")
         basic = base64.b64encode(f"{self._email}:{self._secret}".encode()).decode()
         resp = self._send("POST", self.url("/authentication"), extra={"Authorization": f"Basic {basic}"})
         if resp.status in (200, 201):
-            self.authenticated = True
+            self._logged_in()
             return
         if resp.status == 401 and resp.headers.get("www-authenticate", "").lower() == "persona":
             where = urllib.parse.urljoin(self.url("/authentication"), resp.headers.get("location", ""))
@@ -272,13 +335,24 @@ class BrainSession:
             self.on_biometric(where)
             done = self._send("POST", where)
             if done.status in (200, 201):
-                self.authenticated = True
+                self._logged_in()
                 return
             raise BrainAuthError(f"biometric verification not completed ({done.status}): "
                                  f"{done.detail()}")
         if resp.status >= 500:
             raise ConnectionError(f"authentication returned {resp.status}")
         raise BrainAuthError(f"authentication failed ({resp.status}): {resp.detail()}")
+
+    def _logged_in(self) -> None:
+        self.authenticated = True
+        save = getattr(self.transport, "save_session", None)
+        if save is not None:
+            save()
+
+    def ensure_login(self) -> None:
+        """Log in unless already logged in or a saved session was loaded."""
+        if not self.authenticated:
+            self.authenticate()
 
     def request(self, method: str, path: str, *, json_body=None,
                 params: dict | None = None) -> Response:
@@ -322,12 +396,19 @@ class BrainSession:
 def make_session(config: BrainApiConfig, *, sleep: Callable[[float], None] = time.sleep,
                  transport: Transport | None = None,
                  on_biometric: Callable[[str], None] | None = None) -> BrainSession:
-    """The real session. Fails fast (before any request) when credentials are missing.
+    """The real session. Fails fast (before any request) when credentials are missing and
+    there is no saved session to reuse.
     ``on_biometric(url)`` is called when BRAIN asks for biometric verification and must
     return once the person has verified at ``url``; without it that login fails."""
-    email, secret = credentials_from_env()
-    return BrainSession(transport or UrllibTransport(config.request_timeout_seconds), email,
-                        secret, sleep=sleep, rate_limit_max_wait=config.rate_limit_max_wait_seconds,
+    transport = transport or UrllibTransport(config.request_timeout_seconds,
+                                             session_file=config.session_file)
+    try:
+        email, secret = credentials_from_env()
+    except BrainAuthError:
+        if not getattr(transport, "restored", False):
+            raise
+        email = secret = None   # the saved session is used; a new login would need them
+    return BrainSession(transport, email, secret, sleep=sleep, rate_limit_max_wait=config.rate_limit_max_wait_seconds,
                         on_biometric=on_biometric)
 
 
@@ -602,8 +683,12 @@ class RealBrainClient:
         if wait is not None or running:
             return {"status": "running", "retry_after": wait, "progress": sim.get("progress")}
         self._capture(brain_sim_id, "simulation", sim)
-        if _failure_message(sim) is not None:
-            return translate(sim, None)
+        failure = _failure_message(sim)
+        if failure is not None:
+            raw = translate(sim, None)
+            if any(m.lower() in failure.lower() for m in self.config.retry_error_messages):
+                raw["retryable"] = True   # BRAIN's own error: the simulator submits once more
+            return raw
 
         alpha_id = sim["alpha"]
         notes: list[str] = []

@@ -59,6 +59,31 @@ def test_model_revision_becomes_child(candidate):
     assert out.rulings["g1"].source == "model"
 
 
+def test_factor_neutralization_at_the_start_is_an_advisory(candidate):
+    from alpha_research.critic import setting_issues
+    fresh = candidate(candidate_id="g1", neutralization="CROWDING")
+    assert "factor neutralization CROWDING" in setting_issues(fresh)[0].text
+    child = candidate(candidate_id="p_r1", neutralization="CROWDING", parent_id="p",
+                      lever="neutralize_crowding", generation=1)
+    assert setting_issues(child) == []   # a repair lever's choice comes from results
+    assert setting_issues(candidate(candidate_id="g2", neutralization="INDUSTRY")) == []
+
+
+def test_critic_can_undo_a_neutralization_whose_reason_does_not_hold(candidate):
+    c = candidate(candidate_id="g1", expression="rank(-ts_delta(close, 5))",
+                  neutralization="REVERSION_AND_MOMENTUM")
+    critic = Critic(SPEC, llm=ScriptedLLMClient([reviews(
+        {"candidate_id": "g1", "verdict": "revise", "issues": ["removes the reversal itself"],
+         "neutralization": "subindustry"})]))
+    out = review_and_debate([c], {"g1": "Neutralization REVERSION_AND_MOMENTUM: why not"},
+                            critic, DebateJudge())
+    child = out.to_simulate[0]
+    assert (child.candidate_id, child.expression, child.neutralization) == \
+        ("g1_c1", c.expression, "SUBINDUSTRY")
+    # a neutralization the region does not allow is ignored (no change -> no revision)
+    assert critic.revision(c, None, "COUNTRY") is None
+
+
 def test_repair_children_get_rule_checks_only(candidate):
     fresh = candidate(candidate_id="g1", expression="ts_delta(close, 5)")
     child = candidate(candidate_id="p_r1", expression="ts_delta(close, 10)", parent_id="p",

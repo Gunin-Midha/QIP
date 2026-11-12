@@ -25,7 +25,7 @@ from .schemas import GROUP_NEUTRALIZATIONS, REGION_SETTINGS, neutralizations_for
 
 PROMPT_VERSIONS = {
     "prefilter": "prefilter-v3",
-    "critic": "critic-v4",
+    "critic": "critic-v5",
     "judge": "judge-v4",
     "repair": "repair-v5",
     "strategy": "strategy-v4",
@@ -211,10 +211,12 @@ For each candidate:
 
 Lines starting "issues found so far" were found by rule checks; a look-ahead found there cannot be cleared.
 
+Neutralization: a group neutralization (MARKET, SECTOR, INDUSTRY, SUBINDUSTRY, COUNTRY) is the normal start. A factor neutralization or NONE comes with the author's reason in the rationale ("Neutralization X: ..."). Judge that reason: a factor neutralization fits when the idea is meant to be independent of that factor, and removes the signal when the signal is that factor (a reversal idea under a reversal/momentum neutralization, a size idea under a size-related one); NONE keeps a market bet. If the reason does not hold, give "revise" with "neutralization": a group neutralization (the expression may stay the same).
+
 {DATA_RULE}
 
 {JSON_RULE}
-{{"reviews": [{{"candidate_id": "<id exactly as given>", "verdict": "simulate|revise|drop", "issues": [{{"category": "<category>", "detail": "<one sentence>"}}], "revised_expression": "<only when the verdict is revise>", "expected_failure": "<optional>"}}]}}
+{{"reviews": [{{"candidate_id": "<id exactly as given>", "verdict": "simulate|revise|drop", "issues": [{{"category": "<category>", "detail": "<one sentence>"}}], "revised_expression": "<only when the verdict is revise>", "neutralization": "<optional, only with revise: the neutralization to use instead>", "expected_failure": "<optional>"}}]}}
 Include every candidate exactly once."""
 
 

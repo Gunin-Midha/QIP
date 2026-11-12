@@ -38,15 +38,16 @@ def usa(**block):
 def test_the_v2_plan_loads_every_region_and_delay():
     plans = load_plan(V2)
     markets = {(p.settings.region, p.settings.delay) for p in plans}
-    assert markets == {("USA", 0), ("USA", 1), ("ALL", 1), ("GLB", 1), ("EUR", 0), ("EUR", 1),
+    # ALL is off: BRAIN won't simulate regular alphas there
+    assert markets == {("USA", 0), ("USA", 1), ("GLB", 1), ("EUR", 0), ("EUR", 1),
                        ("ASI", 1), ("CHN", 0), ("CHN", 1), ("JPN", 0), ("JPN", 1), ("AMR", 0),
                        ("AMR", 1), ("IND", 1), ("DEU", 0), ("DEU", 1), ("GBR", 0), ("GBR", 1)}
-    assert len(plans) == 37
+    assert len(plans) == 35
     # the same dataset in one region at both delays is two arms
     assert {p.settings.delay for p in plans if p.dataset == "other561"} == {0, 1}
     opt = next(p for p in plans if p.dataset == "option8")
     assert (opt.settings.universe, opt.settings.neutralization, opt.settings.decay,
-            opt.settings.truncation) == ("TOP3000", "CROWDING", 4, 0.08)
+            opt.settings.truncation) == ("TOP3000", "SUBINDUSTRY", 4, 0.08)
     assert opt.catalog.name == "datafields_usa_top3000_d1.json"
     assert all(p.catalog is not None and f"_d{p.settings.delay}." in p.catalog.name for p in plans)
 
@@ -70,6 +71,8 @@ def test_a_disabled_region_is_skipped(tmp_path):
 @pytest.mark.parametrize("regions, match", [
     ({}, "non-empty mapping"),
     ({"MARS": usa()}, "region 'MARS'"),
+    ({"ALL": usa(settings={"universe": "LARGE", "neutralization": "INDUSTRY", "decay": 4})},
+     "does not simulate regular alphas in region ALL"),
     ({"USA": usa(enabled="yes")}, "'enabled' must be true or false"),
     ({"USA": usa(enabled=False)}, "no arms in an enabled region"),
     ({"USA": usa(arms=[])}, "non-empty 'arms'"),
@@ -82,6 +85,11 @@ def test_a_disabled_region_is_skipped(tmp_path):
      "pv1.*USA delay 1 twice"),
     ({"USA": usa(arms=[{"dataset": "pv1", "delay": 1}])}, "at least one hypothesis"),
     ({"USA": usa(settings={"universe": "TOP3000"})}, "missing generation settings"),
+    # new alphas start from a group neutralization; NONE and factor ones are repair levers
+    ({"USA": usa(arms=[{"dataset": "pv1", "delay": 1, "settings": {"neutralization": "CROWDING"},
+                        "hypotheses": ["h"]}])}, "'CROWDING' as a starting setting"),
+    ({"USA": usa(settings={"universe": "TOP3000", "neutralization": "NONE", "decay": 4})},
+     "'NONE' as a starting setting"),
 ])
 def test_v2_plan_errors(tmp_path, regions, match):
     with pytest.raises(ConfigError, match=match):
@@ -131,13 +139,13 @@ def test_each_delay_is_its_own_arm_with_its_own_catalog(memory, config, playbook
                       llm_factory=lambda m, r=RouterLLM(): r, client=StubBrain(), config=config,
                       playbook=playbook, spec=SPEC, generator_config=GEN_CONFIG, memory=memory,
                       markets=markets, seed=0, sleep=vc.sleep, clock=vc.clock, run_id="rs1")
-    d1, d0 = ("pv1", "USA", "gen-v3", "claude-test", 1), ("pv1", "USA", "gen-v3", "claude-test", 0)
+    d1, d0 = ("pv1", "USA", "gen-v5", "claude-test", 1), ("pv1", "USA", "gen-v5", "claude-test", 0)
     assert set(run.arms) == {d1, d0}
     assert run._generator(d1).datafields == ["close", "vwap"]
     assert run._generator(d0).datafields == ["close", "volume"]
-    assert arm_label(d0) == "pv1/USA/D0/gen-v3/claude-test"
+    assert arm_label(d0) == "pv1/USA/D0/gen-v5/claude-test"
     report = run.run(1)
-    assert set(report["arms"]) == {"pv1/USA/D1/gen-v3/claude-test", "pv1/USA/D0/gen-v3/claude-test"}
+    assert set(report["arms"]) == {"pv1/USA/D1/gen-v5/claude-test", "pv1/USA/D0/gen-v5/claude-test"}
 
 
 class NewDatasetStrategy(RouterLLM):
@@ -161,13 +169,13 @@ def test_a_new_dataset_gets_arms_only_where_its_catalog_has_it(memory, config, p
                       run_id="rs1")
     run.run(2)
     new = [k for k in run.arms if k[0] == "other561"]
-    assert new == [("other561", "USA", "gen-v3+evo1", "claude-test", 0)]
+    assert new == [("other561", "USA", "gen-v5+evo1", "claude-test", 0)]
     assert run.arms[new[0]].settings.delay == 0
 
 
 def test_single_catalog_runs_keep_working(memory, config, playbook):
     run = make_run(memory, config, playbook)
-    assert list(run.arms) == [("pv1", "USA", "gen-v3", "claude-test", 1)]
+    assert list(run.arms) == [("pv1", "USA", "gen-v5", "claude-test", 1)]
 
 
 # ---------------------------------------------------------------- CLI
@@ -182,10 +190,21 @@ def test_cli_reads_each_plan_catalog_once(tmp_path, capsys):
     markets = cli._plan_catalogs(load_plan(write_v2(tmp_path, regions)))
     fields, meta = markets[("USA", 1)]
     assert fields == ["implied_volatility_call_60"] and meta["implied_volatility_call_60"]["dataset"] == "option8"
-    assert capsys.readouterr().out.count("catalog USA D1: 1 fields") == 1
+    assert capsys.readouterr().out.strip() == "field catalogs: 1 region/delays, 1 fields"
 
 
 def test_cli_missing_plan_catalog_is_a_config_error(tmp_path):
     plans = load_plan(write_v2(tmp_path, {"USA": usa(catalogs={1: "missing.json"})}))
     with pytest.raises(ConfigError, match="brain_discovery"):
         cli._plan_catalogs(plans)
+
+
+def test_console_arm_names_are_short():
+    from alpha_research.research import arm_short
+    assert arm_short(("sentiment21", "EUR", "gen-v5", "groq:qwen/qwen3.8-27b", 1)) == \
+        "sentiment21 EUR D1 (qwen3.8-27b)"
+    assert arm_short(("pv1", "USA", "gen-v5+evo1", "gemini-3.6-flash", 0)) == \
+        "pv1 USA D0 evo1 (gemini-3.6-flash)"
+    assert arm_short(("pv1", "USA", "gen-v5", "nvidia/nemotron-3-ultra-550b-a55b:free", 1)) == \
+        "pv1 USA D1 (nemotron-3-ultra-550b-a55b)"
+    assert arm_short(("pv1", "USA", "gen-v5", "groq:gpt-oss-120b", 1)).endswith("(gpt-oss-120b)")

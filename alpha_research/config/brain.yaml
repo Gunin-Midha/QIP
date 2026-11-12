@@ -24,4 +24,14 @@ fetch_self_correlation: true
 # here; SELF_CORRELATION PENDING there, a value here), so these replace them.
 fetch_submission_check: true
 check_max_wait_seconds: 600
+# BRAIN failure messages that are BRAIN's own trouble, not the alpha's: such a simulation is
+# submitted once more (run rs20261111174623 lost one to the first message).
+retry_error_messages:
+  - "There was an error while running the simulation"
 
+# Saved BRAIN session: after a login (with BRAIN's biometric check) the session cookie is
+# saved here and reused by the next commands, so BRAIN asks to verify again only when it
+# ends the session. Must be outside the repository; the file is created readable only by
+# you (0600) and holds the session cookie only. null = never save. `cli brain logout`
+# deletes it.
+session_file: ~/.config/qip/brain_session.txt

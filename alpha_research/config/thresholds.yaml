@@ -85,7 +85,7 @@ repair:
 
 # Simulator
 simulator:
-  max_poll_seconds: 600
+  max_poll_seconds: 1200   # GLB simulations took over 600 s (run rs20261111162604)
   poll_interval_seconds: 5
   max_retries: 3
   max_concurrent: 1               # OQ-3: real limit is account-specific

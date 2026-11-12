@@ -51,7 +51,8 @@ class FastExprError(ValueError):
 _LEX_RE = re.compile(
     r"""
     (?P<ws>\s+)
-  | (?P<num>\d+\.\d*(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?|\d+(?:[eE][+-]?\d+)?)
+  | (?P<sci>(?:\d+\.\d*|\.\d+|\d+)[eE][+-]?\d+)
+  | (?P<num>\d+\.\d*|\.\d+|\d+)
   | (?P<name>[A-Za-z_][A-Za-z0-9_]*)
   | (?P<str>"[^"\n]*"|'[^'\n]*')
   | (?P<op>&&|\|\||<=|>=|==|!=|[-+*/(),;=<>])
@@ -74,6 +75,11 @@ def _lex(source: str) -> list[Lexeme]:
         m = _LEX_RE.match(source, pos)
         if not m:
             raise FastExprError(f"unexpected character {source[pos]!r} at position {pos}")
+        if m.lastgroup == "sci":
+            # BRAIN's parser stops at the "e" (run rs20261111162604: 'Unexpected character')
+            plain = f"{float(m.group()):.12f}".rstrip("0").rstrip(".")
+            raise FastExprError(f"scientific notation {m.group()!r} at position {pos} is not "
+                                f"accepted by BRAIN; write it as a plain decimal ({plain})")
         pos = m.end()
         if m.lastgroup != "ws":
             out.append(Lexeme(m.lastgroup, m.group(), m.start()))

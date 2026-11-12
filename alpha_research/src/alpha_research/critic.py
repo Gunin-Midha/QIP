@@ -8,10 +8,13 @@ Critic
      operator, ignoring a leading minus, is not rank, zscore, scale, normalize, quantile,
      winsorize or a group_* operator), or a window is longer than 512 days, or the
      neutralization is NONE (the alpha keeps a market bet; run 2's cash-flow alpha looked
-     strong only because of it). Advisory issues never block: they inform the reviews.
+     strong only because of it), or a fresh alpha starts from a factor neutralization (its
+     reason is in the rationale). Advisory issues never block: they inform the reviews.
 2. Model review (``critic.use_model``): one call per batch sees each candidate, its
    hypothesis and rationale, and the rule issues, and answers simulate, revise or drop,
-   with issues and optionally a revised expression. A revision must pass
+   with issues and optionally a revised expression and, with revise, a neutralization
+   allowed in the region (to undo a factor neutralization or NONE whose reason does not
+   hold). A revision must pass
    ``fastexpr.analyze`` or it is discarded. If the model is off or its reply is unusable,
    the verdict comes from the rules: drop on a blocking issue, otherwise simulate.
 
@@ -44,7 +47,7 @@ from .generator import GenerationError, ask_json
 from .llm import LLMClient, ModelDown
 from .prompts import critic_system, critic_user, judge_system, judge_user
 from .research_loop import assign_lineage
-from .schemas import CandidateRecord, SchemaError
+from .schemas import GROUP_NEUTRALIZATIONS, CandidateRecord, SchemaError, neutralizations_for
 
 VERDICTS = ("simulate", "revise", "drop")
 NORMALIZERS = {"rank", "zscore", "scale", "normalize", "quantile", "winsorize"}
@@ -101,6 +104,12 @@ def setting_issues(c: CandidateRecord) -> list[Issue]:
     if c.neutralization == "NONE":
         return [Issue("advisory", "neutralization NONE leaves a market bet in the alpha: its "
                                   "Sharpe may come from market direction, not stock selection")]
+    if c.lever is None and c.neutralization not in GROUP_NEUTRALIZATIONS:
+        # the Generator's own choice (a repair lever's is evidence-driven): its reason is in
+        # the rationale for the Critic to weigh
+        return [Issue("advisory", f"factor neutralization {c.neutralization} chosen at the "
+                                  "start: check the author's reason; it can remove the signal "
+                                  "itself when the signal is close to the factor")]
     return []
 
 
@@ -159,19 +168,27 @@ class Critic:
         self.limits = limits
         self.max_output = max_output
 
-    def revision(self, original: CandidateRecord, expression) -> CandidateRecord | None:
+    def revision(self, original: CandidateRecord, expression,
+                 neutralization=None) -> CandidateRecord | None:
+        """The revised candidate, or None. ``neutralization`` (optional) must be allowed in
+        the region; a revision may change only the neutralization."""
+        neut = original.neutralization
+        if isinstance(neutralization, str) and neutralization.upper() in \
+                neutralizations_for(original.region):
+            neut = neutralization.upper()
         if not isinstance(expression, str) or not expression.strip():
-            return None
+            expression = original.expression
         expression = expression.strip()
-        if expression == original.expression:
+        if expression == original.expression and neut == original.neutralization:
             return None
         fields = catalog_for(self.markets, self.datafields, original.region, original.delay)
         if not analyze(expression, self.spec, datafields=fields, limits=self.limits).ok:
             return None
         if any(i.severity == "blocking" for i in rule_issues(expression)):
             return None
-        child = assign_lineage(dataclasses.replace(original, expression=expression), original,
-                               lever="critic_revision")
+        child = assign_lineage(dataclasses.replace(original, expression=expression,
+                                                   neutralization=neut),
+                               original, lever="critic_revision")
         child = dataclasses.replace(child, candidate_id=f"{original.candidate_id}_c1",
                                     model=getattr(self.llm, "model", original.model))
         try:
@@ -218,7 +235,8 @@ class Critic:
             expected = item.get("expected_failure")
             if isinstance(expected, str) and expected.strip() and expected != "none":
                 issues.append(f"expected to fail: {expected.strip()}")
-            revised = self.revision(by_id[cid], item.get("revised_expression"))
+            revised = self.revision(by_id[cid], item.get("revised_expression"),
+                                    item.get("neutralization"))
             reviews[cid] = Review(cid, verdict, issues, revised, "model", base.blocking)
         return reviews
 

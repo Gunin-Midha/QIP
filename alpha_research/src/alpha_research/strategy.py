@@ -154,9 +154,16 @@ def region_notes(outcomes: list[dict], region: str, *, max_levers: int = 3) -> s
     tried = [f"{n} {acc}/{dec}" for n, (dec, acc) in info["neutralizations"].items()]
     lines.append("- Neutralizations tried there (accepted/decided): " + ", ".join(tried) + ".")
     stats = LeverStats.from_events(repair_events(outcomes))
-    good = [r for r in stats.region_table() if r["region"] == region and r["fixed"] > 0]
+    rows = [r for r in stats.region_table() if r["region"] == region]
+    good = [r for r in rows if r["fixed"] > 0]
     for r in good[:max_levers]:
         lines.append(f"- Repair that fixed {r['failure_class']} there: {r['lever']}.")
+    neut = [r for r in rows if "neutraliz" in r["lever"]]
+    if neut:  # what changing the neutralization did to failing alphas in this region
+        lines.append("- Neutralization changes by the Repair Agent there (fixed/improved/tried, "
+                     "for which failure): " + ", ".join(
+                         f"{r['lever']} {r['fixed']}/{r['improved']}/{r['events']} "
+                         f"({r['failure_class']})" for r in neut) + ".")
     return "\n".join(lines)
 
 

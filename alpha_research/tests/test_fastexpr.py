@@ -100,7 +100,10 @@ def test_comparisons_and_logic_inside_trade_when(spec):
 
 
 def test_scientific_and_leading_dot_numbers(spec):
-    assert analyze("rank(close * 1e-3 + .5)", spec).ok
+    assert analyze("rank(close * 0.001 + .5)", spec).ok
+    # BRAIN rejects scientific notation ("Unexpected character 'e'", run rs20261111162604)
+    bad = analyze("rank(close / max(volume, 1e-08))", spec)
+    assert not bad.ok and "plain decimal (0.00000001)" in " ".join(bad.errors)
 
 
 def test_group_arguments_are_not_datafields(spec):

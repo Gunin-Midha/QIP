@@ -31,7 +31,8 @@ from pathlib import Path
 import yaml
 
 from .brain_api import (EMAIL_ENV_VAR, SECRET_ENV_VAR, BrainApiError, RealBrainClient,
-                        list_datafields, list_datasets, list_operators, load_brain_config, make_session,
+                        UrllibTransport, list_datafields, list_datasets, list_operators,
+                        load_brain_config, make_session,
                         simulation_options)
 from .brain_client import FixtureBrainClient, FixtureNotFoundError, SubmissionRejected
 from .compare import model_comparison
@@ -221,8 +222,25 @@ def _brain_session(config):
 
 
 def _brain_auth(args) -> int:
-    _brain_session(load_brain_config(args.brain_config)).authenticate()
-    print("BRAIN login ok")
+    """A fresh login (with BRAIN's biometric check), saved for the next commands."""
+    config = load_brain_config(args.brain_config)
+    _brain_session(config).authenticate()
+    if config.session_file is not None:
+        print(f"BRAIN login ok; session saved to {config.session_file}. The next commands "
+              "reuse it until BRAIN ends it (`brain logout` deletes it).")
+    else:
+        print("BRAIN login ok (session_file is off in the brain config, so nothing is saved)")
+    return EXIT_OK
+
+
+def _brain_logout(args) -> int:
+    config = load_brain_config(args.brain_config)
+    if config.session_file is None:
+        print("no saved BRAIN session (session_file is off in the brain config)")
+        return EXIT_OK
+    gone = UrllibTransport(session_file=config.session_file).forget_session()
+    print(f"deleted the saved BRAIN session {config.session_file}" if gone
+          else f"no saved BRAIN session at {config.session_file}")
     return EXIT_OK
 
 
@@ -354,9 +372,10 @@ def _plan_catalogs(plans) -> dict[tuple, tuple[list[str], dict]]:
                 raise ConfigError(f"cannot read datafield catalog {p.catalog} for "
                                   f"{p.settings.region} delay {p.settings.delay}: {exc} "
                                   "(scripts/brain_discovery.py downloads the catalogs)") from exc
-            print(f"catalog {p.settings.region} D{p.settings.delay}: "
-                  f"{len(read[p.catalog][0]):,} fields from {p.catalog}")
         markets[(p.settings.region, p.settings.delay)] = read[p.catalog]
+    if markets:
+        print(f"field catalogs: {len(markets)} region/delays, "
+              f"{sum(len(f) for f, _ in read.values()):,} fields")
     return markets
 
 
@@ -404,9 +423,13 @@ def _research(args) -> int:
     if report["regions_this_run"] is not None:
         print(f"  regions this run: {report['regions_this_run']}; simulations per region so far: "
               f"{report['simulations_by_region']}")
-    for arm, s in report["arms"].items():
+    active = {a: s for a, s in report["arms"].items()
+              if s["accepted"] or s["not_accepted"] or s["repairs_queued"]}
+    for arm, s in active.items():   # arms with no evidence yet are in the report file only
         print(f"  {arm}: accepted {s['accepted']}, not accepted {s['not_accepted']}, "
               f"pass rate {s['posterior_pass_rate']}, repairs queued {s['repairs_queued']}")
+    if len(active) < len(report["arms"]):
+        print(f"  ({len(report['arms']) - len(active)} arms with no results yet are in the report)")
     return EXIT_OK
 
 
@@ -639,8 +662,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     brain = sub.add_parser("brain", help=f"BRAIN account tools (needs {EMAIL_ENV_VAR} and {SECRET_ENV_VAR})")
     bsub = brain.add_subparsers(dest="brain_command", required=True)
-    b_auth = bsub.add_parser("auth", help="check that the BRAIN login works")
+    b_auth = bsub.add_parser("auth", help="log in to BRAIN and save the session for later commands")
     b_auth.set_defaults(func=_brain_auth)
+    b_out = bsub.add_parser("logout", help="delete the saved BRAIN session")
+    b_out.set_defaults(func=_brain_logout)
     b_opt = bsub.add_parser("options", help="list the simulation settings BRAIN allows")
     b_opt.add_argument("--out", default="captures/simulation_options.json")
     b_opt.set_defaults(func=_brain_options)
@@ -668,7 +693,7 @@ def build_parser() -> argparse.ArgumentParser:
     b_ds.add_argument("--delay", type=int, required=True)
     b_ds.add_argument("--out", required=True)
     b_ds.set_defaults(func=_brain_datasets)
-    for sp in (b_auth, b_opt, b_cap, b_ops, b_df, b_ds):
+    for sp in (b_auth, b_out, b_opt, b_cap, b_ops, b_df, b_ds):
         sp.add_argument("--brain-config", default="config/brain.yaml")
     return p
 

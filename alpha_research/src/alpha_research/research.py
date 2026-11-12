@@ -86,7 +86,8 @@ from .prefilter import PreFilter, PrefilterConfig
 from .repair import Playbook
 from .lever_stats import LeverStats, RepairLearningConfig, distance, repair_events
 from .repair_agent import RepairAgent
-from .schemas import REGION_SETTINGS, CandidateRecord, experiment_hash
+from .schemas import (GROUP_NEUTRALIZATIONS, NO_REGULAR_SIMULATION, REGION_SETTINGS,
+                      CandidateRecord, experiment_hash)
 from .strategy import StrategyConfig, StrategyEvolution, region_notes
 
 DECIDED = ("accept", "reject", "repair")
@@ -381,6 +382,21 @@ def arm_label(key: tuple) -> str:
     return f"{ds}/{region}/D{delay}/{pv}/{model}"
 
 
+def arm_short(key: tuple) -> str:
+    """An arm as console text: ``dataset REGION D<delay> (model)``, the model without its
+    host and maker prefix, and the prompt version only when evolved."""
+    ds, region, pv, model, delay = key
+    evo = f" {pv.split('+', 1)[1]}" if "+" in pv else ""
+    head, _, rest = model.partition(":")
+    name = rest if rest and "/" not in head else model      # drop a "groq:" host prefix
+    name = name.split("/")[-1].removesuffix(":free")
+    return f"{ds} {region} D{delay}{evo} ({name})"
+
+
+def _slots_text(alloc: dict) -> str:
+    return ", ".join(f"{arm_short(k)}{f' x{n}' if n > 1 else ''}" for k, n in alloc.items() if n)
+
+
 def load_plan(path: str | Path) -> list[ArmPlan]:
     """Research plan YAML in one of two layouts (paper paths relative to the plan file).
 
@@ -410,6 +426,7 @@ def load_plan(path: str | Path) -> list[ArmPlan]:
         if not isinstance(a.get("settings"), dict):
             raise ConfigError(f"{where} needs a 'settings' mapping")
         settings = GenerationSettings.from_mapping({**a["settings"], "dataset": a["dataset"]})
+        _check_start_neutralization(settings, where)
         plans.append(ArmPlan(a["dataset"], settings, _plan_sources(a, where, path)))
         _check_unique(plans[-1], seen)
     return plans
@@ -444,6 +461,9 @@ def _entry_settings(a, region: str, defaults: dict, rsettings: dict,
     """An arm's or seed's settings: defaults <- region settings <- its own, plus region and
     delay, checked against what BRAIN allows in the region."""
     allowed = REGION_SETTINGS[region]
+    if region in NO_REGULAR_SIMULATION:
+        raise ConfigError(f"{where}: BRAIN does not simulate regular alphas in region {region} "
+                          "(\"not available for simulation type REGULAR\"); set enabled: false")
     if not isinstance(a, dict) or not isinstance(a.get("dataset"), str) or not a["dataset"]:
         raise ConfigError(f"{where} needs a 'dataset' label")
     if not isinstance(a.get("settings") or {}, dict):
@@ -461,7 +481,21 @@ def _entry_settings(a, region: str, defaults: dict, rsettings: dict,
     if settings.neutralization not in allowed["neutralizations"]:
         raise ConfigError(f"{where} ({a['dataset']}): neutralization "
                           f"{settings.neutralization!r} is not allowed in {region}")
+    _check_start_neutralization(settings, where)
     return settings
+
+
+def _check_start_neutralization(settings: GenerationSettings, where: str) -> None:
+    """A plan's default neutralization is a group one: as a default for every idea a factor
+    neutralization can remove the signal itself (run rs20261111162604: revision ideas under
+    REVERSION_AND_MOMENTUM). The Generator may still choose a factor one or NONE for one
+    alpha with a reason the Critic reviews (gen-v5), and the Repair Agent tries them as
+    levers."""
+    if settings.neutralization not in GROUP_NEUTRALIZATIONS:
+        raise ConfigError(f"{where} ({settings.dataset}): neutralization "
+                          f"{settings.neutralization!r} as a starting setting; use one of "
+                          f"{', '.join(GROUP_NEUTRALIZATIONS)} (the Generator may pick a factor one or "
+                          "NONE per alpha with a reason; the Repair Agent tries them as levers)")
 
 
 @dataclass(frozen=True)
@@ -637,6 +671,7 @@ class ResearchRun:
         self.log: list[dict] = []
         self.stop_reason: str | None = None
         self.resumed: list[dict] = []
+        self.recovered: list[dict] = []
         self.warm_started = self._warm_start()
         self.region_sims, self.run_regions = self._pick_regions()
 
@@ -676,14 +711,25 @@ class ResearchRun:
                    if self.models.shadow_critics else [])
         return primary, shadows
 
+    def _arm_of(self, c: CandidateRecord, model: str | None) -> tuple | None:
+        """The arm a candidate in memory belongs to in this run: its own arm when that still
+        exists, else the same (dataset, region, model, delay) under the current prompt
+        version, so a prompt version bump (gen-v3 -> gen-v4) or a Strategy version from an
+        earlier run does not orphan its outcomes and open repairs. None = no such arm."""
+        key = (c.dataset, c.region, c.prompt_version, model, c.delay)
+        if key in self.arms:
+            return key
+        key = (c.dataset, c.region, self.generator_config.prompt_version, model, c.delay)
+        return key if key in self.arms else None
+
     def _warm_start(self) -> int:
         n = 0
         outcomes = self.memory.candidate_outcomes()
         models = arm_models(outcomes, self.memory.critic_reviews())
         for row in outcomes:
             c, d = row["candidate"], row["decision"]
-            key = (c.dataset, c.region, c.prompt_version, models.get(c.candidate_id), c.delay)
-            if d is not None and d.decision in DECIDED and key in self.director.state:
+            key = self._arm_of(c, models.get(c.candidate_id))
+            if d is not None and d.decision in DECIDED and key is not None:
                 self.director.update(key, d.decision == "accept")
                 n += 1
         return n
@@ -702,7 +748,9 @@ class ResearchRun:
         last = {r: seen.get(r, {}).get("last") or "" for r in regions}
         chosen = sorted(regions, key=lambda r: (counts[r], last[r], regions.index(r)))[:k]
         chosen = [r for r in regions if r in chosen]  # plan order
-        self._emit(f"--- regions this run: {chosen} (simulations so far: {counts})")
+        done = ", ".join(f"{r} {n}" for r, n in counts.items() if n) or "none yet"
+        self._emit(f"--- regions this run: {', '.join(chosen)} (fewest simulations so far; "
+                   f"done: {done})")
         return counts, chosen
 
     def _in_run(self, key: tuple) -> bool:
@@ -740,8 +788,8 @@ class ResearchRun:
             c, d = row["candidate"], row["decision"]
             if d is None or d.decision != "repair" or c.candidate_id in parents:
                 continue
-            key = (c.dataset, c.region, c.prompt_version, models.get(c.candidate_id), c.delay)
-            if key not in self.repair_queue or not self._in_run(key):
+            key = self._arm_of(c, models.get(c.candidate_id))
+            if key is None or not self._in_run(key):
                 continue
             dist = distance(d, row["result"], cfg.unmeasured_failure_penalty)
             open_rows.append((float("inf") if dist is None else dist, len(open_rows), key, row))
@@ -759,6 +807,41 @@ class ResearchRun:
         if self.resumed:
             self._emit(f"--- resumed {len(self.resumed)} repair(s) from memory: "
                        f"{[i.get('child') for i in self.resumed]}")
+
+    def _recover_submissions(self) -> None:
+        """Results BRAIN finished after an earlier run stopped waiting (our timeout, or a
+        crash): one poll each, and a finished one is decided like any other result and
+        credited to its arm. They spend no simulation budget (BRAIN already ran them) and
+        come before resumed repairs, so a recovered near miss can be repaired in this run.
+        One still running is tried again at the next run's start."""
+        rows = self.memory.unfinished_submissions()
+        if not rows:
+            return
+        models = arm_models(self.memory.candidate_outcomes(), self.memory.critic_reviews())
+        still = 0
+        for p in rows:
+            c = self.memory.get_candidate(p["candidate_id"])
+            if c is None:
+                continue
+            try:
+                out = self.pipeline.recover(c, p["brain_sim_id"])
+            except Exception as exc:  # a lookup that goes wrong never stops the run
+                log.warning("recovering %s failed: %s", c.candidate_id, exc)
+                out = None
+            if out is None:
+                still += 1
+                continue
+            key = self._arm_of(c, models.get(c.candidate_id))
+            if key is not None and out.decision in DECIDED:
+                self.director.update(key, out.decision == "accept")
+            self.recovered.append({"candidate_id": c.candidate_id, "decision": out.decision,
+                                   "failure_class": out.failure_class})
+        if self.recovered or still:
+            got = ", ".join(f"{i['candidate_id']} {i['decision']}/{i['failure_class']}"
+                            for i in self.recovered) or "none"
+            self._emit(f"--- recovered {len(self.recovered)} result(s) BRAIN finished after "
+                       f"an earlier run stopped waiting: {got}"
+                       + (f"; {still} not ready yet" if still else ""))
 
     def _prepare_seeds(self) -> None:
         """Turn the plan's seeds into fresh root candidates on BRAIN's current period (the
@@ -814,8 +897,9 @@ class ResearchRun:
             self.seed_queue.append((key, cand))
             self.seed_notes.append({"seed": name, "candidate_id": new_id, "arm": arm_label(key),
                                     "status": "queued"})
-        if self.seed_notes:
-            self._emit(f"--- seeds: {self.seed_notes}")
+        for n in self.seed_notes:   # a seed simulated in an earlier run is not news
+            if n["status"] != "simulated in an earlier run":
+                self._emit(f"--- seed {n['seed']}: {n['status']}")
 
     def _pool_expressions(self) -> list[str]:
         return [c.expression for a in self.pipeline.pool.alpha_ids()
@@ -823,6 +907,7 @@ class ResearchRun:
 
     def run(self, rounds: int) -> dict:
         self._prepare_seeds()
+        self._recover_submissions()
         if self.agents.repair.resume_from_memory:
             try:
                 self._resume_repairs()
@@ -899,8 +984,9 @@ class ResearchRun:
             return
         alloc = self._allocate(slots, live) if slots > 0 else {}
         entry["allocation"] = {arm_label(k): n for k, n in alloc.items()}
-        self._emit(f"--- round {r}: {slots} slots after {sum(len(c) for c in first.values())} "
-                   f"queued repair(s), allocation {entry['allocation']}")
+        repairs = sum(len(c) for c in first.values())
+        self._emit(f"--- round {r}: {f'{repairs} repair(s), then ' if repairs else ''}"
+                   f"{slots} new: {_slots_text(alloc) or 'none'}")
         lost, emptied = self._run_allocation(r, alloc, entry, "")
         passes = 0
         while not self.stop_reason:
@@ -915,7 +1001,7 @@ class ResearchRun:
             alloc = self._allocate(spare, live)
             entry.setdefault("refills", []).append(
                 {arm_label(k): n for k, n in alloc.items() if n})
-            self._emit(f"--- round {r}: refill {spare} unused slot(s): {entry['refills'][-1]}")
+            self._emit(f"--- round {r}: refill {spare}: {_slots_text(alloc)}")
             lost, emptied = self._run_allocation(r, alloc, entry, f"f{len(entry['refills'])}")
 
     def _allocate(self, slots: int, live: list[tuple]) -> dict:
@@ -1105,7 +1191,8 @@ class ResearchRun:
                                      "guidance": evo.guidance, "hypotheses": evo.hypotheses,
                                      "region_guidance": evo.region_guidance,
                                      "new_arms": added, "notes": evo.notes}
-        self._emit(f"--- strategy evolution: {evo.prompt_version} ({evo.source}), new arms {added}")
+        self._emit(f"--- strategy evolution: {evo.prompt_version} ({evo.source}), "
+                   f"{len(added)} new arms")
 
     def _add_arm(self, key: tuple, plan: ArmPlan, added: list[str]) -> None:
         if key in self.arms:
@@ -1143,6 +1230,7 @@ class ResearchRun:
             "regions_this_run": self.run_regions,   # None = every region (no rotation)
             "simulations_by_region": dict(self.region_sims),   # since region_balance_since
             "arms": arms,
+            "recovered_results": self.recovered,
             "resumed_repairs": self.resumed,
             "seeds": self.seed_notes,
             **_lever_tables(LeverStats.from_events(

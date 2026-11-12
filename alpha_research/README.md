@@ -209,6 +209,14 @@ result. When BRAIN asks for biometric verification (our consultant account does 
 new login), the CLI prints the link and waits for Enter in a terminal; without a terminal
 the login fails with an error that says so.
 
+Saved session: after a login the session cookie is saved to `session_file`
+(`config/brain.yaml`, default `~/.config/qip/brain_session.txt`; refused inside the repo;
+created 0600, cookie only) and the next commands reuse it, so BRAIN asks to verify again
+only once it ends the session (a 401 then logs in again and saves the new one). With a
+saved session `BRAIN_EMAIL` / `BRAIN_PASSWORD` are needed only for a new login.
+`cli brain auth` forces a fresh login and saves it; `cli brain logout` deletes the file;
+`session_file: null` turns saving off.
+
 Mapping (matches BRAIN's samples): `is.sharpe/fitness/turnover/returns/drawdown` as
 fractions, `is.margin` times 10,000 into bps, sub-universe Sharpe and cutoff from the
 `LOW_SUB_UNIVERSE_SHARPE` check's value and limit, weight concentration from the
@@ -247,7 +255,16 @@ Each round:
    the rest, so a repair is never stranded in an arm that gets no slot. Then children
    waiting for an arm take that arm's slots. At the start of a run, every `repair`
    decision in memory whose child never reached BRAIN (the run stopped, or no slot) is
-   repaired again (`repair.resume_from_memory`).
+   repaired again (`repair.resume_from_memory`). A memory candidate whose own arm no longer
+   exists (its prompt version was bumped, or it came from an earlier run's Strategy
+   version) counts for the arm with the same dataset, region, model and delay under the
+   current prompt version, for the warm start and for resumed repairs.
+   Before that, results BRAIN finished after an earlier run stopped waiting (our
+   `max_poll_seconds` timeout, or a crash after submitting) are fetched with one poll each
+   and decided like any other result, without spending simulation budget (report
+   `recovered_results`); one still running is tried again next run. A simulation that
+   fails with BRAIN's own error (`brain.yaml` `retry_error_messages`, "There was an error
+   while running the simulation") is submitted once more.
 3. **Alpha Generator** fills the remaining slots from the arm's next hypothesis or paper
    (the plan's sources are used in turn).
 4. **Cheap Pre-Filter** drops invalid expressions, experiments already simulated, and near
@@ -313,6 +330,22 @@ the Repair Agent works on what fails. A seed does not update the Director's view
 It is validated against its market's catalog; a seed not in memory, invalid, without an arm
 in its region/delay, or already simulated is listed in the report's `seeds` and skipped.
 `scripts/brain_discovery.py --datasets option6` adds named datasets to the catalogs.
+
+**Field roles, named fields, neutralization (gen-v4, gen-v5).** Each catalog field gets a
+role from BRAIN's type and the start of its description (`config/generator.yaml`
+`field_roles`): `id` (identifiers, codes, names, raw text), `time` (dates, times of day) or
+`signal`. The Generator does not list `id` fields (unless the hypothesis names one), tags
+`time` fields "for event timing", and sends back an alpha whose only datafields are `id`
+fields. Fields a hypothesis names are listed first, as the fields to build on. A plan's
+default neutralization must be a group one (MARKET, SECTOR, INDUSTRY, SUBINDUSTRY, COUNTRY);
+the plan loader refuses NONE and factor neutralizations there. Per alpha, the model may
+choose any neutralization the region allows (gen-v5): a factor one or NONE needs a
+`neutralization_reason` (without one, the arm's default is used), which is added to the
+rationale the Critic reads. The Critic flags a fresh alpha's factor neutralization as an
+advisory, judges the reason, and may revise back to a group neutralization (its reply's
+`neutralization`, critic-v5); NONE stays an advisory. The Generator's region notes show
+how each neutralization fared in that region and what the Repair Agent's neutralization
+levers fixed there, so the choices follow results.
 
 **The models behind the agents.** Each agent has its own model, set in the `models`
 section of `config/agents.yaml`. The provider comes from the model id: `claude-*` is
@@ -544,7 +577,7 @@ work in another.
   is told its market and gets `region_notes` from memory each round (accepts, top failures,
   how each neutralization fared and which repairs worked in that region). Strategy sees a
   per-region breakdown and may write `region_guidance`, which only that region's new arms
-  get. Versions: prefilter-v3, critic-v4, judge-v4, repair-v5, strategy-v4, gen-v3.
+  get. Versions: prefilter-v3, critic-v5, judge-v4, repair-v5, strategy-v4, gen-v5.
 - **Director per region.** `director.region_floor_share` (0.5) gives every plan region at
   least floor(share x slots / regions) slots a round; `director.max_region_share` (0.6)
   caps a region while another is below it. Arm posteriors are already per region.

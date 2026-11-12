@@ -297,6 +297,22 @@ def test_region_breakdown_and_notes(candidate):
     assert region_notes(rows, "JPN") is None
 
 
+def test_region_notes_show_what_neutralization_repairs_did(candidate):
+    # the Generator chooses neutralizations from this evidence (gen-v5)
+    from alpha_research.schemas import GateResult, ResultRecord
+    parent = candidate(candidate_id="p", neutralization="SUBINDUSTRY")
+    child = candidate(candidate_id="p_r1", neutralization="STATISTICAL", parent_id="p",
+                      lever="neutralize_statistical", generation=1)
+    rows = [{"candidate": parent, "result": ResultRecord("p", "complete", sharpe=1.2),
+             "decision": DecisionRecord("p", "repair", "sharpe", gate_results=[
+                 GateResult("sharpe_min", False, 1.2, 1.58, "")])},
+            {"candidate": child, "result": ResultRecord("p_r1", "complete", sharpe=1.9),
+             "decision": DecisionRecord("p_r1", "accept", "none")}]
+    notes = region_notes(rows, "USA")
+    assert "Neutralization changes by the Repair Agent there" in notes
+    assert "neutralize_statistical 1/0/1 (sharpe)" in notes
+
+
 def test_strategy_region_guidance_goes_only_to_that_region(candidate):
     rows = [_outcome(candidate, "a", "USA", "SUBINDUSTRY", "reject", "sharpe")]
     reply = json.dumps({"guidance": ["g"], "region_guidance": {"EUR": ["use COUNTRY"]},

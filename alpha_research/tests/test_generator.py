@@ -354,10 +354,12 @@ def test_system_prompt_lists_rules_operators_and_relevant_fields(spec, cfg):
 def test_system_prompt_lists_the_regions_neutralizations(spec, settings, cfg):
     llm = ScriptedLLMClient([alphas(E1)])
     make(llm, spec, settings, cfg).generate(Source("hypothesis", HYP), 1, batch_id="b1")
-    line = next(l for l in llm.calls[0]["system"].splitlines() if l.startswith("Neutralizations allowed"))
-    assert "CROWDING" in line and "SUBINDUSTRY" in line and "COUNTRY" not in line   # USA has no COUNTRY
-    assert "factor neutralizations" in line
-    assert "one of the neutralizations allowed above" in llm.calls[0]["user"]
+    line = next(l for l in llm.calls[0]["system"].splitlines() if l.startswith("Neutralization"))
+    # every neutralization the region allows, groups and factor ones apart; factor or
+    # NONE needs a reason
+    assert "SUBINDUSTRY" in line and "COUNTRY" not in line   # USA has no COUNTRY
+    assert "factor: " in line and "CROWDING" in line and "NONE (keeps a market bet)" in line
+    assert "neutralization_reason" in line and "neutralization_reason" in llm.calls[0]["user"]
 
 
 def test_exploration_fields_span_other_datasets_and_carry_hints(spec, cfg):
@@ -371,7 +373,7 @@ def test_exploration_fields_span_other_datasets_and_carry_hints(spec, cfg):
     assert select_datafields(catalog, "opt options", 12, 0.5, meta) == (rel, exp)   # stable
     meta["fnd_f1"]["type"] = "SYMBOL"
     meta["news_f2"]["type"] = "VECTOR"
-    _, exp2 = select_datafields(catalog, "opt options", 39, 1.0, meta)   # every eligible field
+    _, exp2 = select_datafields(catalog, "opt options", 38, 1.0, meta)   # every eligible field
     assert "fnd_f1" not in exp2 and "news_f2" in exp2
     from alpha_research.generator import _annotate
     assert _annotate("news_f2", meta) == "news_f2 [vector: wrap in vec_avg or vec_sum, cov 50%, 7 alphas]"
@@ -487,3 +489,75 @@ def test_guidance_is_shown_in_the_system_prompt(spec, settings, cfg):
     llm = ScriptedLLMClient([alphas(E1)])
     make(llm, spec, settings, cfg).generate(Source("hypothesis", HYP), 1, batch_id="g2")
     assert "Lessons from earlier" not in llm.calls[0]["system"]
+
+
+# ------------------------------------------------------------------ field roles and named fields
+
+ROLE_META = {
+    "nws_set": {"dataset": "nws", "type": "VECTOR",
+                "description": "Identifies which content set the record came from"},
+    "nws_nip": {"dataset": "nws", "type": "VECTOR",
+                "description": "A granular score between -1.00 and 1.00 for news impact"},
+    "anl_ccy": {"dataset": "anl", "type": "MATRIX", "description": "Currency (ISO)"},
+    "anl_dt": {"dataset": "anl", "type": "MATRIX",
+               "description": "Expected Earnings Report Date"},
+    "anl_eps": {"dataset": "anl", "type": "MATRIX",
+                "description": "Currency-adjusted consensus EPS estimate"},
+    "currency": {"dataset": "pv", "type": "GROUP", "description": "Currency"},
+}
+
+
+def test_field_roles_come_from_the_start_of_brains_description(cfg):
+    from alpha_research.generator import field_role
+    roles = {f: field_role(f, ROLE_META, cfg) for f in ROLE_META}
+    assert roles == {"nws_set": "id", "nws_nip": "signal", "anl_ccy": "id", "anl_dt": "time",
+                     "anl_eps": "signal",          # "currency" later in the text is not an id
+                     "currency": "signal"}         # a GROUP field is a group
+    assert field_role("x", {"x": {"type": "SYMBOL"}}, cfg) == "id"
+
+
+def test_named_fields_come_first_and_id_fields_are_hidden(cfg):
+    from alpha_research.generator import select_datafields
+    text = "news impact (nws_nip) over the last 5 days, counting each story event set"
+    rel, _ = select_datafields(list(ROLE_META), text, 3, 0.0, ROLE_META, cfg)
+    assert rel[0] == "nws_nip" and "nws_set" not in rel and "anl_ccy" not in rel
+    # a field the task names explicitly is listed even when it looks like an id
+    rel, _ = select_datafields(list(ROLE_META), "use nws_set", 3, 0.0, ROLE_META, cfg)
+    assert rel[0] == "nws_set"
+
+
+def test_prompt_marks_named_and_timing_fields(spec, cfg):
+    prompt = build_system_prompt(spec, list(ROLE_META), "news impact nws_nip around anl_dt",
+                                 cfg, meta=ROLE_META)
+    named = next(l for l in prompt.splitlines() if l.startswith("Fields named in the task"))
+    assert "nws_nip" in named and "date/time: for event timing" in named
+    assert "nws_set" not in prompt and "anl_ccy" not in prompt
+
+
+def test_an_alpha_built_only_on_identifier_fields_is_sent_back(spec, settings, cfg):
+    llm = ScriptedLLMClient([alphas("rank(vec_avg(nws_set))"),
+                             alphas("rank(vec_avg(nws_nip))")])
+    gen = AlphaGenerator(llm, spec, settings, cfg, datafields=list(ROLE_META),
+                         field_meta=ROLE_META)
+    res = gen.generate(Source("hypothesis", HYP), 1, batch_id="b1")
+    assert [c.expression for c in res.candidates] == ["rank(vec_avg(nws_nip))"]
+    assert "only identifier/text fields (nws_set)" in llm.calls[1]["user"]
+
+
+def test_model_may_choose_a_factor_or_no_neutralization_with_a_reason(spec, settings, cfg):
+    llm = ScriptedLLMClient([json.dumps({"alphas": [
+        {"expression": E1, "neutralization": "CROWDING", "rationale": "r1",
+         "neutralization_reason": "the idea should not be a crowding bet"},
+        {"expression": "rank(-ts_delta(close, 9))", "neutralization": "NONE"},   # no reason
+        {"expression": "rank(-ts_delta(close, 11))", "neutralization": "industry"},
+        {"expression": "rank(-ts_delta(close, 13))", "neutralization": "COUNTRY",
+         "neutralization_reason": "x"}]})])   # COUNTRY is not allowed in USA
+    res = make(llm, spec, settings, cfg).generate(Source("hypothesis", HYP), 4, batch_id="b1")
+    assert [c.neutralization for c in res.candidates] == \
+        ["CROWDING", settings.neutralization, "INDUSTRY", settings.neutralization]
+    a, b, _, d = res.candidates
+    # the reason goes to the Critic with the rationale
+    assert res.rationales[a.candidate_id] == \
+        "r1 Neutralization CROWDING: the idea should not be a crowding bet"
+    assert any("needs a neutralization_reason" in w for w in res.warnings[b.candidate_id])
+    assert any("not allowed in USA" in w for w in res.warnings[d.candidate_id])

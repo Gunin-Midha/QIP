@@ -715,3 +715,32 @@ Fixed:
 **Status.** The skew/VRP seed uses `opt6_ivhvxernratio` (option6), which is not in our USA D1 catalog (option6 was not among the 20 datasets fetched), so it is skipped as invalid until `scripts/brain_discovery.py --regions USA --datasets option6` is run. Offline check on a copy of memory: the IV seed was the first simulation of the run, on 2014-01-01..2023-12-31.
 
 657 tests pass.
+
+### First plan v2 run (2026-11-11, `rs20261111162604`)
+
+**Result.** The skew + VRP seed was accepted after two repairs: `seed_774d71e6` (Sharpe 1.65, fitness 1.07, failed only PROD_CORRELATION 0.81 > 0.70) -> `neutralize_statistical` (PROD_CORRELATION gone, fitness 0.90) -> `wrap_in_smoothing` (ts_decay_linear 10 around the whole signal): `seed_774d71e6_r1_r2`, Sharpe 1.84, fitness 1.35, turnover 13.2%, sub-universe 1.00, self-correlation 0.13, PROD_CORRELATION 0.655 < 0.70; every BRAIN check passes. The IV spread seed reached Sharpe 1.14 / fitness 0.52 (rank_transform) and hit the repair depth limit. Fresh ideas: GLB and USA far misses (Sharpe -0.26..0.26).
+
+**Problems found and fixed.**
+- BRAIN refuses regular alphas in region ALL (400 "Region ALL is not available for simulation type REGULAR"): 7 of 20 simulations wasted. `schemas.NO_REGULAR_SIMULATION`; the plan loader refuses ALL arms and seeds; ALL is `enabled: false` in plan v2 (35 arms).
+- BRAIN's parser rejects scientific notation (`1e-08`: "Unexpected character 'e'"); the lexer now raises with the plain decimal to use.
+- A GLB simulation hit `max_poll_seconds` 600; raised to 1200.
+- The console printed every arm's allocation (140+ zeros) and every new evolution arm; now only arms with slots and the first 6 new arms plus a count.
+- Seen, not changed: Nemotron (OpenRouter) gave an empty reply and was marked down for the run (failover worked); Gemini 503s were retried; Groq per-minute limits were waited out.
+
+### Why GLB looked weak, and general guards (2026-11-11, gen-v4)
+
+**Diagnosis.** Four GLB results, all Sharpe -0.26..0.26 (BRAIN's GLB limits are not stricter: sub-universe limit 0.08-0.16). Both news20 alphas used `nws20_rp_story_event_count`, an identifier ("Identifies which content set the record came from"): the hypothesis named the sentiment fields, but the relevance ranking scores name parts ("story", "event", "count") and did not favour named fields. Both analyst69 revision alphas started under REVERSION_AND_MOMENTUM (my plan setting), which removes much of a revision signal. analyst69 has no GLB data before mid-2015.
+
+**Owner: no region-specific fixes, general ones.** Built: field roles (`generator.field_role`, patterns in `config/generator.yaml` matched at the start of BRAIN's description; checked on all 17 catalogs: 621 id, 1,291 time of ~78,000; keyword matching anywhere in the text was tried first and mislabelled real signals such as currency-adjusted estimates and implied volatilities, so it was dropped); id fields left out of the prompt unless named; time fields tagged; an alpha using only id fields is sent back to the model; fields named in the hypothesis listed first as the ones to build on (`named_fields`); new alphas start from a group neutralization (plan loader, Generator), factor neutralizations and NONE stay Repair Agent levers; plan v2's three factor-neutralization overrides removed. Generator prompt `gen-v4`.
+
+674 tests pass.
+
+### Model-chosen neutralization, prompt-version resume, BRAIN-side losses (2026-11-12)
+
+**Model decides neutralization (owner decision 2026-11-11), gen-v5 / critic-v5.** The Generator may choose any neutralization the region allows. A factor neutralization or NONE needs a one-line `neutralization_reason`; without it the arm's default is used (warning in the generation report). The reason is appended to the rationale (`Neutralization X: ...`) so the Critic sees it. The Critic gets a rule advisory for a fresh alpha's factor neutralization (repair children are exempt: their lever comes from results), a prompt paragraph on when a factor neutralization fits and when it removes the signal, and may revise only the neutralization (reply key `neutralization`, checked against the region). NONE remains an advisory. Evidence: `strategy.region_notes` adds the Repair Agent's neutralization levers in the region (fixed/improved/tried per failure class) to the per-neutralization accept counts it already showed. Plan defaults stay group neutralizations (`research._check_start_neutralization`).
+
+**Open repairs after a prompt version bump.** `_warm_start` and `_resume_repairs` keyed on the candidate's `prompt_version`, so gen-v3 -> gen-v4 orphaned earlier runs' open repairs and warm-start evidence. `ResearchRun._arm_of` now uses the candidate's own arm if it exists, else the same (dataset, region, model, delay) under the current prompt version.
+
+**BRAIN-side losses (run rs20261111174623: 2 of 3 simulations).** (1) Timeouts: `memory.pending()` skips any candidate with a result, and a timeout is stored as one, so timed-out submissions were never looked at again. New read-only `MemoryStore.unfinished_submissions()` (latest result `timeout` with a simulation id, plus pending submissions without any result); at run start `ResearchRun._recover_submissions` polls each once (`Simulator.recover`, `Pipeline.recover`); a finished one is decided like any other (no simulation budget, Director credited, before resumed repairs so a recovered near miss can be repaired), one still running waits for the next run, one BRAIN no longer knows is skipped. Report `recovered_results`. (2) BRAIN's generic error: `brain.yaml` `retry_error_messages`; `RealBrainClient.poll` marks such a failure `retryable` and the simulator submits once more (the new simulation id is on the result; `pending_submissions` keeps the first, since it is append-only).
+
+687 tests pass.

@@ -20,6 +20,23 @@ MAIN_CONFIG = ROOT / "config" / "thresholds.yaml"
 PLAYBOOK = ROOT / "config" / "repair_playbook.yaml"
 
 
+@pytest.fixture(autouse=True)
+def _no_real_session_or_network(tmp_path, monkeypatch):
+    """Tests never touch the network (hard rule 1). HOME points at an empty tmp dir, so the
+    saved BRAIN session (config/brain.yaml session_file, under ~) is never found; real network
+    opens raise. Tests that fake the network replace these calls themselves."""
+    import urllib.request
+    home = tmp_path / "_home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    def _blocked(*args, **kwargs):
+        raise RuntimeError("a test tried to use the network")
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", _blocked)
+    monkeypatch.setattr(urllib.request, "urlopen", _blocked)
+
+
 @pytest.fixture
 def no_holdout_config(tmp_path):
     """The main config with the holdout cleared, for the 'holdout must be set' paths."""

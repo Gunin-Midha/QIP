@@ -55,6 +55,9 @@ REGION_SETTINGS = {
     "GBR": {"universes": ("TOP700",), "delays": (0, 1), "neutralizations": _NEUTS},
 }
 REGIONS = set(REGION_SETTINGS)
+# BRAIN lists ALL in OPTIONS /simulations but refuses regular alphas there (400 "Region ALL
+# is not available for simulation type REGULAR", run rs20261111162604), so plans can't use it.
+NO_REGULAR_SIMULATION = frozenset({"ALL"})
 UNIVERSES = {u for s in REGION_SETTINGS.values() for u in s["universes"]}
 NEUTRALIZATIONS = {n for s in REGION_SETTINGS.values() for n in s["neutralizations"]}
 
