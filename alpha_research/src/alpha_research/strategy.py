@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from .generator import GenerationError, ask_json
 from .lever_stats import LeverStats, repair_events
 from .llm import LLMClient, ModelDown
-from .prompts import strategy_system, strategy_user
+from .prompts import BAR_CHECKS, strategy_system, strategy_user
 
 @dataclass(frozen=True)
 class StrategyConfig:
@@ -139,6 +139,19 @@ def region_breakdown(outcomes: list[dict]) -> dict:
                 "datasets": len(v["datasets"]),
                 "neutralizations": dict(sorted(v["neutralizations"].items()))}
             for r, v in sorted(regions.items())}
+
+
+def brain_limits(outcomes: list[dict]) -> dict[tuple, dict[str, float]]:
+    """{(region, delay): {check: limit}}: BRAIN's own limits as reported with its checks on
+    our results (the latest seen). They differ a lot by market: JPN/AMR delay 0 need Sharpe
+    2.69 and fitness 1.5, CHN delay 0 Sharpe 3.49 (run rs20261112054223), USA delay 1 1.58."""
+    out: dict[tuple, dict[str, float]] = {}
+    for row in outcomes:
+        c, r = row["candidate"], row["result"]
+        for check, v in ((r.check_values or {}).items() if r is not None else ()):
+            if check in BAR_CHECKS and isinstance(v, dict) and v.get("limit") is not None:
+                out.setdefault((c.region, c.delay), {})[check] = v["limit"]
+    return out
 
 
 def region_notes(outcomes: list[dict], region: str, *, max_levers: int = 3) -> str | None:

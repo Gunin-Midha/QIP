@@ -52,6 +52,22 @@ def test_the_v2_plan_loads_every_region_and_delay():
     assert all(p.catalog is not None and f"_d{p.settings.delay}." in p.catalog.name for p in plans)
 
 
+def test_plan_v3_is_delay_1_on_each_markets_main_datasets():
+    from alpha_research.research import load_seeds
+    path = ROOT / "config" / "research_plan.v3.yaml"
+    plans = load_plan(path)
+    assert len(plans) == 30 and {p.settings.delay for p in plans} == {1}
+    by_region = {}
+    for p in plans:
+        by_region.setdefault(p.settings.region, set()).add(p.dataset)
+    assert set(by_region) == {"USA", "GLB", "EUR", "ASI", "CHN", "JPN", "AMR", "IND", "DEU", "GBR"}
+    # price/volume plus the region's main model and fundamental/analyst sets (not one alpha)
+    assert all("pv1" in ds for r, ds in by_region.items() if r != "USA")
+    assert all(len(ds) == 3 for ds in by_region.values())
+    # only the owner's two earlier seeds, no single-alpha seeds of our own
+    assert len(load_seeds(path)) == 2
+
+
 def test_settings_are_inherited_and_arm_settings_win(tmp_path):
     regions = {"USA": usa(arms=[{"dataset": "pv1", "delay": 0, "settings": {"decay": 2},
                                  "hypotheses": ["h"]},

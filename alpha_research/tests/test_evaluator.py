@@ -41,6 +41,47 @@ def test_sharpe_near_miss_repairs(config, playbook, sharpe):
     assert (d.decision, d.failure_class) == ("repair", "sharpe")
 
 
+def test_negative_sharpe_goes_to_the_sign_flip_before_turnover(config, playbook):
+    # run rs20261112054223: Sharpe -1.68 with turnover 109% was smoothed, never flipped
+    d = evaluate(passing(sharpe=-0.90, turnover=0.85), config, playbook)
+    assert (d.decision, d.failure_class) == ("repair", "sharpe")
+    assert any(r.startswith("sign first") for r in d.reasons)
+    assert "sent to sharpe levers ahead of turnover" in d.reasons
+    # a positive near miss keeps the usual priority (turnover first)
+    assert evaluate(passing(sharpe=1.10, turnover=0.85), config, playbook).failure_class == \
+        "turnover"
+    # a far miss is not rerouted
+    assert evaluate(passing(sharpe=-0.30, turnover=0.85), config, playbook).failure_class == \
+        "turnover"
+
+
+def rn(sharpe):
+    return {"risk_neutralized": {"sharpe": sharpe}}
+
+
+def test_risk_neutralized_sharpe_counts_for_the_near_miss(make_config, playbook):
+    config = make_config(repair__risk_neutralized_gap=0.5)
+    assert evaluate(passing(sharpe=0.30), config, playbook).decision == "reject"
+    d = evaluate(passing(sharpe=0.30, alt_stats=rn(1.20)), config, playbook)
+    assert (d.decision, d.failure_class) == ("repair", "sharpe")
+    assert any(r.startswith("factor neutralization first") for r in d.reasons)
+    # negative raw, far better risk-neutralized: factors first, not the sign
+    d = evaluate(passing(sharpe=-0.30, turnover=0.85, alt_stats=rn(1.20)), config, playbook)
+    assert d.failure_class == "sharpe"
+    assert any(r.startswith("factor neutralization first") for r in d.reasons)
+    assert not any(r.startswith("sign first") for r in d.reasons)
+    # a raw near miss keeps the usual priority (turnover first); the factor route only takes
+    # over when the risk-neutralized Sharpe is what makes the alpha repairable
+    d = evaluate(passing(sharpe=1.0, turnover=0.85, alt_stats=rn(2.0)), config, playbook)
+    assert d.failure_class == "turnover"
+    d = evaluate(passing(sharpe=1.0, alt_stats=rn(2.0)), config, playbook)
+    assert any(r.startswith("factor neutralization first") for r in d.reasons)
+    # gap off (null): the risk-neutralized value still counts for the near miss, no factor route
+    d = evaluate(passing(sharpe=0.30, alt_stats=rn(1.20)), make_config(), playbook)
+    assert d.decision == "repair"
+    assert not any(r.startswith("factor neutralization first") for r in d.reasons)
+
+
 def test_fitness_near_miss(config, playbook):
     assert evaluate(passing(fitness=0.73), config, playbook).decision == "repair"
     assert evaluate(passing(fitness=0.40), config, playbook).decision == "reject"

@@ -347,6 +347,24 @@ advisory, judges the reason, and may revise back to a group neutralization (its 
 how each neutralization fared in that region and what the Repair Agent's neutralization
 levers fixed there, so the choices follow results.
 
+**Pipeline guards from the non-USA runs (2026-11-12).**
+- *Sign and factors first.* A failed Sharpe goes to the Sharpe levers ahead of a
+  higher-priority class when the raw Sharpe is negative and a near miss by size
+  (`flip_sign` first), or when BRAIN's risk-neutralized Sharpe is a near miss and at least
+  `repair.risk_neutralized_gap` (0.5, thresholds.yaml) above the raw one; the Repair Agent
+  then tries the `neutralize_*` levers first and never flips the sign. The factor route takes
+  over from another class only when the raw Sharpe alone is too far to repair. The Sharpe
+  near-miss test counts the larger of |raw| and |risk-neutralized|.
+- *Sparse fields.* `critic.sparse_fields` (agents.yaml: dataset categories news, sentiment,
+  socialmedia, or coverage below 0.5): a fresh alpha that feeds such a field into a `ts_*`
+  operator without a backfill is revised by the Critic's rule check to
+  `ts_backfill(<field>, 20)`; the fix stands unless the model writes its own revision or
+  drops the alpha. Repair children are left alone.
+- *BRAIN's real bar.* BRAIN's limits as reported with its checks on our results
+  (`strategy.brain_limits`, per region and delay: e.g. Sharpe 2.69 at JPN/AMR delay 0, 3.49
+  at CHN delay 0) are shown in every agent's context and as the first line of each
+  Generator arm's guidance.
+
 **The models behind the agents.** Each agent has its own model, set in the `models`
 section of `config/agents.yaml`. The provider comes from the model id: `claude-*` is
 Anthropic, `gemini-*` is Google (Gemini's REST API over the standard library). A null
@@ -577,7 +595,7 @@ work in another.
   is told its market and gets `region_notes` from memory each round (accepts, top failures,
   how each neutralization fared and which repairs worked in that region). Strategy sees a
   per-region breakdown and may write `region_guidance`, which only that region's new arms
-  get. Versions: prefilter-v3, critic-v5, judge-v4, repair-v5, strategy-v4, gen-v5.
+  get. Versions: prefilter-v3, critic-v6, judge-v4, repair-v5, strategy-v4, gen-v5.
 - **Director per region.** `director.region_floor_share` (0.5) gives every plan region at
   least floor(share x slots / regions) slots a round; `director.max_region_share` (0.6)
   caps a region while another is below it. Arm posteriors are already per region.

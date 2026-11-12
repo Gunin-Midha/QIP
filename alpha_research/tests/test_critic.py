@@ -84,6 +84,61 @@ def test_critic_can_undo_a_neutralization_whose_reason_does_not_hold(candidate):
     assert critic.revision(c, None, "COUNTRY") is None
 
 
+@pytest.mark.parametrize("expr, unfilled", [
+    ("rank(ts_zscore(snt, 20))", ["snt"]),
+    ("rank(ts_zscore(ts_backfill(snt, 20), 20))", []),
+    ("a = pos - neg; rank(ts_mean(a, 5))", ["neg", "pos"]),
+    ("a = ts_backfill(pos, 5); rank(ts_mean(a, 5))", []),
+    ("rank(snt)", []),                                   # no ts_* operator: nothing to fill
+    ("rank(ts_zscore(close, 20))", []),
+])
+def test_sparse_unfilled(expr, unfilled):
+    from alpha_research.critic import sparse_unfilled
+    assert sorted(sparse_unfilled(expr, {"snt", "pos", "neg"})) == unfilled
+
+
+def test_sparse_field_rule_picks_fields_by_category_or_coverage():
+    from alpha_research.critic import SparseFieldRule
+    rule = SparseFieldRule.from_dict({"categories": ["sentiment"], "coverage_below": 0.5})
+    meta = {"snt": {"category": "sentiment", "coverage": 0.85},
+            "eps": {"category": "analyst", "coverage": 0.3},
+            "pv": {"category": "pv", "coverage": 1.0}}
+    assert rule.fields(meta) == {"snt", "eps"} and rule.lookback == 20
+    assert SparseFieldRule.from_dict(None) is None
+    with pytest.raises(ValueError):
+        SparseFieldRule.from_dict({"lookback": 0})
+
+
+def _sparse_critic(llm=None):
+    return Critic(SPEC, llm=llm, sparse={("USA", 1): {"snt23_2pos_mean"}}, sparse_lookback=20)
+
+
+def test_sparse_field_without_backfill_is_revised_by_the_rule(candidate):
+    c = candidate(candidate_id="g1", expression="rank(ts_zscore(snt23_2pos_mean, 20))")
+    out = review_and_debate([c], {}, _sparse_critic(), DebateJudge())
+    child = out.to_simulate[0]
+    assert child.candidate_id == "g1_c1" and child.lever == "critic_revision"
+    assert child.expression == "rank(ts_zscore(ts_backfill(snt23_2pos_mean, 20), 20))"
+    # a repair child is left alone: the lever's change stays the only change
+    r = candidate(candidate_id="p_r1", expression=c.expression, parent_id="p",
+                  lever="increase_decay", generation=1)
+    assert review_and_debate([r], {}, _sparse_critic(), DebateJudge()).to_simulate == [r]
+    # other markets use their own sparse set (none here)
+    eur = candidate(candidate_id="e1", expression=c.expression, region="EUR", universe="TOP2500")
+    assert review_and_debate([eur], {}, _sparse_critic(), DebateJudge()).to_simulate == [eur]
+
+
+def test_model_simulate_does_not_clear_the_backfill_but_its_own_revision_wins(candidate):
+    c = candidate(candidate_id="g1", expression="rank(ts_zscore(snt23_2pos_mean, 20))")
+    out = review_and_debate([c], {}, _sparse_critic(ScriptedLLMClient([reviews(
+        {"candidate_id": "g1", "verdict": "simulate"})])), DebateJudge())
+    assert "ts_backfill(snt23_2pos_mean, 20)" in out.to_simulate[0].expression
+    own = "rank(ts_mean(ts_backfill(snt23_2pos_mean, 60), 20))"
+    out = review_and_debate([c], {}, _sparse_critic(ScriptedLLMClient([reviews(
+        {"candidate_id": "g1", "verdict": "revise", "revised_expression": own})])), DebateJudge())
+    assert out.to_simulate[0].expression == own
+
+
 def test_repair_children_get_rule_checks_only(candidate):
     fresh = candidate(candidate_id="g1", expression="ts_delta(close, 5)")
     child = candidate(candidate_id="p_r1", expression="ts_delta(close, 10)", parent_id="p",

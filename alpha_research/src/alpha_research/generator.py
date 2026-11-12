@@ -203,7 +203,7 @@ def load_datafields(path: str | Path) -> list[str]:
 def load_datafield_meta(path: str | Path) -> dict[str, dict]:
     """Per-field facts from a JSON catalog written by ``cli brain datafields``: coverage
     (share of instruments with a value), alpha_count (BRAIN alphas using the field, a
-    crowding measure) and dataset. Empty for a catalog of bare ids or a text file."""
+    crowding measure), dataset and its category (news, sentiment, ...). Empty for a catalog of bare ids or a text file."""
     if Path(path).suffix.lower() != ".json":
         return {}
     data = json.loads(Path(path).read_text())
@@ -212,9 +212,10 @@ def load_datafield_meta(path: str | Path) -> dict[str, dict]:
     meta = {}
     for x in data:
         if isinstance(x, dict) and isinstance(x.get("id"), str):
-            ds = x.get("dataset")
+            ds, cat = x.get("dataset"), x.get("category")
             meta[x["id"]] = {"coverage": x.get("coverage"), "alpha_count": x.get("alphaCount"),
                              "dataset": ds.get("id") if isinstance(ds, dict) else ds,
+                             "category": cat.get("id") if isinstance(cat, dict) else cat,
                              "type": x.get("type"), "description": x.get("description")}
     return meta
 

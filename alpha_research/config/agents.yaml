@@ -13,6 +13,14 @@ prefilter:
 
 critic:
   use_model: true                  # false = rule checks only
+  # Fields with a value on few days: a fresh alpha that feeds one into a ts_* operator
+  # without ts_backfill is revised to ts_backfill(field, lookback) by the rule check (run
+  # rs20261112054223: JPN sentiment z-scores had half the book in one stock). Category = the
+  # catalog's dataset category. Builder defaults 2026-11-12 (OQ-20). Remove the block = off.
+  sparse_fields:
+    categories: [news, sentiment, socialmedia]
+    coverage_below: 0.5
+    lookback: 20
 
 debate:
   use_model: true                  # false = the critic's verdict stands

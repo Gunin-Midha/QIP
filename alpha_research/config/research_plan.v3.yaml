@@ -1,0 +1,291 @@
+# Research plan v3 (2026-11-12, DRAFT): each market's most-used datasets, delay 1 first.
+#
+# Why (REPORT.md, "Why non-USA results were poor", 2026-11-12): plan v2 built every non-USA
+# arm on news, sentiment, short-interest or niche alternative data, several with almost no
+# BRAIN alphas in that market, and half its arms were delay 0, where BRAIN's bar is Sharpe
+# 2.69 (JPN, AMR) or 3.49 (CHN) with fitness 1.5. 21 non-USA results, best Sharpe 0.48.
+#
+# How the datasets were picked (captures/consultant_catalogs/, 2026-11-11): per region at
+# delay 1, from the datasets whose fields we downloaded, the most-used on BRAIN in that
+# market (datasets_<market>.json alphaCount): pv1 (price/volume) everywhere, the region's
+# main model dataset, and its main fundamental or analyst dataset. These are where BRAIN
+# users have found signal in each market. They are also crowded, so the hypotheses avoid
+# the plain textbook forms (production-correlation risk): conditioned, group-relative or
+# combined versions, and the sub-scores of a model rather than its headline score.
+# Every field named below is in that region/delay's catalog (checked 2026-11-12). VECTOR
+# fields (several values per stock-day) must be wrapped in a vec_* operator.
+#
+# Delay 0 is off everywhere. Turn it back on in a region once it has a delay-1 accept.
+#
+# Owner rule (2026-11-12): the plan must improve general performance, not one alpha's. So
+# no arm or seed exists to push a single alpha: the choices above are by market and
+# dataset class, and every hypothesis is a general idea the Generator writes several
+# alphas for. The two seeds below are the owner's own earlier choices (plan v2).
+#
+# Layout and settings rules: as plan v2 (research.load_plan). Settings: largest universe
+# per region; a group neutralization by default (the loader refuses others as defaults; the
+# Generator may pick a factor one or NONE per alpha with a reason, gen-v5).
+#
+# Size: 30 arms x 4 generator models = 120 Director arms. Region rotation
+# (director.regions_per_run 3) works on 3 regions per run.
+
+seeds:
+  # IV spread, accepted 2026-11-04 at user level (Sharpe 1.38, fitness 1.01).
+  - from_memory: rs20261103184506r01a0_002_r1x
+  # Skew + volatility risk premium, accepted in the BRAIN web app (owner, 2026-11-11);
+  # skipped as invalid until option6 is in the USA D1 catalog (see plan v2).
+  - dataset: option8
+    region: USA
+    delay: 1
+    settings: {universe: TOP3000, decay: 0, truncation: 0.01, neutralization: INDUSTRY}
+    expression: |
+      skew = winsorize(ts_backfill(implied_volatility_call_90 - implied_volatility_put_90, 60), std=3);
+      vrp = winsorize(ts_backfill(opt6_ivhvxernratio, 60), std=3);
+      liq = rank(volume*close);
+      ts_decay_linear(zscore(skew), 10) * (1 - liq) + ts_decay_linear(zscore(skew) + zscore(vrp), 5) * liq
+
+defaults:
+  truncation: 0.08
+  start_date: "2014-01-01"
+  end_date: "2023-12-31"
+
+regions:
+  USA:
+    enabled: true
+    settings: {universe: TOP3000, neutralization: SUBINDUSTRY, decay: 4}
+    catalogs:
+      1: ../captures/consultant_catalogs/datafields_usa_top3000_d1.json
+    arms:
+      - dataset: option8
+        delay: 1
+        hypotheses:
+          - "Implied volatility spread (Cremers and Weinbaum 2010): stocks whose at-the-money call implied volatility exceeds put implied volatility (implied_volatility_call_60 minus implied_volatility_put_60, scaled by implied_volatility_mean_60) outperform over 1-4 weeks, because informed traders buy calls before good news. The plain version is crowded on BRAIN, so differentiate it: combine the 30- and 60-day spreads, or condition on the volatility skew (implied_volatility_mean_skew_120)."
+          - "Volatility risk premium: stocks whose implied volatility (implied_volatility_mean_30) is high relative to their own realised volatility (historical_volatility_30 or parkinson_volatility_30) are priced for risk that rarely arrives and underperform over the next month. Rank the implied-minus-realised gap within subindustry and smooth it."
+      - dataset: fundamental6
+        delay: 1
+        settings: {decay: 6}
+        hypotheses:
+          - "Cash-based profitability: operating cash flow relative to assets (cashflow_op / assets) predicts returns better than earnings because accruals mean-revert (Sloan 1996); rank it within subindustry and combine with a low accrual measure (operating_income minus cashflow_op, scaled by assets). Fundamentals update quarterly: backfill with ts_backfill and keep decay high."
+          - "Investment and leverage: firms growing assets fast (assets relative to its value a year ago, ts_delay about 252 days) or raising debt (debt / assets rising) underperform (Cooper, Gulen and Schill 2008); firms with high cash relative to enterprise_value outperform. Rank within subindustry."
+      - dataset: analyst4
+        delay: 1
+        settings: {decay: 5}
+        hypotheses:
+          - "Estimate revisions: the change in the mean EPS estimate (est_eps) over 20-60 days, scaled by the stock price (close), predicts returns because analysts and investors adjust slowly. Backfill est_eps first; rank within subindustry; the 60-day version keeps turnover low."
+          - "Coverage and surprise: stocks where the announced EBIT (anl4_ebit_value) beats the level implied by earlier estimates, among names with more estimates (anl4_qf_az_eps_number), drift up after the announcement. Condition the surprise on coverage so a single analyst does not drive the signal."
+
+  GLB:
+    enabled: true
+    settings: {universe: TOP3000, neutralization: COUNTRY, decay: 4}
+    catalogs:
+      1: ../captures/consultant_catalogs/datafields_glb_top3000_d1.json
+    arms:
+      - dataset: pv1
+        delay: 1
+        hypotheses:
+          - "Low-volume reversal: short-term reversal (minus the 5-day return) is stronger when the move came on low volume (volume relative to adv20), because such moves are liquidity noise rather than news (Campbell, Grossman and Wang 1993). Weight the reversal by one minus the volume rank and rank within country."
+          - "52-week-high anchoring (George and Hwang 2004): stocks trading close to their 252-day high (close / ts_max(high, 252)) keep outperforming because investors anchor on the high and under-react to good news. Rank within country and industry, and smooth over 5 days."
+      - dataset: model110
+        delay: 1
+        settings: {decay: 6}
+        hypotheses:
+          - "Improving analyst sentiment: the 20-day change of mdl110_analyst_sentiment predicts returns better than its level (the level is in the crowded headline mdl110_score). Rank the change within country and smooth it."
+          - "Quality at a reasonable price: stocks scoring well on both mdl110_quality and mdl110_value outperform; the combination is less crowded than mdl110_score. Use the product or the minimum of the two ranks, within country."
+      - dataset: fundamental17
+        delay: 1
+        settings: {decay: 6}
+        hypotheses:
+          - "EBITDA yield (fnd17_ebitda2ev) within industry: cheap firms on operating earnings outperform, and the yield is comparable across countries where book values are not. Backfill, rank within industry, and avoid the most indebted names (high fnd17_atotd2cap)."
+          - "Free cash flow per share (fnd17_2anrhsfcq) relative to price (close) is a cash-based value signal that survives accounting differences across countries; rank its change over a quarter (about 63 days) within industry."
+
+  EUR:
+    enabled: true
+    settings: {universe: TOP2500, neutralization: COUNTRY, decay: 4}
+    catalogs:
+      1: ../captures/consultant_catalogs/datafields_eur_top2500_d1.json
+    arms:
+      - dataset: pv1
+        delay: 1
+        hypotheses:
+          - "Overnight versus intraday returns: European stocks with strong overnight gaps (open relative to the previous close) that fade during the day (close below open) carry information-free pressure that reverses over the next days. Rank the 10-day sum of intraday minus overnight returns within country."
+          - "Abnormal turnover: a jump in share turnover (volume / sharesout relative to its own 60-day average) marks attention-driven buying that reverses over 1-4 weeks (Gervais, Kaniel and Mingelgrin 2001 found the opposite for low-attention names, so test both signs). Rank within country and industry."
+      - dataset: model38
+        delay: 1
+        settings: {decay: 6}
+        hypotheses:
+          - "Price to intrinsic value: stocks whose StarMine price-to-intrinsic-value rank within sector (star_val_piv_sector_rank) is attractive outperform; it is less crowded than star_val_sector_rank. Rank its 20-day change too: a stock becoming cheaper against its own intrinsic value tends to recover."
+          - "Shareholder yield: a high buyback yield rank (star_val_buyback_yield) signals management's view that the stock is cheap; combine it with the price/cash-flow rank (star_val_pcf) and rank within country."
+      - dataset: fundamental17
+        delay: 1
+        settings: {decay: 6}
+        hypotheses:
+          - "Free cash flow yield: trailing free cash flow (fnd17_fcfmtt) relative to market cap (cap) predicts returns in Europe, where reported earnings differ by accounting standard. Backfill, rank within industry, and smooth."
+          - "Free-cash-flow momentum: the change in quarterly free cash flow per share (fnd17_anrhsfcq versus fnd17_2anrhsfcq) scaled by price (close) marks improving fundamentals that the price follows over the next quarter. Rank within country."
+
+  ASI:
+    enabled: true
+    settings: {universe: MINVOL1M, neutralization: COUNTRY, decay: 5}
+    catalogs:
+      1: ../captures/consultant_catalogs/datafields_asi_minvol1m_d1.json
+    arms:
+      - dataset: pv1
+        delay: 1
+        hypotheses:
+          - "VWAP pressure: when the close is well below the day's vwap, sellers pushed late in the day, and that pressure reverses over the next few days in Asian markets with many retail traders. Use the 5-day mean of (close - vwap) / vwap, negative, ranked within country."
+          - "Low idiosyncratic volatility: stocks with low volatility of daily returns (ts_std_dev(returns, 60)) relative to their country outperform (Ang et al. 2006), strongest among liquid names. Rank minus the volatility within country, tilted by rank(adv20)."
+      - dataset: model110
+        delay: 1
+        settings: {decay: 6}
+        hypotheses:
+          - "Growth and quality without momentum: the headline mdl110_score is heavily used in ASI (72,000 alphas); its components are not. Combine mdl110_growth and mdl110_quality, and remove what mdl110_price_momentum_reversal explains, so the signal is not a price-momentum bet."
+          - "Tree-model disagreement: where the nonlinear model (mdl110_tree) ranks a stock well above the composite (mdl110_score), the tree is picking up interactions the linear blend misses; long the positive gap, ranked within country."
+      - dataset: fundamental23
+        delay: 1
+        settings: {decay: 6}
+        hypotheses:
+          - "Accruals: net income (income) above operating cash flow (cashflow_op), scaled by assets, marks earnings that will not repeat; low-accrual firms outperform (Sloan 1996). Backfill both and rank minus the accrual ratio within country and industry."
+          - "Operating profitability: operating_income relative to assets predicts returns (Novy-Marx 2013), and in Asia it separates real earners from state-backed or asset-heavy firms. Rank within industry and combine with the 1-year sales growth (sales versus ts_delay(sales, 252))."
+
+  CHN:
+    enabled: true
+    settings: {universe: TOP2000U, neutralization: INDUSTRY, decay: 4}
+    catalogs:
+      1: ../captures/consultant_catalogs/datafields_chn_top2000u_d1.json
+    arms:
+      - dataset: pv1
+        delay: 1
+        hypotheses:
+          - "Lottery demand in a retail market: Chinese stocks with extreme recent daily gains (ts_max(returns, 20)) attract retail lottery buyers and underperform (Bali, Cakici and Whitelaw 2011). Rank minus the maximum daily return within industry."
+          - "Turnover reversal: high recent turnover (volume relative to its 60-day mean) in China marks speculative trading that reverses over 1-4 weeks. Rank minus the abnormal turnover within industry and smooth over 5 days."
+      - dataset: model175
+        delay: 1
+        settings: {decay: 5}
+        hypotheses:
+          - "Stable trading: stocks with low volatility of daily turnover (mdl175_volatility, or mdl175_02dtsvt relative to mdl175_02amvt) are less exposed to retail speculation and outperform. Rank minus the turnover volatility within industry."
+          - "Money flow against beta: a high 20-day money flow (mdl175_moneyflow20) in low-beta stocks (mdl175_beta20) marks informed accumulation, while money flow in high-beta stocks is speculation that reverses. Condition the money-flow rank on the beta rank."
+      - dataset: model26
+        delay: 1
+        settings: {decay: 6}
+        hypotheses:
+          - "Analyst revisions: the StarMine ARM revision score (star_arm_score, or its earnings sub-score star_arm_pref_earnings_score) predicts returns as analysts adjust slowly; in China coverage is thinner, so backfill and rank within industry."
+          - "Revision-adjusted value: a cheap forward P/E (mdl26_frwrd_p_stm_fy1, low is cheap) is a value trap unless revisions agree; long cheap stocks with improving revisions (mdl26_revisions), short expensive ones with falling revisions."
+
+  JPN:
+    enabled: true
+    settings: {universe: TOP1600, neutralization: INDUSTRY, decay: 4}
+    catalogs:
+      1: ../captures/consultant_catalogs/datafields_jpn_top1600_d1.json
+    arms:
+      - dataset: pv1
+        delay: 1
+        hypotheses:
+          - "Monthly reversal in Japan: past 1-month losers outperform past winners over the next month, more strongly than in the US. Use minus the 21-day return, skipping the last day, ranked within industry and scaled by minus its volatility so the calmest losers carry the most weight."
+          - "Volume-confirmed trend: a 60-day price trend (close / ts_delay(close, 60)) with rising volume (adv20 above its 120-day mean) continues; without volume it reverses. Multiply the trend rank by the sign of the volume change."
+      - dataset: other176
+        delay: 1
+        settings: {decay: 5}
+        hypotheses:
+          - "Medium-term model with seasonality: the medium-term model score (oth176_eq_medium) and the seasonality model (oth176_hc_eq_seasonality) capture different effects; long stocks where both agree, ranked within industry. The headline composite (oth176_maltahc_eq_score) is the crowded one."
+          - "Short-term versus hedge model: where the short-term model (oth176_eq_short) is positive but the hedge model (oth176_eq_hedge) flags downside, the short-term signal is fragile; scale the short-term score down by the hedge score's rank."
+      - dataset: fundamental17
+        delay: 1
+        settings: {decay: 6}
+        hypotheses:
+          - "Revenue growth at a fair price: year-on-year quarterly revenue growth (fnd17_revchngyr) predicts returns in Japan when the stock is not expensive on sales (fnd17_qpr2rev); rank growth minus the price-to-sales rank within industry."
+          - "Shareholder returns in Japan: rising dividend yield (fnd17_yield) and a low price-to-book (fnd17_price2bk) mark firms responding to governance reform (TSE 2023 push on low P/B), which outperform. Combine the two ranks within industry."
+
+  AMR:
+    enabled: true
+    settings: {universe: TOP600, neutralization: COUNTRY, decay: 4}
+    catalogs:
+      1: ../captures/consultant_catalogs/datafields_amr_top600_d1.json
+    arms:
+      - dataset: pv1
+        delay: 1
+        hypotheses:
+          - "Intermediate momentum: the 12-month return skipping the last month (close 21 days ago relative to close 252 days ago) predicts returns in the Americas outside the US; rank within country and industry, and scale by minus the 60-day volatility so the steadiest trends count most."
+          - "Short-term reversal conditioned on size: minus the 5-day return predicts returns mainly among smaller names (low cap); weight the reversal by one minus rank(cap) and rank within country."
+      - dataset: model39
+        delay: 1
+        settings: {decay: 6}
+        hypotheses:
+          - "Value-momentum improvement: the 20-day change in the sector rank of the Value-Momentum model (mdl39_12_val_mo_sector_rank) predicts returns better than its level, which is widely used. Rank the change within country."
+          - "Global versus sector disagreement: a stock ranked better globally (global_value_momentum_rank) than within its sector (sector_value_momentum_rank) is cheap because its sector is cheap; the stock-specific part (sector rank) is the purer signal. Long the sector rank, neutralized by the global rank."
+      - dataset: analyst69
+        delay: 1
+        settings: {decay: 5}
+        hypotheses:
+          - "EPS estimate revisions: the 60-day change of the current-year consensus EPS (anl69_best_eeps_cur_yr), scaled by price (close), predicts returns; backfill first, rank within country."
+          - "Cheap on sales with upgrades: a low price-to-sales estimate (anl69_best_px_sales_ratio, VECTOR: use vec_avg) combined with rising EPS estimates (anl69_best_eeps_cur_yr) separates real value from value traps. Rank within country and industry."
+
+  IND:
+    enabled: true
+    settings: {universe: TOP500, neutralization: SECTOR, decay: 4}
+    catalogs:
+      1: ../captures/consultant_catalogs/datafields_ind_top500_d1.json
+    arms:
+      - dataset: pv1
+        delay: 1
+        hypotheses:
+          - "Liquidity premium among Indian large caps: stocks whose dollar volume (adv20) fell relative to its 120-day average become less liquid and are priced lower, then recover. Rank minus the change in adv20 within sector and smooth over 10 days."
+          - "Range-based volatility: stocks with a high daily range ((high - low) / close, 20-day mean) relative to their sector are speculative and underperform. Rank minus the range within sector."
+      - dataset: model39
+        delay: 1
+        settings: {decay: 6}
+        hypotheses:
+          - "Short-term momentum against value-momentum: the short-term price momentum score (short_term_price_momentum_score_2) reverses when the slower Value-Momentum rank (sector_value_momentum_rank) is poor; long stocks with a good value-momentum rank and weak short-term momentum."
+          - "Value-momentum rank change: the 10-20 day change of the industry Value-Momentum rank (industry_value_momentum_rank_float) catches upgrades before the slower level does; rank the change within sector."
+      - dataset: analyst4
+        delay: 1
+        settings: {decay: 5}
+        hypotheses:
+          - "Analyst disagreement: a wide spread between the highest and lowest EPS estimates (anl4_afv4_eps_high minus anl4_qfv4_eps_low, relative to the absolute mean anl4_afv4_eps_mean) means uncertainty that, with short-sale limits in India, leaves stocks overpriced; rank minus the dispersion within sector."
+          - "Profit estimate revisions: the 60-day change of the mean net profit estimate (est_netprofit) scaled by market cap (cap) predicts returns; backfill and rank within sector."
+
+  DEU:
+    enabled: true
+    settings: {universe: TOP500, neutralization: SECTOR, decay: 4}
+    catalogs:
+      1: ../captures/consultant_catalogs/datafields_deu_top500_d1.json
+    arms:
+      - dataset: pv1
+        delay: 1
+        hypotheses:
+          - "52-week-high anchoring: German stocks near their 252-day high (close / ts_max(high, 252)) keep outperforming; rank within sector and smooth over 5 days."
+          - "Low-volume reversal: minus the 5-day return, weighted by one minus the rank of volume relative to adv20, ranked within sector."
+      - dataset: model38
+        delay: 1
+        settings: {decay: 6}
+        hypotheses:
+          - "Relative valuation within sector: the StarMine sector valuation rank (star_val_sector_rank) and its industry version (star_val_industry_rank) agree on cheap stocks that outperform; use the average rank and its 20-day change."
+          - "Cash-flow valuation: the price/cash-flow component rank (star_val_pcf) is less crowded than the headline ranks; combine it with sector_relative_valuation_rank and rank within sector."
+      - dataset: analyst7
+        delay: 1
+        settings: {decay: 5}
+        hypotheses:
+          - "Breadth of upgrades: the number of raised EBIT estimates for the next 4 quarters (est_12m_ebi_raisednum_4wks) relative to the number of estimates (est_12m_ebi_num) predicts returns; rank within sector."
+          - "Recommendation momentum: raised minus lowered recommendations over 4 weeks (rec_raisednum_4wks minus rec_lowerednum_4wks) predicts returns over the next month; smooth and rank within sector."
+
+  GBR:
+    enabled: true
+    settings: {universe: TOP700, neutralization: INDUSTRY, decay: 4}
+    catalogs:
+      1: ../captures/consultant_catalogs/datafields_gbr_top700_d1.json
+    arms:
+      - dataset: pv1
+        delay: 1
+        hypotheses:
+          - "Overnight gap reversal in the UK: the 10-day sum of overnight returns (open relative to the previous close) minus intraday returns (close relative to open) reverses over the next week; rank minus it within industry."
+          - "Low volatility: minus the 60-day volatility of returns, ranked within industry and tilted toward liquid names (rank(adv20))."
+      - dataset: model38
+        delay: 1
+        settings: {decay: 6}
+        hypotheses:
+          - "Price versus intrinsic value: a low ratio of price to StarMine intrinsic value (star_val_piv_ratio) marks cheap stocks; rank minus the ratio within industry and combine with the regional valuation rank (star_val_region_rank)."
+          - "Earnings path: the projected EPS growth from fiscal year 2 to year 3 (star_val_earnings_projection_fy3 relative to star_val_earnings_projection_fy2), scaled by price, is a growth-at-a-price signal; rank within industry."
+      - dataset: analyst7
+        delay: 1
+        settings: {decay: 5}
+        hypotheses:
+          - "Downgrade breadth: many lowered pre-tax profit and net income estimates over 4 weeks (est_12m_pre_lowerednum_4wks, est_12m_net_lowerednum_4wks) predict underperformance; rank minus their sum within industry."
+          - "Sales versus profit downgrades: lowered sales estimates (est_12m_sal_lowerednum_4wks) without lowered profit estimates (est_12m_pre_lowerednum_4wks) mean margins are expected to hold; long that gap, ranked within industry."

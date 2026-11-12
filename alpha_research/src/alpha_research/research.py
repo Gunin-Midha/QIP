@@ -72,7 +72,7 @@ import yaml
 
 from .brain_client import BrainClient
 from .config import Config, ConfigError
-from .critic import Critic, DebateJudge, ReviewOutcome, review_and_debate
+from .critic import Critic, DebateJudge, ReviewOutcome, SparseFieldRule, review_and_debate
 from .compare import arm_models, model_comparison
 from .fastexpr import FastExprSpec, analyze, catalog, catalog_for
 from .generator import (AlphaGenerator, GenerationError, GenerationSettings, GeneratorConfig,
@@ -81,14 +81,14 @@ from .llm import LLMClient, LLMUnavailable, ModelDown, provider_of
 from .memory import MemoryStore
 from .orchestrator import Orchestrator, balance_slots
 from .pipeline import Pipeline
-from .prompts import PROMPT_VERSIONS, brain_context
+from .prompts import PROMPT_VERSIONS, bar_text, brain_context
 from .prefilter import PreFilter, PrefilterConfig
 from .repair import Playbook
 from .lever_stats import LeverStats, RepairLearningConfig, distance, repair_events
 from .repair_agent import RepairAgent
 from .schemas import (GROUP_NEUTRALIZATIONS, NO_REGULAR_SIMULATION, REGION_SETTINGS,
                       CandidateRecord, experiment_hash)
-from .strategy import StrategyConfig, StrategyEvolution, region_notes
+from .strategy import StrategyConfig, StrategyEvolution, brain_limits, region_notes
 
 DECIDED = ("accept", "reject", "repair")
 
@@ -221,6 +221,7 @@ class AgentsConfig:
     regions_per_run: int | None = None        # rotation: work on this many regions per run
     region_balance_since: str | None = None   # ISO date: count simulations per region from here
     repair: RepairLearningConfig = field(default_factory=RepairLearningConfig)
+    sparse: SparseFieldRule | None = None     # critic.sparse_fields; None = rule off
 
     def used_models(self) -> list[str]:
         """Model ids this config will call (agents with the model switched off left out)."""
@@ -349,7 +350,15 @@ def agents_config_from_dict(raw) -> AgentsConfig:
         regions_per_run=(None if secs["director"].get("regions_per_run") is None
                          else _pos_int(secs["director"], "director", "regions_per_run")),
         region_balance_since=_opt_date(secs["director"], "director", "region_balance_since"),
+        sparse=_sparse_rule(secs["critic"]),
     )
+
+
+def _sparse_rule(sec: dict) -> SparseFieldRule | None:
+    try:
+        return SparseFieldRule.from_dict(sec.get("sparse_fields"))
+    except ValueError as exc:
+        raise ConfigError(f"agents config: {exc}") from exc
 
 
 def load_agents_config(path: str | Path) -> AgentsConfig:
@@ -634,7 +643,9 @@ class ResearchRun:
                                  out=out)
         limits, mo = generator_config.limits, agents.max_output
         # thresholds from config and the plan's regions, shown to every agent's model
-        ctx = brain_context(config, sorted({p.settings.region for p in plans}))
+        self.seen_limits = brain_limits(memory.candidate_outcomes())   # BRAIN's, per market
+        ctx = brain_context(config, sorted({p.settings.region for p in plans}),
+                            seen_limits=self.seen_limits)
         m = self.models
         pf_llm = self.fallback(m.prefilter) if agents.prefilter.use_model else None
         self.prefilter = PreFilter(agents.prefilter, spec, memory, llm=pf_llm,
@@ -642,8 +653,14 @@ class ResearchRun:
                                    max_output=mo, context=ctx)
         # one Critic per critic model, plus a rules-only Critic (None) for when they are down
         critic_models = (*m.critic, None) if agents.critic_model else (None,)
+        rule = agents.sparse
+        sparse = ({None: rule.fields(self.field_meta),
+                   **{k: rule.fields(meta) for k, (_, meta) in self.markets.items()}}
+                  if rule else {})
         self.critics = {cm: Critic(spec, llm=self.llm(cm) if cm else None, datafields=typed,
-                                   markets=mtyped, limits=limits, max_output=mo, context=ctx)
+                                   markets=mtyped, limits=limits, max_output=mo, context=ctx,
+                                   sparse=sparse,
+                                   sparse_lookback=rule.lookback if rule else 20)
                         for cm in critic_models}
         self.judge = DebateJudge(llm=self.fallback(m.debate) if agents.debate_model else None,
                                  max_output=mo, context=ctx)
@@ -769,7 +786,10 @@ class ResearchRun:
                                                   cfg, datafields=fields, field_meta=meta)
         # the region's own evidence from memory, refreshed every time, then the arm's guidance
         notes = region_notes(self.memory.candidate_outcomes(), plan.settings.region)
-        parts = [p for p in (notes, plan.guidance) if p]
+        bar = bar_text(self.seen_limits.get((plan.settings.region, plan.settings.delay), {}))
+        bar = (f"- BRAIN's bar in this market ({plan.settings.region} delay "
+               f"{plan.settings.delay}, from its checks on our alphas): {bar}.") if bar else None
+        parts = [p for p in (bar, notes, plan.guidance) if p]
         self.generators[key].guidance = "\n".join(parts) or None
         return self.generators[key]
 

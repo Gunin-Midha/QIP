@@ -25,7 +25,7 @@ from .schemas import GROUP_NEUTRALIZATIONS, REGION_SETTINGS, neutralizations_for
 
 PROMPT_VERSIONS = {
     "prefilter": "prefilter-v3",
-    "critic": "critic-v5",
+    "critic": "critic-v6",
     "judge": "judge-v4",
     "repair": "repair-v5",
     "strategy": "strategy-v4",
@@ -55,9 +55,27 @@ _FACTOR_NEUTRALIZATIONS = [n for n in dict.fromkeys(
     if n not in GROUP_NEUTRALIZATIONS and n != "NONE"]
 
 
-def brain_context(config: Config | None, regions: list[str] | None = None) -> str:
+# BRAIN check -> (label, comparison, shown in percent)
+BAR_CHECKS = {"LOW_SHARPE": ("Sharpe", ">=", False), "LOW_FITNESS": ("fitness", ">=", False),
+              "HIGH_TURNOVER": ("turnover", "<=", True), "LOW_RETURNS": ("returns", ">=", True),
+              "LOW_2Y_SHARPE": ("last-2-years Sharpe", ">=", False)}
+
+
+def bar_text(limits: dict[str, float]) -> str:
+    """'Sharpe >= 2.69, fitness >= 1.5, turnover <= 70%' from one market's limits."""
+    parts = []
+    for check, (label, cmp, pct) in BAR_CHECKS.items():
+        if check in limits:
+            v = limits[check]
+            parts.append(f"{label} {cmp} {v * 100:g}%" if pct else f"{label} {cmp} {v:g}")
+    return ", ".join(parts)
+
+
+def brain_context(config: Config | None, regions: list[str] | None = None,
+                  seen_limits: dict | None = None) -> str:
     """How BRAIN judges an alpha, with the thresholds from config/thresholds.yaml, and for
-    each region in ``regions`` its settings and any per-region limits."""
+    each region in ``regions`` its settings, any per-region limits, and BRAIN's own limits
+    seen on our results there (``seen_limits``: ``strategy.brain_limits``)."""
     g = config.gates if config is not None else None
     d = config.diversity if config is not None else None
     lines = [
@@ -100,11 +118,11 @@ def brain_context(config: Config | None, regions: list[str] | None = None) -> st
         lines.append("- Where BRAIN reports its own limit for an alpha's check, that limit "
                      "is used instead.")
     for region in regions or []:
-        lines.append(_region_line(config, region))
+        lines.append(_region_line(config, region, seen_limits or {}))
     return "\n".join(lines)
 
 
-def _region_line(config: Config | None, region: str) -> str:
+def _region_line(config: Config | None, region: str, seen: dict | None = None) -> str:
     s = REGION_SETTINGS.get(region)
     if s is None:
         return f"- Region {region}: not enabled on our account."
@@ -119,6 +137,10 @@ def _region_line(config: Config | None, region: str) -> str:
                        if getattr(g, k) != getattr(config.gates, k)]
             if changed:
                 text += f" Our limits for delay {delay}: {', '.join(changed)}."
+    for delay in s["delays"]:
+        bar = bar_text((seen or {}).get((region, delay), {}))
+        if bar:
+            text += f" BRAIN's bar at delay {delay} (from its checks on our alphas): {bar}."
     return text
 
 
@@ -210,6 +232,8 @@ For each candidate:
 4. Optionally predict which BRAIN test it is most likely to fail ("expected_failure": sharpe, fitness, turnover, sub_universe, concentration, self_correlation or none).
 
 Lines starting "issues found so far" were found by rule checks; a look-ahead found there cannot be cleared.
+
+Sparse fields: a news or sentiment field has a value only on days with stories. Feeding it to a ts_* operator without ts_backfill leaves most stocks without a value, so a few names carry the book. The rule check already revises such alphas to ts_backfill(<field>, d); keep that fix in any revision you write.
 
 Neutralization: a group neutralization (MARKET, SECTOR, INDUSTRY, SUBINDUSTRY, COUNTRY) is the normal start. A factor neutralization or NONE comes with the author's reason in the rationale ("Neutralization X: ..."). Judge that reason: a factor neutralization fits when the idea is meant to be independent of that factor, and removes the signal when the signal is that factor (a reversal idea under a reversal/momentum neutralization, a size idea under a size-related one); NONE keeps a market bet. If the reason does not hold, give "revise" with "neutralization": a group neutralization (the expression may stay the same).
 

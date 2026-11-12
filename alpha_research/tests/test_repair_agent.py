@@ -68,6 +68,22 @@ def test_repair_applies_first_untried_lever_and_sets_lineage(memory, playbook, c
     assert child.expression == parent.expression
 
 
+def test_factor_first_decision_tries_a_factor_neutralization_not_the_sign(memory, playbook,
+                                                                          candidate):
+    from alpha_research.schemas import ResultRecord
+    agent = RepairAgent(playbook, SPEC, memory)
+    parent = candidate(candidate_id="p1")
+    res = ResultRecord("p1", "complete", sharpe=-0.3,
+                       alt_stats={"risk_neutralized": {"sharpe": 1.2}})
+    d = DecisionRecord("p1", "repair", "sharpe", reasons=[
+        "factor neutralization first: risk-neutralized Sharpe 1.2 vs raw -0.3"])
+    out = agent.repair(parent, d, res)
+    assert out.lever.startswith("neutralize_") and out.child.expression == parent.expression
+    # without the reason, the negative Sharpe is flipped first as before
+    plain = agent.repair(parent, DecisionRecord("p1", "repair", "sharpe"), res)
+    assert plain.lever == "flip_sign"
+
+
 def test_repair_skips_tried_and_inapplicable_levers(memory, playbook, candidate):
     agent = RepairAgent(playbook, SPEC, memory)
     root = candidate(candidate_id="p1", decay=4)

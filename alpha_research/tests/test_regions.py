@@ -313,6 +313,23 @@ def test_region_notes_show_what_neutralization_repairs_did(candidate):
     assert "neutralize_statistical 1/0/1 (sharpe)" in notes
 
 
+def test_brain_limits_from_memory_reach_the_prompts(candidate):
+    from alpha_research.prompts import bar_text, brain_context
+    from alpha_research.schemas import ResultRecord
+    from alpha_research.strategy import brain_limits
+    c = candidate(candidate_id="j0", region="JPN", universe="TOP1600", delay=0)
+    res = ResultRecord("j0", "complete", sharpe=0.3, check_values={
+        "LOW_SHARPE": {"value": 0.3, "limit": 2.69}, "LOW_FITNESS": {"value": 0.1, "limit": 1.5},
+        "HIGH_TURNOVER": {"value": 1.6, "limit": 0.7}, "CONCENTRATED_WEIGHT": {"value": 0.5,
+                                                                             "limit": 0.1}})
+    lim = brain_limits([{"candidate": c, "result": res, "decision": None}])
+    assert lim == {("JPN", 0): {"LOW_SHARPE": 2.69, "LOW_FITNESS": 1.5, "HIGH_TURNOVER": 0.7}}
+    assert bar_text(lim[("JPN", 0)]) == "Sharpe >= 2.69, fitness >= 1.5, turnover <= 70%"
+    text = brain_context(None, ["JPN"], seen_limits=lim)
+    assert "BRAIN's bar at delay 0 (from its checks on our alphas): Sharpe >= 2.69" in text
+    assert "at delay 1" not in text   # nothing seen there yet
+
+
 def test_strategy_region_guidance_goes_only_to_that_region(candidate):
     rows = [_outcome(candidate, "a", "USA", "SUBINDUSTRY", "reject", "sharpe")]
     reply = json.dumps({"guidance": ["g"], "region_guidance": {"EUR": ["use COUNTRY"]},

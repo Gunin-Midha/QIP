@@ -135,7 +135,8 @@ class Pipeline:
         else:
             veto, risk_checks, risk_reasons = False, [], []
         decision = evaluator.decide(result, gates, self.playbook, risk_checks, veto, risk_reasons,
-                                    config.repair.near_miss_share)
+                                    config.repair.near_miss_share,
+                                    config.repair.risk_neutralized_gap)
 
         admitted_by_diversity = None
         if decision.decision == "accept":

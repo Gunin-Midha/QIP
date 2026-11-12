@@ -71,6 +71,7 @@ import string
 from dataclasses import dataclass, field
 from typing import Collection, Mapping
 
+from .evaluator import FACTOR_FIRST
 from .fastexpr import (Assign, Binary, Call, ComplexityLimits, FastExprError, FastExprSpec,
                        Name, Num, Unary, analyze, catalog, catalog_for, parse, render)
 from .generator import GenerationError, ask_json
@@ -408,8 +409,16 @@ class RepairAgent:
     def ranked(self, candidate: CandidateRecord, decision: DecisionRecord,
                result: ResultRecord | None, stats: LeverStats) -> list[tuple[Lever, float]]:
         failing = failing_classes(decision, result) | {decision.failure_class}
-        return rank_levers(self.playbook, decision.failure_class, failing, stats,
-                           self.learning, self.rng, region=candidate.region)
+        ranked = rank_levers(self.playbook, decision.failure_class, failing, stats,
+                             self.learning, self.rng, region=candidate.region)
+        if any(r.startswith(FACTOR_FIRST) for r in decision.reasons):
+            # BRAIN's risk-neutralized Sharpe is far better than the raw one: remove the
+            # factors first, and never flip the sign of a signal that only needs them gone
+            factor = [x for x in ranked if x[0].name.startswith("neutralize_")]
+            rest = [x for x in ranked
+                    if not x[0].name.startswith("neutralize_") and x[0].name != "flip_sign"]
+            ranked = factor + rest
+        return ranked
 
     def repair(self, candidate: CandidateRecord, decision: DecisionRecord,
                result: ResultRecord | None = None,

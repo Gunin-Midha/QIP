@@ -82,6 +82,10 @@ repair:
     sharpe: 0.6     # Sharpe |value| >= 0.6 x sharpe_min (0.95 with sharpe_min 1.58)
     fitness: 0.5    # fitness |value| >= 0.5 x fitness_min
     recent_sharpe: 0.6   # LOW_2Y_SHARPE / IS_LADDER_SHARPE value >= 0.6 x BRAIN's limit (OQ-18)
+  # BRAIN's risk-neutralized Sharpe at least this much above the raw Sharpe sends a failed
+  # Sharpe to the factor neutralization levers first (builder default 2026-11-12, OQ-20;
+  # null = off). A negative raw Sharpe that is a near miss goes to flip_sign first.
+  risk_neutralized_gap: 0.5
 
 # Simulator
 simulator:

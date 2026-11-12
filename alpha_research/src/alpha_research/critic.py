@@ -4,6 +4,10 @@ Critic
 1. Rule checks, no model:
    - blocking: a time-series operator with a window (2nd positional argument) of zero or
      less. A negative ``ts_delay`` reads the future; zero is meaningless.
+   - revise (fresh alphas): a sparse field (news/sentiment category or low coverage,
+     ``SparseFieldRule``) reaches a ts_* operator without a backfill; the rule writes the
+     revision (the field wrapped in ts_backfill) and it stands unless the model writes its
+     own revision or drops the alpha.
    - advisory: the final expression is not cross-sectionally normalized (its outermost
      operator, ignoring a leading minus, is not rank, zscore, scale, normalize, quantile,
      winsorize or a group_* operator), or a window is longer than 512 days, or the
@@ -41,8 +45,8 @@ import dataclasses
 from dataclasses import dataclass, field
 from typing import Collection, Mapping
 
-from .fastexpr import (Call, ComplexityLimits, FastExprError, FastExprSpec, Num, Unary,
-                       analyze, catalog, catalog_for, parse)
+from .fastexpr import (Assign, Binary, Call, ComplexityLimits, FastExprError, FastExprSpec,
+                       Name, Num, Unary, analyze, catalog, catalog_for, parse, render)
 from .generator import GenerationError, ask_json
 from .llm import LLMClient, ModelDown
 from .prompts import critic_system, critic_user, judge_system, judge_user
@@ -67,6 +71,44 @@ class Review:
     revised: CandidateRecord | None = None
     source: str = "rules"            # "rules" or "model"
     blocking: bool = False           # a blocking rule issue: neither model may clear it
+
+
+@dataclass(frozen=True)
+class SparseFieldRule:
+    """Which fields have a value on few days (``config/agents.yaml`` critic.sparse_fields):
+    news, sentiment and similar event datasets (BRAIN reports their coverage as the share of
+    stocks ever covered, 85% for a story-based JPN sentiment field), or low coverage."""
+    categories: tuple[str, ...] = ()
+    coverage_below: float | None = None
+    lookback: int = 20
+
+    def fields(self, meta: Mapping[str, Mapping]) -> set[str]:
+        out = set()
+        for f, m in (meta or {}).items():
+            cov = m.get("coverage")
+            if m.get("category") in self.categories or (
+                    self.coverage_below is not None and isinstance(cov, (int, float))
+                    and cov < self.coverage_below):
+                out.add(f)
+        return out
+
+    @classmethod
+    def from_dict(cls, raw) -> "SparseFieldRule | None":
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise ValueError("critic.sparse_fields must be a mapping")
+        cats = raw.get("categories") or []
+        cov = raw.get("coverage_below")
+        lookback = raw.get("lookback", 20)
+        if not isinstance(cats, list) or not all(isinstance(c, str) for c in cats):
+            raise ValueError("critic.sparse_fields.categories must be a list of strings")
+        if cov is not None and (isinstance(cov, bool) or not isinstance(cov, (int, float))
+                                or not 0 <= cov <= 1):
+            raise ValueError("critic.sparse_fields.coverage_below must be in [0, 1] or null")
+        if isinstance(lookback, bool) or not isinstance(lookback, int) or lookback < 1:
+            raise ValueError("critic.sparse_fields.lookback must be a positive integer")
+        return cls(tuple(cats), None if cov is None else float(cov), lookback)
 
 
 @dataclass
@@ -111,6 +153,74 @@ def setting_issues(c: CandidateRecord) -> list[Issue]:
                                   "start: check the author's reason; it can remove the signal "
                                   "itself when the signal is close to the factor")]
     return []
+
+
+_BACKFILLS = ("ts_backfill", "group_backfill")
+
+
+def sparse_unfilled(expression: str, sparse: Collection[str]) -> list[str]:
+    """Sparse fields that reach a ``ts_*`` operator (other than a backfill) without a
+    backfill around them: on most days most stocks have no value there, so the time-series
+    operator returns NaN and a few names carry the whole book (run rs20261112054223: JPN
+    sentiment z-scores had CONCENTRATED_WEIGHT 0.5 and turnover 160%). A variable assigned
+    from such an expression counts as the field."""
+    try:
+        stmts = parse(expression)
+    except FastExprError:
+        return []
+    found: list[str] = []
+    tainted: dict[str, set] = {}
+
+    def raw(n, filled: bool) -> set:
+        """Unfilled sparse names under ``n`` (variables resolved)."""
+        if isinstance(n, Name):
+            if n.name in tainted:
+                return set() if filled else set(tainted[n.name])
+            return {n.name} if n.name in sparse and not filled else set()
+        if isinstance(n, Call):
+            inner = filled or n.name in _BACKFILLS
+            got = set()
+            for a in (*n.args, *(v for _, v in n.kwargs)):
+                got |= raw(a, inner)
+            if n.name.startswith("ts_") and n.name not in _BACKFILLS:
+                found.extend(sorted(got - set(found)))
+            return got
+        got = set()
+        for attr in ("operand", "left", "right"):
+            child = getattr(n, attr, None)
+            if child is not None and not isinstance(child, str):
+                got |= raw(child, filled)
+        return got
+
+    for st in stmts:
+        if isinstance(st, Assign):
+            tainted[st.name] = raw(st.value, False)
+        else:
+            raw(st, False)
+    return list(dict.fromkeys(found))
+
+
+def _fill(node, names: set, lookback: int):
+    """Wrap each of ``names`` (not already inside a backfill) in ts_backfill(name, lookback)."""
+    if isinstance(node, Name):
+        return Call("ts_backfill", (node, Num(str(lookback))), ()) if node.name in names else node
+    if isinstance(node, Call):
+        if node.name in _BACKFILLS:
+            return node
+        return Call(node.name, tuple(_fill(a, names, lookback) for a in node.args),
+                    tuple((k, _fill(v, names, lookback)) for k, v in node.kwargs))
+    if isinstance(node, Unary):
+        return Unary(node.op, _fill(node.operand, names, lookback))
+    if isinstance(node, Binary):
+        return Binary(node.op, _fill(node.left, names, lookback), _fill(node.right, names, lookback))
+    return node
+
+
+def backfilled(expression: str, names: Collection[str], lookback: int) -> str:
+    stmts = parse(expression)
+    out = tuple(Assign(st.name, _fill(st.value, set(names), lookback)) if isinstance(st, Assign)
+                else _fill(st, set(names), lookback) for st in stmts)
+    return render(out)
 
 
 def rule_issues(expression: str) -> list[Issue]:
@@ -159,8 +269,12 @@ class Critic:
                  datafields: Collection[str] | None = None,
                  markets: Mapping[tuple, Mapping] | None = None,
                  limits: ComplexityLimits | None = None, max_output: int = 4096,
-                 context: str = ""):
+                 context: str = "", sparse: Mapping | None = None, sparse_lookback: int = 20):
         self.spec = spec
+        # {(region, delay) or None: sparse field ids} (SparseFieldRule.fields per market;
+        # None = the catalog for markets without their own); empty = rule off
+        self.sparse = sparse or {}
+        self.sparse_lookback = sparse_lookback
         self.context = context  # prompts.brain_context(config)
         self.llm = llm
         self.datafields = catalog(datafields)  # {id: type}: types check vec_* use
@@ -203,8 +317,11 @@ class Critic:
         for c in candidates:
             issues = rule_issues(c.expression) + setting_issues(c)
             blocking = any(i.severity == "blocking" for i in issues)
-            reviews[c.candidate_id] = Review(c.candidate_id, "drop" if blocking else "simulate",
-                                             [i.text for i in issues], blocking=blocking)
+            review = Review(c.candidate_id, "drop" if blocking else "simulate",
+                            [i.text for i in issues], blocking=blocking)
+            if not blocking and c.lever is None:
+                review = self._sparse_review(c, review)
+            reviews[c.candidate_id] = review
         if self.llm is None or not use_model or not candidates:
             return reviews
         user = critic_user(candidates, rationales,
@@ -237,8 +354,28 @@ class Critic:
                 issues.append(f"expected to fail: {expected.strip()}")
             revised = self.revision(by_id[cid], item.get("revised_expression"),
                                     item.get("neutralization"))
+            if base.revised is not None and verdict != "drop" and revised is None:
+                # the rule's backfill stands unless the model writes its own revision
+                verdict, revised = "revise", base.revised
             reviews[cid] = Review(cid, verdict, issues, revised, "model", base.blocking)
         return reviews
+
+
+    def _sparse_review(self, c: CandidateRecord, review: Review) -> Review:
+        sparse = self.sparse.get((c.region, c.delay), self.sparse.get(None, set()))
+        names = sparse_unfilled(c.expression, sparse) if sparse else []
+        if not names:
+            return review
+        fixed = self.revision(c, backfilled(c.expression, names, self.sparse_lookback))
+        text = (f"sparse field(s) {', '.join(names)} (news/sentiment or low coverage) enter a "
+                "ts_* operator without ts_backfill: on most days most stocks have no value, so "
+                "few names carry the weight")
+        if fixed is None:
+            return dataclasses.replace(review, issues=review.issues + [text])
+        fixed = dataclasses.replace(fixed, model=c.model)
+        return dataclasses.replace(review, verdict="revise", revised=fixed, issues=review.issues
+                                   + [f"{text}; revised to ts_backfill(<field>, "
+                                      f"{self.sparse_lookback})"])
 
 
 class DebateJudge:

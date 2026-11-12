@@ -105,6 +105,9 @@ class RepairPolicy:
     # value, so a sign flip can rescue a negative Sharpe) for the candidate to go to repair
     # instead of reject. A class not listed (or a null share) has no such limit.
     near_miss_share: dict = field(default_factory=dict)
+    # BRAIN's risk-neutralized Sharpe this much above the raw one sends a failed Sharpe to
+    # the factor neutralization levers first (evaluator.sharpe_route). None = off.
+    risk_neutralized_gap: float | None = None
 
 
 @dataclass(frozen=True)
@@ -307,6 +310,8 @@ def config_from_dict(raw: Any, source: str = "<dict>") -> Config:
         v = _num(shares, "repair.near_miss_share", cls, lo=0.0, hi=1.0)
         if v is not None:
             near_miss[cls] = v
+    rn_gap = _num(rp, "repair", "risk_neutralized_gap", lo=0.0) \
+        if "risk_neutralized_gap" in rp else None
 
     # optional section: per-region (or region/delay) gate overrides
     rg = raw.get("regions") or {}
@@ -323,7 +328,7 @@ def config_from_dict(raw: Any, source: str = "<dict>") -> Config:
                         for k, (lo, hi) in REGION_GATE_KEYS.items() if k in over}
 
     return Config(gates, risk, diversity, auditor, holdout, simulator, source=source,
-                  repair=RepairPolicy(near_miss), regions=regions)
+                  repair=RepairPolicy(near_miss, rn_gap), regions=regions)
 
 
 def load_config(path: str | Path) -> Config:

@@ -408,10 +408,22 @@ def test_run_stops_when_every_generator_model_is_down(memory, config, playbook):
 # ---------------------------------------------------------------- config and plan
 
 
+def test_generator_is_told_brain_bar_for_its_market(memory, config, playbook, candidate):
+    from alpha_research.schemas import ResultRecord
+    memory.put_candidate(candidate(candidate_id="seen1"))
+    memory.put_result(ResultRecord("seen1", "complete", sharpe=0.5, check_values={
+        "LOW_SHARPE": {"value": 0.5, "limit": 1.58}}))
+    run = make_run(memory, config, playbook)
+    gen = run._generator(ARM)
+    assert "BRAIN's bar in this market (USA delay 1, from its checks on our alphas): " \
+           "Sharpe >= 1.58" in gen.guidance
+
+
 def test_main_agents_config_loads():
     a = MAIN_AGENTS
     assert a.prefilter.near_duplicate_similarity == 0.9 and a.critic_model
     assert a.strategy.every_rounds == 2 and a.floor_share == 0.2
+    assert a.sparse.categories == ("news", "sentiment", "socialmedia") and a.sparse.lookback == 20
     # free models only (owner, 2026-11-03); GPT and Nemotron (OpenRouter, generator only)
     # added 2026-11-04, no Mistral (Llama and DeepSeek wait for a free host that answers);
     # shadow critics off to save the quotas
