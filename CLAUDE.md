@@ -45,6 +45,7 @@ This is a WorldQuant BRAIN alpha research system for the IIT Madras Quant Guild 
 
 Standing owner rule: every change and every plan must improve general performance, not one alpha's (no single-alpha seeds, arms or rules). Ask the owner before committing or pushing.
 
+0. **Answer the owner's question first (asked 2026-11-12, "answer next time", not answered yet):** "Why are you choosing datasets/fields in the plan; shouldn't they be chosen by the Generator?" Give a clear answer (what the plan fixes today: arms = dataset x region x delay for the Director, the catalog per market, hypotheses naming fields; what the Generator already picks: fields within the catalog, exploration share across datasets) and the options, before running plan v3.
 1. **Run plan v3** (nothing run on it yet). From `alpha_research/`:
    `PYTHONPATH=src python3 -m alpha_research.cli research --plan config/research_plan.v3.yaml --max-simulations 20 --max-llm-calls 60 --per-round 5 --rounds 6`
    Rotation should start with IND, DEU, GBR (no simulations yet). Then interpret the report.
