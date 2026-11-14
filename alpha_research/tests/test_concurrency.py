@@ -15,8 +15,9 @@ class SlowBrain:
     how many were running at once. ``retryable``: candidate ids whose first simulation
     fails with BRAIN's own error."""
 
-    def __init__(self, polls=3, retryable=(), sharpe=None):
+    def __init__(self, polls=3, retryable=(), sharpe=None, polls_by=None):
         self.polls, self.retryable = polls, set(retryable)
+        self.polls_by = polls_by or {}
         self.sharpe = sharpe or {}
         self.left, self.owner, self.submits = {}, {}, []
         self.active = self.max_active = 0
@@ -24,7 +25,8 @@ class SlowBrain:
     def submit(self, c):
         sim = f"sim{len(self.submits)}"
         self.submits.append(c.candidate_id)
-        self.left[sim], self.owner[sim] = self.polls, c.candidate_id
+        self.left[sim] = self.polls_by.get(c.candidate_id, self.polls)
+        self.owner[sim] = c.candidate_id
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         return sim
@@ -157,3 +159,24 @@ def test_cli_run_takes_max_concurrent(tmp_path, capsys):
     lines = [ln for ln in capsys.readouterr().out.splitlines() if " | " in ln]
     assert len(lines) == 31            # every hand-written candidate decided, 8 at a time
     assert main([*args, "--max-concurrent", "0"]) == 2
+
+
+def test_progress_lines_come_as_each_finishes_then_decisions_in_order(memory, make_config,
+                                                                      playbook, candidate):
+    import io
+    brain = SlowBrain(polls_by={"c0": 4, "c1": 1, "c2": 2})     # c0 finishes last
+    vc, out = VirtualClock(), io.StringIO()
+    pipe = Pipeline(make_config(simulator__max_concurrent=3), playbook, brain, memory,
+                    sleep=vc.sleep, clock=vc.clock, out=out)
+    pipe.process_many(cands(candidate, 3))
+    lines = out.getvalue().splitlines()
+    progress = [ln for ln in lines if ln.startswith("  BRAIN: ")]
+    assert [ln.split()[1] for ln in progress] == ["c1", "c2", "c0"]
+    assert progress[0] == "  BRAIN: c1 finished (1 of 3), complete: Sharpe 1.00, fitness 0.50, turnover 0.20"
+    decided = [ln.split(" | ")[0] for ln in lines if " | " in ln]
+    assert decided == ["c0", "c1", "c2"] and lines.index(progress[-1]) < lines.index(
+        next(ln for ln in lines if " | " in ln))
+    # one alpha on its own: no progress line, as before
+    out.truncate(0), out.seek(0)
+    pipe.process_many([candidate(candidate_id="solo", expression="rank(-ts_delta(close, 9))")])
+    assert not [ln for ln in out.getvalue().splitlines() if ln.startswith("  BRAIN: ")]

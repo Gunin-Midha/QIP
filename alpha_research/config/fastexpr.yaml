@@ -116,6 +116,10 @@ base_fields: [close, open, high, low, volume, vwap, returns, cap, adv20]
 # 2026-11-14; this count reproduced BRAIN's 66, 66 and 71). null = not checked.
 max_operators: 64
 
+# Names BRAIN refuses as variable names ('Attempted to use reserved variable name: "delta"',
+# 2026-11-14). Add each new one BRAIN reports.
+reserved_names: [delta]
+
 # Bare words that are values, not datafields.
 # BRAIN's own docs write both true/false and True/False.
 constants: ["nan", "true", "false", "True", "False", "gaussian", "uniform", "cauchy"]

@@ -360,6 +360,8 @@ class FastExprSpec:
     # BRAIN's limit on operators in one alpha: function calls plus arithmetic (+ - * /,
     # comparisons, unary minus); None = not checked
     max_operators: int | None = None
+    # names BRAIN refuses as variables ('Attempted to use reserved variable name: "delta"')
+    reserved_names: frozenset[str] = frozenset()
 
     @classmethod
     def load(cls, path: str | Path) -> "FastExprSpec":
@@ -395,7 +397,11 @@ class FastExprSpec:
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int)
                                   or limit < 1):
             raise ConfigError("fastexpr spec: 'max_operators' must be a positive integer or null")
-        return cls(ops, sets["groups"], sets["base_fields"], sets["constants"], limit)
+        reserved = raw.get("reserved_names") or []
+        if not isinstance(reserved, list) or not all(isinstance(x, str) and x for x in reserved):
+            raise ConfigError("fastexpr spec: 'reserved_names' must be a list of names")
+        return cls(ops, sets["groups"], sets["base_fields"], sets["constants"], limit,
+                   frozenset(reserved))
 
     def signatures(self) -> list[str]:
         return [op.signature for op in self.operators.values()]
@@ -585,6 +591,8 @@ def analyze(expression: str, spec: FastExprSpec, *,
                 w.err("the last statement must be the alpha expression, not an assignment")
             if stmt.name in spec.operators:
                 w.err(f"variable {stmt.name!r} has the same name as an operator")
+            if stmt.name in spec.reserved_names:
+                w.err(f"variable name {stmt.name!r} is reserved on BRAIN; choose another")
             w.visit(stmt.value)
             w.variables.add(stmt.name)  # defined only for later statements
         else:

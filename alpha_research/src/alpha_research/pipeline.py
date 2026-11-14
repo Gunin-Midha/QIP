@@ -110,6 +110,17 @@ class Pipeline:
         self.auditor = Auditor(memory, config)
         self.out = out
 
+    def _progress(self, r: ResultRecord, finished: int, total: int) -> None:
+        """One line as each of several simulations finishes; decisions follow in order once
+        all are done."""
+        if r.status == "complete":
+            stats = ", ".join(f"{k} {v:.2f}" for k, v in (("Sharpe", r.sharpe), ("fitness", r.fitness),
+                                                           ("turnover", r.turnover)) if v is not None)
+            what = f"complete: {stats}" if stats else "complete"
+        else:
+            what = r.status
+        print(f"  BRAIN: {r.candidate_id} finished ({finished} of {total}), {what}", file=self.out)
+
     def _emit(self, outcome: Outcome) -> Outcome:
         if self.out is not None:
             print(outcome.line(), file=self.out)
@@ -132,7 +143,9 @@ class Pipeline:
                 continue
             seen.add(h)
             to_run.append((i, candidate))
-        results = self.simulator.run_many([c for _, c in to_run])
+        results = self.simulator.run_many(
+            [c for _, c in to_run],
+            on_done=self._progress if self.out is not None and len(to_run) > 1 else None)
         for (i, candidate), result in zip(to_run, results):
             if result.status != "invalid":
                 self.auditor.register_variant(candidate.family, candidate.candidate_id)

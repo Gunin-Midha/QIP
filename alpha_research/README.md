@@ -648,7 +648,9 @@ screenshot values (aggregate plus yearly rows for 2019 to 2023).
   in turn), `Pipeline.process_many` decides them in order, and `cli research` queues
   screened alphas and sends them 3 at a time (and at each round's end). Over the real
   limit BRAIN answers 429 and the client waits for a slot. Raise the value once a run
-  shows no 429 waits. Raised to 8 the same day (8 submitted within 6 s, no 429).
+  shows no 429 waits. Raised to 8 the same day (8 submitted within 6 s, no 429). A
+  `BRAIN: <id> finished (k of N)` line prints as each simulation finishes; the decision
+  lines follow in order once the whole batch is done.
 - **Lessons by dataset category** (`generator.category_lessons`, gen-v7): advice from our
   own results shown to the Generator by the BRAIN category of its arm's dataset (`all`
   goes to every arm). Repair lever `speed_up` (decay and smoothing windows down) is the

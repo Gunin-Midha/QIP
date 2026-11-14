@@ -322,3 +322,10 @@ def test_operator_limit_counts_calls_and_arithmetic_as_brain_does(spec):
     over = "a = " + " + ".join(["rank(close)"] * 33) + "; -a"  # 33 + 32 + unary minus = 66
     assert analyze(over, spec).errors == [
         "66 operators (calls plus arithmetic) exceed BRAIN's limit of 64"]
+
+
+def test_reserved_variable_names_are_errors(spec):
+    # BRAIN, 2026-11-14: 'Attempted to use reserved variable name: "delta"'
+    e = analyze("delta = ts_delta(close, 8); rank(delta)", spec).errors
+    assert e == ["variable name 'delta' is reserved on BRAIN; choose another"]
+    assert analyze("d = ts_delta(close, 8); rank(d)", spec).errors == []

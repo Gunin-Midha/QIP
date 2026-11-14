@@ -799,4 +799,12 @@ Round 5 (pairing with other signals): `deu_19` (EBIT breadth at half weight, no 
 
 The owner submitted `seed_774d71e6_r1_r2` (BRAIN alpha `3q0wOPoQ`) on 2026-11-14. `regions_per_run` stays 3 (owner).
 
-737 tests pass.
+### First plan v4 run, progress lines, memory split (2026-11-14)
+
+**Run `rs20261114174347` (GLB, EUR, ASI; stopped by the owner in round 3, no report file).** 10 simulations in two batches of 5. The 2026-11-12 factor routing paid off: an EUR pv1 overnight-vs-intraday reversal written by gpt-oss had raw Sharpe 0.91 but risk-neutralized 2.28, was sent "factor neutralization first", and its `neutralize_statistical` child reached Sharpe 2.71, fitness 1.30, every year positive, failing only sub-universe and the 2-year Sharpe (1.45). ASI model110 component alphas (Sharpe 1.10-1.25, built as the v4 hypotheses ask, from the model's components) fail ASI-only checks (LOW_ASI_JPN_SHARPE, LOW_ROBUST_UNIVERSE_SHARPE.WITH_RATIO, LOW_ROBUST_UNIVERSE_RETURNS), which have no failure class yet. In ASI, BRAIN reported LOW_SHARPE as WARNING (provisional, other checks failed); our gate then uses BRAIN's own limit, so the outcome matches. Strategy Evolution updated 36 arms in place and added none. BRAIN refused a variable named `delta`: `fastexpr.yaml` `reserved_names` (replay: exactly that alpha).
+
+**Progress lines.** With several alphas at once the decisions print only when the whole batch is done, and a finished alpha's recordsets and /check can take minutes after BRAIN shows it complete, so the terminal looked idle. `Simulator.run_many(on_done=)` and `Pipeline._progress` now print `BRAIN: <id> finished (k of N), ...` as each finishes.
+
+**Memory split (owner).** `scripts/split_memory.py --since 2026-11-10` moved `data/` to `data_archive/pre_consultant_20261114/` and rebuilt memory from the consultant-era rows (114 of 192 candidates, pool = the skew+VRP alpha only, 3 run reports). MemoryStore stays append-only.
+
+740 tests pass.

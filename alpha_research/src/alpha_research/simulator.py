@@ -260,11 +260,15 @@ class Simulator:
         return self.run_many([candidate], max_concurrent=1)[0]
 
     def run_many(self, candidates: list[CandidateRecord],
-                 max_concurrent: int | None = None) -> list[ResultRecord]:
+                 max_concurrent: int | None = None,
+                 on_done: Callable[[ResultRecord, int, int], None] | None = None
+                 ) -> list[ResultRecord]:
         """Results in the order of ``candidates``, each persisted as it finishes. At most
         ``max_concurrent`` (default ``simulator.max_concurrent``) run on BRAIN at a time; a
         resumed pending submission takes a slot too. Each simulation has its own
-        ``max_poll_seconds`` from its own submission."""
+        ``max_poll_seconds`` from its own submission. ``on_done(result, finished, total)``
+        is called as each submitted alpha finishes (progress; invalid ones are not
+        submitted and not counted)."""
         limit = max(1, max_concurrent or self.config.simulator.max_concurrent)
         results: list[ResultRecord | None] = [None] * len(candidates)
         waiting: deque[_Job] = deque()
@@ -282,13 +286,22 @@ class Simulator:
             waiting.append(_Job(i, candidate, sim_id))
 
         active: list[_Job] = []
+        total, finished = len(waiting), 0
+
+        def done(job: _Job, result: ResultRecord) -> None:
+            nonlocal finished
+            results[job.index] = self._done(job, result)
+            finished += 1
+            if on_done is not None:
+                on_done(results[job.index], finished, total)
+
         while waiting or active:
             while waiting and len(active) < limit:
                 job = waiting.popleft()
                 if job.sim_id is None:
                     sim_id = self._submit(job.candidate)
                     if isinstance(sim_id, ResultRecord):  # submitting failed
-                        results[job.index] = self._done(job, sim_id)
+                        done(job, sim_id)
                         continue
                     job.sim_id = sim_id
                     if job.retried_from is None:
@@ -311,7 +324,7 @@ class Simulator:
                     job.retried_from, job.sim_id = job.sim_id, None
                     waiting.appendleft(job)
                 else:
-                    results[job.index] = self._done(job, result)
+                    done(job, result)
             if active and waits:
                 self.sleep(min(waits))
         return results  # type: ignore[return-value]
