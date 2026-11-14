@@ -33,6 +33,9 @@ class GatesConfig:
     self_correlation_max: float | None
     use_brain_checks: bool = False   # BRAIN's PASS/FAIL checks as hard gates (evaluator.py)
     brain_checks_ignored: tuple[str, ...] = ()   # BRAIN checks that are never gates
+    # BRAIN checks about submitting, not about the alpha (quota, Power Pool, themes): gates
+    # checked only once every other check passes; a failure makes the decision pending
+    submission_checks: tuple[str, ...] = ()
     # our own gates use the limit BRAIN reports for that alpha's check when it has one
     # (LOW_SHARPE -> sharpe_min, ...): BRAIN's limits differ by region and delay
     limits_from_brain: bool = False
@@ -233,6 +236,7 @@ def config_from_dict(raw: Any, source: str = "<dict>") -> Config:
         self_correlation_max=_num(g, "gates", "self_correlation_max", lo=-1.0, hi=1.0),
         use_brain_checks=_opt_bool(g, "gates", "use_brain_checks"),
         brain_checks_ignored=_opt_names(g, "gates", "brain_checks_ignored"),
+        submission_checks=_opt_names(g, "gates", "submission_checks"),
         limits_from_brain=_opt_bool(g, "gates", "limits_from_brain"),
         brain_checks_only=_opt_bool(g, "gates", "brain_checks_only"),
     )

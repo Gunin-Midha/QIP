@@ -787,4 +787,16 @@ Fixed:
 
 **Operator limit.** Three round-3 alphas failed with "Expression with 66 operators exceeds limit of 64". BRAIN counts every function call plus every arithmetic or comparison operator and unary minus; that count reproduces its 66, 66 and 71. `config/fastexpr.yaml` `max_operators: 64`, checked in `fastexpr.analyze` for every alpha; replay over memory: exactly those 3. Round 3: `deu_11_fast` (2-day smoothing) Sharpe 2.06 / fitness 2.05 / 2-year Sharpe 1.32 (best yet; deu_7 1.17), `deu_9` (1-week counts) 1.21; GBR best 2-year 0.82 (`gbr_8`, Sharpe 1.57). Round 4 (`rescue_20261114_round4_8.json`) combines and extends those, all under 64 operators.
 
-731 tests pass.
+Round 5 (pairing with other signals): `deu_19` (EBIT breadth at half weight, no smoothing) Sharpe 2.32, fitness 2.52, 2-year Sharpe 1.43, the best yet but still short; pairing with a low-volume dip raised 2023 (up to 1.30) but cut 2022 to 0.33-0.52 and turnover rose to ~49%, so the recent checks got worse; GBR's overnight reversal lifted the overall Sharpe (1.82) but not 2023 (0.23). The hand rescues of this family stop here.
+
+### General improvements from the rescues (2026-11-14)
+
+**Submission-only checks (owner: count them, but only at that stage).** `gates.submission_checks` (quota, theme/pyramid/competition matches, Osmosis, Power Pool description and correlation) become `submit:<CHECK>` gates that `evaluator.decide` looks at only after every other hard gate passed; a failure then gives pending (the alpha is good, BRAIN would not take it as it is), never reject or repair. Replay over 160 results: no decision changes.
+
+**Lessons by dataset category (gen-v7).** `generator.category_lessons` in `config/generator.yaml`, shown to the Generator by the BRAIN category of its arm's dataset (`dataset_category`, from the catalog), plus `all` for every arm: keep the speeds of blended parts alike (the dip blends), a part helps a blend only where it is strong in the blend's weak years and not weak elsewhere; for analyst data, net revision breadth over several less-used items plus recommendation breadth, little smoothing, and the note that EBIT upgrades correlate with production.
+
+**Repair lever `speed_up`.** Mechanical: decay down to `decay_to` and the windows of smoothing operators (`ts_decay_linear`, `ts_mean`) down to `window_to`; windows that define the signal (`ts_delta`, ...) stay. First lever for `recent_sharpe` (playbook order; lever learning re-ranks with evidence). In the rescues faster smoothing raised the 2-year Sharpe 1.17 -> 1.32 -> 1.35 where no field change did.
+
+The owner submitted `seed_774d71e6_r1_r2` (BRAIN alpha `3q0wOPoQ`) on 2026-11-14. `regions_per_run` stays 3 (owner).
+
+737 tests pass.

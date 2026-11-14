@@ -9,8 +9,10 @@ LOW_SHARPE, CONCENTRATED_WEIGHT, LOW_SUB_UNIVERSE_SHARPE, ...) becomes a hard ga
 ``brain:<CHECK>``, so whatever BRAIN fails is a definite failure of its class, even where
 our own limit is null (concentration, OQ-4). We set no limits of our own for those checks.
 A check BRAIN reports as WARNING or PENDING is not a PASS/FAIL and is not a gate, and
-neither is a check listed in ``gates.brain_checks_ignored`` (checks about submitting, such as
-the daily submission quota, not about the alpha).
+neither is a check listed in ``gates.brain_checks_ignored``. A check listed in
+``gates.submission_checks`` (about submitting, not the alpha: daily quota, Power Pool,
+theme matches) is a ``submit:<CHECK>`` gate decided last: only an alpha that passes every
+other check is held, as pending, by a failed submission check.
 
 Decision precedence (owner's choice: a definite failure beats "not evaluable"):
 1. status != complete             -> reject / incomplete
@@ -86,6 +88,9 @@ CHECK_TO_CLASS = {
     "pool_correlation": "self_correlation",
     "deflated_sharpe": "other",
 }
+
+
+SUBMISSION_GATE_PREFIX = "submit:"   # gates.submission_checks: decided last (see decide)
 
 
 def check_class(name: str) -> str:
@@ -190,11 +195,16 @@ def run_gates(result: ResultRecord, config: Config) -> list[GateResult]:
         gates = [_brain_verdict(x, result.checks or {}) for x in gates]
 
     if g.use_brain_checks:
-        ignored = set(g.brain_checks_ignored)
+        ignored, submission = set(g.brain_checks_ignored), set(g.submission_checks)
         for name, ok in sorted((result.checks or {}).items()):
             if name in ignored:
                 continue
             value, threshold = _brain_value(name, result)
+            if name in submission:
+                gates.append(GateResult(SUBMISSION_GATE_PREFIX + name, ok, value, threshold,
+                                        "BRAIN submission check " + ("PASS" if ok else "FAIL")
+                                        + " (decided only once every other check passes)"))
+                continue
             gates.append(GateResult(BRAIN_GATE_PREFIX + name, ok, value, threshold,
                                     "BRAIN check " + ("PASS" if ok else "FAIL")))
 
@@ -318,6 +328,15 @@ def decide(result: ResultRecord, gates: list[GateResult], playbook: Playbook,
     if unknown:
         return record("pending", "none",
                       [f"{g.name} not evaluable: {g.note}" for g in unknown])
+
+    # submission checks last: the alpha passed every check about itself, but BRAIN would
+    # not take it as it is (daily quota, Power Pool, ...): pending for the owner, not reject
+    blocked = [g for g in gates if g.name.startswith(SUBMISSION_GATE_PREFIX) and g.passed is False]
+    if blocked:
+        return record("pending", "none",
+                      ["every alpha check passed"] +
+                      [f"{g.name} failed: value {g.value} vs {g.threshold} (submission check)"
+                       for g in blocked])
 
     return record("accept", "none", ["all hard gates passed", "no risk veto"])
 

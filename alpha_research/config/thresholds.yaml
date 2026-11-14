@@ -20,11 +20,14 @@ gates:
   # only when it does not. Our overfitting (auditor), pool-diversity and risk checks are
   # computed and recorded in the decision but never reject an alpha or hold it pending.
   brain_checks_only: true
-  # BRAIN checks that are about submitting, not about the alpha, so never gates: the daily
-  # submission quota (REGULAR_SUBMISSION, limit 4), theme/pyramid/competition matches,
-  # Osmosis allocation, and the Power Pool description and correlation (which apply to
-  # Power Pool submissions only; OQ-17, builder default, owner to confirm).
-  brain_checks_ignored:
+  # BRAIN checks that are about submitting, not about the alpha (owner 2026-11-14: count them,
+  # but only at that stage): checked only once every other check passes; a FAIL then makes
+  # the decision pending (the alpha is good, BRAIN would not take it as it is), never a
+  # reject or a repair. Daily submission quota (REGULAR_SUBMISSION, limit 4),
+  # theme/pyramid/competition matches, Osmosis allocation, Power Pool description and
+  # correlation. WARNING and PENDING are not PASS/FAIL, so they never block.
+  brain_checks_ignored: []
+  submission_checks:
     - REGULAR_SUBMISSION
     - MATCHES_THEMES
     - MATCHES_PYRAMID

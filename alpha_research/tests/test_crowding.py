@@ -157,3 +157,45 @@ def test_ranker_lists_the_arms_dataset_first():
     prompt = build_system_prompt(SPEC, list(meta), text, GEN, meta=meta, dataset="mdl")
     listed = prompt.split("Most relevant to this task:")[1]
     assert listed.index("mdl_quality") < listed.index("news_sentiment")
+
+
+# ------------------------------------------------------------------ category lessons (gen-v7)
+
+def test_lessons_by_dataset_category_reach_the_prompt():
+    from alpha_research.generator import dataset_category, lessons_for
+    by = dict(GEN.category_lessons)
+    assert {"all", "analyst"} <= set(by) and "recommendation breadth" in by["analyst"]
+    meta = {"est_up": {"dataset": "analyst7", "category": "analyst"},
+            "close": {"dataset": "pv1", "category": "pv"}}
+    assert dataset_category("analyst7", meta) == "analyst"
+    assert dataset_category("pv1", meta) == "pv" and dataset_category("nope", meta) is None
+    assert lessons_for(GEN, "analyst") == [by["all"], by["analyst"]]
+    assert lessons_for(GEN, "pv") == [by["all"]]          # no pv lesson yet: only the general one
+    prompt = build_system_prompt(SPEC, ["est_up"], "upgrades", GEN, meta=meta,
+                                 lessons=lessons_for(GEN, "analyst"))
+    assert "What our own results showed for this kind of data" in prompt
+    assert by["analyst"] in prompt
+
+
+def test_category_lessons_config_is_checked(tmp_path):
+    raw = yaml.safe_load((ROOT / "config" / "generator.yaml").read_text())
+    raw["generator"]["category_lessons"] = {"analyst": 3}
+    p = tmp_path / "g.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ConfigError):
+        load_generator_config(p)
+
+
+def test_generator_shows_its_arms_category_lesson():
+    import json
+    from alpha_research.generator import AlphaGenerator, GenerationSettings, Source
+    from alpha_research.llm import ScriptedLLMClient
+    meta = {"est_up": {"dataset": "analyst7", "category": "analyst"}}
+    s = GenerationSettings.from_mapping({"region": "USA", "universe": "TOP3000", "delay": 1,
+                                         "decay": 4, "neutralization": "SECTOR",
+                                         "truncation": 0.08, "start_date": "2014-01-01",
+                                         "end_date": "2023-12-31", "dataset": "analyst7"})
+    llm = ScriptedLLMClient([json.dumps({"alphas": [{"expression": "rank(est_up)"}]})])
+    AlphaGenerator(llm, SPEC, s, GEN, datafields=["est_up"], field_meta=meta).generate(
+        Source("hypothesis", "analyst upgrades"), 1, batch_id="b")
+    assert dict(GEN.category_lessons)["analyst"] in llm.calls[0]["system"]

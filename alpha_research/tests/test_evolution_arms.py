@@ -39,15 +39,15 @@ def test_only_the_runs_regions_evolve_and_each_evolved_arm_replaces_its_parent(
         memory, config, playbook):
     run = evolving_run(memory, config, playbook)
     assert run.run_regions == ["USA", "EUR"]
-    parent = ("pv1", "USA", "gen-v6", "claude-a", 1)
+    parent = ("pv1", "USA", "gen-v7", "claude-a", 1)
     run.director.update(parent, False)
     run.director.update(parent, True)
     before = len(run.arms)
-    evolve(run, "gen-v6+evo1")
+    evolve(run, "gen-v7+evo1")
 
-    evolved = [k for k in run.arms if k[2] == "gen-v6+evo1" and k[0] == "pv1"]
+    evolved = [k for k in run.arms if k[2] == "gen-v7+evo1" and k[0] == "pv1"]
     assert {k[1] for k in evolved} == {"USA", "EUR"} and len(evolved) == 4   # 2 regions x 2 models
-    child = ("pv1", "USA", "gen-v6+evo1", "claude-a", 1)
+    child = ("pv1", "USA", "gen-v7+evo1", "claude-a", 1)
     assert run.successor[parent] == child
     live = run._live_arms()
     assert parent not in live and child in live
@@ -57,9 +57,9 @@ def test_only_the_runs_regions_evolve_and_each_evolved_arm_replaces_its_parent(
     assert (s.successes, s.failures) == (1, 1)
     # new-dataset arms: capped, spread over markets of this run, then models
     new = sorted(k for k in run.arms if k[0] == "newds")
-    assert new == [("newds", "EUR", "gen-v6+evo1", "gemini-b", 1),
-                   ("newds", "USA", "gen-v6+evo1", "claude-a", 1),
-                   ("newds", "USA", "gen-v6+evo1", "gemini-b", 1)]
+    assert new == [("newds", "EUR", "gen-v7+evo1", "gemini-b", 1),
+                   ("newds", "USA", "gen-v7+evo1", "claude-a", 1),
+                   ("newds", "USA", "gen-v7+evo1", "gemini-b", 1)]
     assert len(run.arms) - before == 4 + 3
     assert run.log[-1]["evolution"]["replaced"]
 
@@ -67,10 +67,10 @@ def test_only_the_runs_regions_evolve_and_each_evolved_arm_replaces_its_parent(
 def test_a_second_evolution_evolves_the_successors_and_credit_follows_them(
         memory, config, playbook):
     run = evolving_run(memory, config, playbook, max_new_arms=0)
-    parent = ("pv1", "EUR", "gen-v6", "gemini-b", 1)
-    evolve(run, "gen-v6+evo1")
-    evolve(run, "gen-v6+evo2")
-    latest = ("pv1", "EUR", "gen-v6+evo2", "gemini-b", 1)
+    parent = ("pv1", "EUR", "gen-v7", "gemini-b", 1)
+    evolve(run, "gen-v7+evo1")
+    evolve(run, "gen-v7+evo2")
+    latest = ("pv1", "EUR", "gen-v7+evo2", "gemini-b", 1)
     assert run._current(parent) == latest
     assert not [k for k in run.arms if k[0] == "newds"]                     # cap 0
     assert sum(1 for k in run._live_arms() if k[0] == "pv1") == 4

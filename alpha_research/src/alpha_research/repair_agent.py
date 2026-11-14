@@ -16,6 +16,10 @@ Method
 
    ==================  ===========================================================
    increase_decay      decay -> step.to, if the current decay is lower
+   speed_up            decay -> step.decay_to and smoothing windows (step.operators,
+                       default ts_decay_linear and ts_mean) -> step.window_to, where
+                       larger: a signal priced faster than it is traded fades in the
+                       recent years (DEU analyst rescues, 2026-11-14)
    tighten_truncation  truncation -> step.to, if the current truncation is higher
    lengthen_ts_window  every integer window (2nd positional argument of a ts_* call)
                        multiplied by step.factor
@@ -135,6 +139,41 @@ def _increase_decay(c, step, spec, result=None):
     if c.decay >= to:
         raise LeverNotApplicable(f"decay is already {c.decay} (target {to})")
     return dataclasses.replace(c, decay=to)
+
+
+def _shorten(node, ops, to: int, changed: list):
+    if isinstance(node, Call):
+        args = [_shorten(a, ops, to, changed) for a in node.args]
+        if node.name in ops and len(args) >= 2 and isinstance(args[1], Num) \
+                and args[1].text.isdigit() and int(args[1].text) > to:
+            args[1] = Num(str(to))
+            changed.append(node.name)
+        kwargs = tuple((k, _shorten(v, ops, to, changed)) for k, v in node.kwargs)
+        return Call(node.name, tuple(args), kwargs)
+    if isinstance(node, Unary):
+        return Unary(node.op, _shorten(node.operand, ops, to, changed))
+    if isinstance(node, Binary):
+        return Binary(node.op, _shorten(node.left, ops, to, changed),
+                      _shorten(node.right, ops, to, changed))
+    if isinstance(node, Assign):
+        return Assign(node.name, _shorten(node.value, ops, to, changed))
+    return node
+
+
+def _speed_up(c, step, spec, result=None):
+    decay_to, window_to = step.get("decay_to"), step.get("window_to")
+    ops = tuple(step.get("operators") or ("ts_decay_linear", "ts_mean"))
+    if not all(isinstance(v, int) and not isinstance(v, bool) and v >= 0
+               for v in (decay_to, window_to)) or window_to < 1:
+        raise LeverNotApplicable("speed_up needs integer step.decay_to >= 0 and window_to >= 1")
+    changed: list = []
+    new = tuple(_shorten(s, ops, window_to, changed) for s in parse(c.expression))
+    decay = min(c.decay, decay_to)
+    if not changed and decay == c.decay:
+        raise LeverNotApplicable(f"decay {c.decay} and smoothing windows already at most "
+                                 f"{decay_to} / {window_to}")
+    return dataclasses.replace(c, expression=render(new) if changed else c.expression,
+                               decay=decay)
 
 
 def _tighten_truncation(c, step, spec, result=None):
@@ -340,6 +379,7 @@ def _winsorize(c, step, spec, result=None):
 
 MECHANICAL = {
     "increase_decay": _increase_decay,
+    "speed_up": _speed_up,
     "tighten_truncation": _tighten_truncation,
     "lengthen_ts_window": _lengthen_ts_window,
     "wrap_in_smoothing": _wrap_in_smoothing,

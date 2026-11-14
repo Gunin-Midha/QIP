@@ -118,6 +118,9 @@ drawdown:
     step: {}
 recent_sharpe:                      # BRAIN's LOW_2Y_SHARPE / IS_LADDER_SHARPE: the signal
                                     # weakened in the last in-sample years
+  - lever: speed_up                 # trade the signal sooner: in the DEU analyst rescues
+    step: {decay_to: 2, window_to: 2}   # (2026-11-14) faster smoothing lifted the 2-year
+                                    # Sharpe more than any field change (1.17 -> 1.32 -> 1.35)
   - lever: neutralize_crowding      # a once-good signal decays when it gets crowded
     step: {}
   - lever: neutralize_reversion_and_momentum

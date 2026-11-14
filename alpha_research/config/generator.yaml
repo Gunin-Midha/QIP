@@ -1,7 +1,7 @@
 # Alpha Generator settings (Phase 3). Technical limits have values. Policy limits are
 # null (= not configured, the check is skipped) until the owner decides (OQ-11).
 generator:
-  prompt_version: gen-v6       # written to CandidateRecord.prompt_version; bump when prompts change
+  prompt_version: gen-v7       # written to CandidateRecord.prompt_version; bump when prompts change
   max_repair_rounds: 1         # times rejected expressions are sent back to the model for a fix
   max_paper_chars: 120000      # longer papers are cut to this many characters (null = no cut)
   max_hypotheses_per_paper: 5  # hypotheses extracted from one paper
@@ -18,6 +18,26 @@ generator:
   crowding:
     percentile: 0.9
     min_alphas: 50
+
+  # Lessons from our own results, shown to the Generator by the BRAIN category of the arm's
+  # dataset; "all" goes to every arm. Evidence: the DEU/GBR analyst7 rounds of 2026-11-14
+  # (REPORT.md). Advice in the prompt, never a rule; edit as evidence grows.
+  category_lessons:
+    all: >-
+      When you combine parts, keep their speeds alike or smooth the fast part first: each
+      part enters as a rank, but a fast part (a 5-day price reversal, turnover near 50%)
+      sets the blend's turnover and behaviour over a slow one (analyst revisions) and
+      traded one strong year for a weak one. A part helps a blend only if it is strong in
+      the years the blend is weak without being weak in the others.
+    analyst: >-
+      Revision breadth works best as a net share: (raised minus lowered estimates) divided
+      by the number of estimates, averaged over several forecast items (sales, net income,
+      pre-tax profit, cash flow, dividends, EBITDA) rather than one headline item, and
+      combined with recommendation breadth (raised minus lowered recommendations over their
+      count). Ranked within sector, this took a Sharpe 1.2 signal to 1.9-2.3 with fitness
+      up to 2.5. Revisions are priced fast: little or no smoothing (decay 1-2) and 1-week
+      counts helped the most recent years more than longer windows. The single most used
+      item (EBIT upgrades) added recent strength but correlates with production alphas.
 
   # Field roles, matched (case-insensitive) at the START of BRAIN's description of a field.
   # id: identifiers, codes, names and raw text, which carry no ranking information. They are

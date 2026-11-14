@@ -70,13 +70,31 @@ def test_ignored_brain_checks_are_not_gates(config, playbook):
     assert d.decision == "reject"
 
 
-def test_main_config_ignores_submission_only_checks():
+def test_main_config_checks_submission_only_checks_last():
     from alpha_research.config import load_config
     g = load_config(ROOT / "config" / "thresholds.yaml").gates
-    assert g.sharpe_min == 1.58 and g.use_brain_checks
-    assert {"REGULAR_SUBMISSION", "MATCHES_THEMES", "OSMOSIS_ALLOCATION"} <= set(g.brain_checks_ignored)
+    assert g.sharpe_min == 1.58 and g.use_brain_checks and g.brain_checks_ignored == ()
+    assert {"REGULAR_SUBMISSION", "POWER_POOL_CORRELATION", "MATCHES_THEMES"} <= set(g.submission_checks)
     for alpha_check in ("LOW_SHARPE", "LOW_2Y_SHARPE", "SELF_CORRELATION", "PROD_CORRELATION"):
-        assert alpha_check not in g.brain_checks_ignored
+        assert alpha_check not in g.submission_checks
+
+
+def test_submission_checks_count_only_once_every_alpha_check_passes(config, playbook):
+    sub = dataclasses.replace(config, gates=dataclasses.replace(
+        config.gates, use_brain_checks=True, submission_checks=("REGULAR_SUBMISSION",
+                                                                "POWER_POOL_CORRELATION")))
+    # an alpha failing its own check: the submission check neither adds a class nor hides one
+    d = evaluate(passing(fitness=0.9, checks={"LOW_FITNESS": False, "REGULAR_SUBMISSION": False}),
+                 sub, playbook)
+    assert (d.decision, d.failure_class) == ("repair", "fitness")
+    # every alpha check passes: a failed submission check holds it, pending, never rejects
+    d = evaluate(passing(checks={"LOW_SHARPE": True, "POWER_POOL_CORRELATION": False}), sub, playbook)
+    assert (d.decision, d.failure_class) == ("pending", "none")
+    assert d.reasons[0] == "every alpha check passed"
+    assert any(r.startswith("submit:POWER_POOL_CORRELATION failed") for r in d.reasons)
+    d = evaluate(passing(checks={"LOW_SHARPE": True, "REGULAR_SUBMISSION": True}), sub, playbook)
+    assert d.decision == "accept"
+    assert next(g for g in d.gate_results if g.name == "submit:REGULAR_SUBMISSION").passed
 
 
 # ---------------------------------------------------------------- overfitting guard

@@ -37,6 +37,25 @@ def test_lengthen_ts_window_keeps_statements(candidate):
         apply("lengthen_ts_window", candidate(expression="rank(close)"), factor=2)
 
 
+def test_speed_up_shortens_smoothing_and_decay_only(candidate):
+    c = candidate(decay=5, expression="u = ts_delta(close, 20); group_rank(ts_decay_linear(rank(u), 5), sector)")
+    out = apply("speed_up", c, decay_to=2, window_to=2)
+    assert out.decay == 2
+    # the smoothing window shortens; ts_delta's window defines the signal and stays
+    assert out.expression == "u = ts_delta(close, 20); group_rank(ts_decay_linear(rank(u), 2), sector)"
+    assert apply("speed_up", candidate(decay=5, expression="rank(close)"), decay_to=2,
+                 window_to=2).decay == 2                      # decay alone is enough
+    with pytest.raises(LeverNotApplicable, match="already at most"):
+        apply("speed_up", candidate(decay=1, expression="rank(ts_mean(close, 2))"),
+              decay_to=2, window_to=2)
+    with pytest.raises(LeverNotApplicable, match="needs integer"):
+        apply("speed_up", c, decay_to=2)
+
+
+def test_playbook_tries_speed_up_first_for_recent_sharpe():
+    assert Playbook.load(PLAYBOOK).entries["recent_sharpe"][0].name == "speed_up"
+
+
 def test_wrapping_levers(candidate):
     c = candidate(expression="rank(-ts_delta(close, 5))")
     assert apply("wrap_in_smoothing", c, operator="ts_mean", window=5).expression == \

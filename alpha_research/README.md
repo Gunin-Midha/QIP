@@ -649,6 +649,10 @@ screenshot values (aggregate plus yearly rows for 2019 to 2023).
   screened alphas and sends them 3 at a time (and at each round's end). Over the real
   limit BRAIN answers 429 and the client waits for a slot. Raise the value once a run
   shows no 429 waits. Raised to 8 the same day (8 submitted within 6 s, no 429).
+- **Lessons by dataset category** (`generator.category_lessons`, gen-v7): advice from our
+  own results shown to the Generator by the BRAIN category of its arm's dataset (`all`
+  goes to every arm). Repair lever `speed_up` (decay and smoothing windows down) is the
+  first `recent_sharpe` lever.
 - **OQ-4 Drawdown and concentration limits.** Policy choice.
 - **OQ-5 Leg balance and top-PnL-removal thresholds.** Policy choice.
 - **OQ-6 Weak-year floor and yearly Sharpe spread.** Policy choice.
@@ -673,12 +677,10 @@ screenshot values (aggregate plus yearly rows for 2019 to 2023).
 - **OQ-16 Overfitting and repair budget defaults.** `auditor.min_deflated_sharpe` 0.0 with
   `trials_scope: dataset`; repair `max_depth` 2, `max_trials_per_root` 4, `patience` 2;
   `director.max_arm_share` 0.4; generator `datafield_exploration_share` 0.3. Review them.
-- **OQ-17 Consultant checks.** Builder defaults (2026-11-10): `gates.brain_checks_ignored`
-  skips the submission-only checks, including POWER_POOL_CORRELATION (applies to Power Pool
-  submissions only?); WARNING checks (CLUSTER_TEST, ...) are not gated; what CLUSTER_TEST
-  measures is unknown; BRAIN's limits outside USA delay 1 (e.g. Sharpe for delay 0 or other
-  regions) are unknown, so `gates.sharpe_min` is the USA D1 value and BRAIN's own check
-  decides per alpha. Confirm or correct.
+- **OQ-17 Consultant checks.** Submission-only checks: decided by the owner 2026-11-14
+  (`gates.submission_checks`: counted, but only once every alpha check passes; a failure
+  then makes the decision pending, never reject or repair). Still open: what CLUSTER_TEST
+  measures; WARNING checks are not gated.
 - **OQ-18 Region and new-check defaults.** Builder defaults (2026-11-11): the factor-lever
   priors in the playbook, `near_miss_share.recent_sharpe` 0.6, `region_prior_strength` 2,
   `region_floor_share` 0.5, `max_region_share` 0.6, `limits_from_brain: true`, and the
@@ -687,8 +689,9 @@ screenshot values (aggregate plus yearly rows for 2019 to 2023).
 - **Pass rule (owner, 2026-11-14).** An alpha passes on BRAIN's checks alone
   (`gates.brain_checks_only`): our gates follow BRAIN's verdict per check, and our
   overfitting, pool-diversity and risk checks are recorded in the decision but not applied.
-  Checks in `gates.brain_checks_ignored` (submission quota, theme/pyramid matches, Power
-  Pool) are not gates (OQ-17).
+  Submission-only checks (quota, theme/pyramid matches, Osmosis, Power Pool) are
+  `submit:<CHECK>` gates decided last: an alpha that passes every other check but fails one
+  of them is pending (OQ-17).
 - **OQ-21 Crowded fields.** Builder defaults (2026-11-14): `generator.crowding.percentile`
   0.9 (top 10% of each dataset by BRAIN alpha count), `min_alphas` 50; any one failed
   PROD_CORRELATION marks a field crowded in that market.

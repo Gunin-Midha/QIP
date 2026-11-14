@@ -103,7 +103,7 @@ def test_research_run_wires_prompts_and_context(memory, config, playbook):
     from test_research import RouterLLM, make_run
     llm = RouterLLM()
     report = make_run(memory, config, playbook, llm=llm).run(2)
-    assert report["prompt_versions"] == {"generator": "gen-v6", **prompts.PROMPT_VERSIONS}
+    assert report["prompt_versions"] == {"generator": "gen-v7", **prompts.PROMPT_VERSIONS}
     assert report["models"]["generator"] == ["claude-test"]
     agent_systems = [s for s in llm.all_systems if "Fast Expression language." not in s[:200]
                      and not s.startswith("You are a quantitative researcher")]

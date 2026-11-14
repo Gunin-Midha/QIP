@@ -75,6 +75,9 @@ class GeneratorConfig:
     # listed only when the task names it; None = off
     crowded_percentile: float | None = None
     crowded_min_alphas: int | None = None
+    # lessons from our own results, shown to the Generator by the BRAIN category of its
+    # arm's dataset ("analyst", "pv", ...); "all" goes to every arm
+    category_lessons: tuple[tuple[str, str], ...] = ()
 
 
 def _cfg_int(d: dict, key: str, *, nullable: bool = False, minimum: int = 0) -> int | None:
@@ -115,7 +118,32 @@ def load_generator_config(path: str | Path) -> GeneratorConfig:
         datafield_exploration_share=_cfg_share(g, "datafield_exploration_share"),
         **_cfg_roles(g.get("field_roles")),
         **_cfg_crowding(g.get("crowding")),
+        category_lessons=_cfg_lessons(g.get("category_lessons")),
     )
+
+
+def _cfg_lessons(raw) -> tuple[tuple[str, str], ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, dict) or not all(isinstance(k, str) and isinstance(v, str) and v.strip()
+                                            for k, v in raw.items()):
+        raise ConfigError("generator config: 'category_lessons' must map category names to text")
+    return tuple((k, " ".join(v.split())) for k, v in raw.items())
+
+
+def dataset_category(dataset: str | None, meta: dict) -> str | None:
+    """BRAIN's category of a dataset ("analyst", "pv", ...), from its fields in the catalog."""
+    if dataset is None:
+        return None
+    cats = Counter(m.get("category") for m in meta.values()
+                   if (m or {}).get("dataset") == dataset and m.get("category"))
+    return cats.most_common(1)[0][0] if cats else None
+
+
+def lessons_for(config: "GeneratorConfig", category: str | None) -> list[str]:
+    """The configured lessons for every arm, then for this dataset category."""
+    by = dict(config.category_lessons)
+    return [t for t in (by.get("all"), by.get(category) if category else None) if t]
 
 
 def _cfg_crowding(raw) -> dict:
@@ -485,7 +513,8 @@ def build_system_prompt(spec: FastExprSpec, datafields: Collection[str] | None,
                         relevance_text: str, config: GeneratorConfig,
                         guidance: str | None = None, meta: dict | None = None,
                         neutralizations: Sequence[str] = (), market: str | None = None,
-                        prod_failed: dict | None = None, dataset: str | None = None) -> str:
+                        prod_failed: dict | None = None, dataset: str | None = None,
+                        lessons: Sequence[str] = ()) -> str:
     """``prod_failed``: {field: our alphas using it that failed BRAIN's PROD_CORRELATION}
     in this market (memory); those fields count as crowded too. ``dataset``: the arm's,
     listed first."""
@@ -580,6 +609,9 @@ def build_system_prompt(spec: FastExprSpec, datafields: Collection[str] | None,
         lines.append("No datafield catalog was supplied. Prefer the base fields. Any other "
                      "datafield name you use may not exist on the platform and will be "
                      "flagged as unverified.")
+    if lessons:
+        lines += ["", "What our own results showed for this kind of data (advice, not rules):",
+                  *[f"- {t}" for t in lessons]]
     if guidance:
         lines += ["", "Lessons from earlier research rounds (summarized from our own results; "
                   "advice, not rules, and never a reason to break the language rules):",
@@ -817,7 +849,9 @@ class AlphaGenerator:
                                      market=f"{self.settings.region} {self.settings.universe}, "
                                             f"delay {self.settings.delay}",
                                      prod_failed=self.prod_failed,
-                                     dataset=self.settings.dataset)
+                                     dataset=self.settings.dataset,
+                                     lessons=lessons_for(self.config, dataset_category(
+                                         self.settings.dataset, self.field_meta)))
         reply = self._ask_json(system, _generate_prompt(unit.hypothesis, unit.context, k), result)
         good, bad = self._check(self._items(reply), unit)
 
