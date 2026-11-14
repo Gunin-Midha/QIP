@@ -10,7 +10,7 @@ def test_main_config_loads_with_nulls():
     assert cfg.gates.turnover_max == 0.70
     assert cfg.risk.max_drawdown is None
     assert cfg.diversity.min_marginal_pool_sharpe_gain is None
-    assert cfg.simulator.max_concurrent == 1
+    assert cfg.simulator.max_concurrent == 8   # owner 2026-11-14
 
 
 def test_main_config_holdout_follows_brain_default():

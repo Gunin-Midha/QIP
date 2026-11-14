@@ -357,6 +357,9 @@ class FastExprSpec:
     groups: frozenset[str]
     base_fields: frozenset[str]
     constants: frozenset[str]
+    # BRAIN's limit on operators in one alpha: function calls plus arithmetic (+ - * /,
+    # comparisons, unary minus); None = not checked
+    max_operators: int | None = None
 
     @classmethod
     def load(cls, path: str | Path) -> "FastExprSpec":
@@ -388,7 +391,11 @@ class FastExprSpec:
             if not all(isinstance(x, str) and x for x in raw[key]):
                 raise ConfigError(f"fastexpr spec: {key!r} must hold non-empty strings")
             sets[key] = frozenset(raw[key])
-        return cls(ops, sets["groups"], sets["base_fields"], sets["constants"])
+        limit = raw.get("max_operators")
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int)
+                                  or limit < 1):
+            raise ConfigError("fastexpr spec: 'max_operators' must be a positive integer or null")
+        return cls(ops, sets["groups"], sets["base_fields"], sets["constants"], limit)
 
     def signatures(self) -> list[str]:
         return [op.signature for op in self.operators.values()]
@@ -418,6 +425,20 @@ class Analysis:
     @property
     def ok(self) -> bool:
         return not self.errors
+
+
+def _operators(node) -> int:
+    """Operators as BRAIN counts them: every call and every arithmetic or comparison
+    operator (checked against BRAIN's errors: 66, 66 and 71 on 2026-11-14)."""
+    if isinstance(node, Assign):
+        return _operators(node.value)
+    if isinstance(node, Unary):
+        return 1 + _operators(node.operand)
+    if isinstance(node, Binary):
+        return 1 + _operators(node.left) + _operators(node.right)
+    if isinstance(node, Call):
+        return 1 + sum(_operators(a) for a in node.args) + sum(_operators(v) for _, v in node.kwargs)
+    return 0
 
 
 def _depth(node) -> int:
@@ -474,6 +495,7 @@ class _Walker:
         self.events = ({f for f, t in datafields.items() if t == EVENT_TYPE}
                        if isinstance(datafields, Mapping) else set())
         self.variables: set[str] = set()
+        self.used: set[str] = set()      # variables a later statement reads
         self.errors: list[str] = []
         self.warnings: list[str] = []
         self.operators: set[str] = set()
@@ -499,7 +521,10 @@ class _Walker:
 
     def name(self, n: str, in_vec: bool = False) -> None:
         s = self.spec
-        if n in self.variables or n in s.groups or n in s.constants:
+        if n in self.variables:
+            self.used.add(n)
+            return
+        if n in s.groups or n in s.constants:
             return
         if n in self.events and not in_vec:
             self.err(f"datafield {n!r} is an event (vector) field: use it only inside "
@@ -545,7 +570,8 @@ def analyze(expression: str, spec: FastExprSpec, *,
             datafields: Collection[str] | Mapping[str, str | None] | None = None,
             limits: ComplexityLimits | None = None) -> Analysis:
     """Check one expression. Never raises on bad input; problems go in ``errors``.
-    ``datafields`` with types (``catalog``) also checks that event fields sit in vec_*."""
+    ``datafields`` with types (``catalog``) also checks that event fields sit in vec_*.
+    A variable no later statement reads is an error (BRAIN refuses it)."""
     try:
         stmts = parse(expression)
     except FastExprError as exc:
@@ -563,10 +589,19 @@ def analyze(expression: str, spec: FastExprSpec, *,
             w.variables.add(stmt.name)  # defined only for later statements
         else:
             w.visit(stmt)
+    # BRAIN refuses an alpha with a variable it never reads ('Found unused variables "liq"',
+    # 2026-11-14), so it is an error here too
+    defined = [s.name for s in stmts if isinstance(s, Assign)]
+    for name in dict.fromkeys(n for n in defined if n not in w.used):
+        w.err(f"variable {name!r} is defined but never used (BRAIN refuses unused variables)")
     if not w.fields and not w.errors:
         w.err("expression references no datafield")
 
     depth = max(_depth(s) for s in stmts)
+    n_ops = sum(_operators(s) for s in stmts)
+    if spec.max_operators is not None and n_ops > spec.max_operators:
+        w.err(f"{n_ops} operators (calls plus arithmetic) exceed BRAIN's limit of "
+              f"{spec.max_operators}")
     if limits is not None:
         if limits.max_depth is not None and depth > limits.max_depth:
             w.err(f"nesting depth {depth} exceeds the limit of {limits.max_depth}")

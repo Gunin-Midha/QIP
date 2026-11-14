@@ -13,6 +13,11 @@ Per candidate:
 8. print one summary line
 
 Pending decisions are routed back onto the research loop queue but not re-run here.
+
+``process_many`` runs step 2 for several candidates at once (up to
+``simulator.max_concurrent`` on BRAIN together, OQ-3), then steps 3-8 one candidate at a
+time in the given order, so decisions, pool admission and printed lines come in the same
+order as with ``process`` (a duplicate is printed when it is found).
 """
 
 from __future__ import annotations
@@ -32,7 +37,7 @@ from .config import Config
 from .memory import MemoryStore
 from .pool import Pool
 from .repair import Playbook
-from .research_loop import ResearchLoop
+from .research_loop import ResearchLoop, experiment_id
 from .schemas import CandidateRecord, DecisionRecord, GateResult, ResultRecord, SchemaError
 from .simulator import Simulator
 
@@ -111,14 +116,28 @@ class Pipeline:
         return outcome
 
     def process(self, candidate: CandidateRecord) -> Outcome:
-        if self.loop.is_duplicate(candidate):
-            log.info("duplicate of an earlier experiment, skipped: %s", candidate.candidate_id)
-            return self._emit(Outcome(candidate.candidate_id, "duplicate", None))
+        return self.process_many([candidate])[0]
 
-        result = self.simulator.run(candidate)
-        if result.status != "invalid":
-            self.auditor.register_variant(candidate.family, candidate.candidate_id)
-        return self._evaluate(candidate, result)
+    def process_many(self, candidates: list[CandidateRecord]) -> list[Outcome]:
+        """Outcomes in the order of ``candidates``. Duplicates (of memory or of an earlier
+        candidate in the list) are skipped; the rest are simulated together, then
+        evaluated in order."""
+        outcomes: list[Outcome | None] = [None] * len(candidates)
+        to_run, seen = [], set()
+        for i, candidate in enumerate(candidates):
+            h = experiment_id(candidate)
+            if h in seen or self.loop.is_duplicate(candidate):
+                log.info("duplicate of an earlier experiment, skipped: %s", candidate.candidate_id)
+                outcomes[i] = self._emit(Outcome(candidate.candidate_id, "duplicate", None))
+                continue
+            seen.add(h)
+            to_run.append((i, candidate))
+        results = self.simulator.run_many([c for _, c in to_run])
+        for (i, candidate), result in zip(to_run, results):
+            if result.status != "invalid":
+                self.auditor.register_variant(candidate.family, candidate.candidate_id)
+            outcomes[i] = self._evaluate(candidate, result)
+        return outcomes  # type: ignore[return-value]
 
     def recover(self, candidate: CandidateRecord, sim_id: str) -> Outcome | None:
         """Decide an earlier submission that BRAIN finished after our wait ended (its
@@ -134,15 +153,21 @@ class Pipeline:
             veto, risk_checks, risk_reasons = risk.assess(result, config, gates)
         else:
             veto, risk_checks, risk_reasons = False, [], []
+        brain_only = config.gates.brain_checks_only   # a pass is BRAIN's checks alone
+        if brain_only and veto:
+            veto = False
+            risk_reasons = risk_reasons + ["risk veto recorded, not applied (gates.brain_checks_only)"]
         decision = evaluator.decide(result, gates, self.playbook, risk_checks, veto, risk_reasons,
                                     config.repair.near_miss_share,
                                     config.repair.risk_neutralized_gap)
 
         admitted_by_diversity = None
         if decision.decision == "accept":
-            decision = self._overfitting(candidate, result, decision)
+            checked = self._overfitting(candidate, result, decision)
+            decision = self._informational(decision, checked) if brain_only else checked
         if decision.decision == "accept":
-            admitted_by_diversity, decision = self._diversity(result, decision)
+            admitted_by_diversity, checked = self._diversity(result, decision)
+            decision = self._informational(decision, checked) if brain_only else checked
 
         self.memory.put_decision(decision)
         if decision.decision == "accept":
@@ -150,6 +175,18 @@ class Pipeline:
         self.loop.route(candidate, decision)
         return self._emit(Outcome(candidate.candidate_id, decision.decision,
                                   decision.failure_class, result, decision))
+
+    @staticmethod
+    def _informational(decision: DecisionRecord, checked: DecisionRecord) -> DecisionRecord:
+        """Keep ``decision`` but record what our own check (``checked``) found: its gates
+        and reasons, marked as not applied (gates.brain_checks_only)."""
+        if checked.decision == decision.decision:
+            return checked
+        extra = checked.reasons[len(decision.reasons):]
+        return dataclasses.replace(
+            decision, gate_results=checked.gate_results,
+            reasons=decision.reasons + [f"recorded, not applied (gates.brain_checks_only): {r}"
+                                        for r in extra])
 
     def _overfitting(self, candidate: CandidateRecord, result: ResultRecord,
                      decision: DecisionRecord) -> DecisionRecord:
@@ -189,4 +226,7 @@ class Pipeline:
         return admit, decision
 
     def run(self, candidates: list[CandidateRecord]) -> list[Outcome]:
-        return [self.process(c) for c in candidates]
+        """Every candidate, ``simulator.max_concurrent`` at a time."""
+        n = max(1, self.config.simulator.max_concurrent)
+        return [o for i in range(0, len(candidates), n)
+                for o in self.process_many(candidates[i:i + n])]

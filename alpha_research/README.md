@@ -233,7 +233,7 @@ the simulator marks a result `invalid` if that period overlaps the holdout, so a
 BRAIN's default period cannot leak the holdout (OQ-12). BRAIN's `testPeriod` setting is
 not used. Fixed settings sent with every simulation (instrument type,
 pasteurization, unit and NaN handling, language) live in `config/brain.yaml`.
-Simulations run one at a time (OQ-3). Alphas are never submitted for competition.
+Up to `simulator.max_concurrent` (3) simulations run on BRAIN at once (OQ-3). Alphas are never submitted for competition.
 
 ## Research loop: all agents connected
 
@@ -491,7 +491,19 @@ set, so the results of a hand rescue become evidence for the learner too.
   round while others are below it. The generator lists 120 fields: 70% most relevant
   (crowding breaks ties) and 30% drawn across the other datasets, each annotated with
   coverage, how many BRAIN alphas use it, and vector/group type, as hints, not limits
-  (`gen-v2`). Strategy Evolution sees per-dataset trial counts, the least-tried datasets and
+  (`gen-v2`). Crowded fields (`gen-v6`, `generator.crowding`, OQ-21): a field in the top
+  10% of its dataset by BRAIN alpha count (and >= 50 alphas; groups and base fields
+  excluded) is listed after every other field and never drawn for exploration, unless the
+  task names it; then it is marked `crowded` and the prompt asks for a form other than its
+  common one. Fields of our alphas that failed PROD_CORRELATION in that market count as
+  crowded too (`strategy.prod_correlation_fields`, refreshed from memory before each
+  batch). Strategy Evolution evolves only the run's regions; an evolved arm replaces its
+  parent and starts from its record; new-dataset arms are capped at `strategy.max_new_arms`
+  (8). The relevant part of the listing (`generator._rank_datafields`) puts the arm's
+  own dataset first, then ranks by whole words of the hypothesis found in the field id or
+  BRAIN's description, weighted by how rare each word is in the catalog (crowded fields
+  last). Plan v4 (`config/research_plan.v4.yaml`) is plan v3 with hypotheses that name no
+  fields, so the Generator chooses them. Strategy Evolution sees per-dataset trial counts, the least-tried datasets and
   the fixes that worked; its prompt (`strategy-v3`) requires at least half the new
   hypotheses on least-tried datasets and at most one building on an accepted alpha, and a
   hypothesis on a dataset no arm covers goes to every arm. The Critic flags neutralization
@@ -631,8 +643,12 @@ screenshot values (aggregate plus yearly rows for 2019 to 2023).
 - **OQ-2 Real BRAIN response format.** Confirmed by a live capture (2026-11-03); `daily-pnl`
   holds daily values. Still open: the unit of `weight_concentration`, because BRAIN's
   `CONCENTRATED_WEIGHT` check carries no value when it passes.
-- **OQ-3 Concurrent simulation limit.** Account-specific. `max_concurrent` is 1 and no
-  threading is implemented.
+- **OQ-3 Concurrent simulation limit.** Account-specific and unknown. `max_concurrent` is 3
+  (owner 2026-11-14): `Simulator.run_many` keeps that many running (one thread polling each
+  in turn), `Pipeline.process_many` decides them in order, and `cli research` queues
+  screened alphas and sends them 3 at a time (and at each round's end). Over the real
+  limit BRAIN answers 429 and the client waits for a slot. Raise the value once a run
+  shows no 429 waits. Raised to 8 the same day (8 submitted within 6 s, no 429).
 - **OQ-4 Drawdown and concentration limits.** Policy choice.
 - **OQ-5 Leg balance and top-PnL-removal thresholds.** Policy choice.
 - **OQ-6 Weak-year floor and yearly Sharpe spread.** Policy choice.
@@ -668,6 +684,14 @@ screenshot values (aggregate plus yearly rows for 2019 to 2023).
   `region_floor_share` 0.5, `max_region_share` 0.6, `limits_from_brain: true`, and the
   `change_universe` size order per region (GLB, ALL, CHN, AMR, IND, DEU, GBR have none).
   What DATA_DIVERSITY measures is unknown, so it stays class "other" (no repair).
+- **Pass rule (owner, 2026-11-14).** An alpha passes on BRAIN's checks alone
+  (`gates.brain_checks_only`): our gates follow BRAIN's verdict per check, and our
+  overfitting, pool-diversity and risk checks are recorded in the decision but not applied.
+  Checks in `gates.brain_checks_ignored` (submission quota, theme/pyramid matches, Power
+  Pool) are not gates (OQ-17).
+- **OQ-21 Crowded fields.** Builder defaults (2026-11-14): `generator.crowding.percentile`
+  0.9 (top 10% of each dataset by BRAIN alpha count), `min_alphas` 50; any one failed
+  PROD_CORRELATION marks a field crowded in that market.
 - **OQ-14 Data Scientist input.** The datafield audit needs a dates × instruments matrix
   per field. BRAIN's API (as far as the web app shows) does not provide raw data, so decide
   the source: BRAIN's per-field statistics, an outside data source, or probe simulations.

@@ -80,7 +80,7 @@ def test_a_memory_seed_is_simulated_first_as_a_new_root(memory, config, playbook
     first = brain.submitted[0]
     assert first.candidate_id == "old_acc_seed" and first.expression == "rank(-ts_delta(close, 13))"
     assert (first.parent_id, first.generation, first.lever, first.decay) == (None, 0, None, 10)
-    assert (first.prompt_version, first.model) == ("gen-v5", "claude-test")   # its arm's
+    assert (first.prompt_version, first.model) == ("gen-v6", "claude-test")   # its arm's
     assert first.start_date == run.arms[next(iter(run.arms))].settings.start_date
     assert report["seeds"][0]["status"].startswith(("accept", "reject", "repair", "pending"))
     assert run.log[0]["arms"][0]["seed"] == "old_acc_seed"

@@ -5,15 +5,21 @@ retries, normalize the raw dict into a ResultRecord, run the metric validator, p
 return. A failure the client marks ``retryable`` (BRAIN's own error) is submitted once more.
 ``recover`` polls an earlier submission once, for results BRAIN finished after our wait.
 
+``run_many`` keeps up to ``simulator.max_concurrent`` simulations running on BRAIN at once
+(OQ-3): it submits until that many are running, polls each running one in turn, and submits
+the next as soon as one finishes. One thread: BRAIN does the work in parallel, we only wait
+for it, so memory (SQLite) and the virtual clock stay simple. ``run`` is ``run_many`` of one.
+
 Time is injected (``sleep`` and ``clock``) so fixture runs can use ``VirtualClock`` and
-never wait in real time. Single-threaded; ``simulator.max_concurrent`` is not used yet
-(OQ-3).
+never wait in real time.
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from collections import deque
+from dataclasses import dataclass
 from datetime import date
 from typing import Callable
 
@@ -230,6 +236,16 @@ def normalize(raw: dict, candidate_id: str, brain_sim_id: str | None) -> ResultR
 # wrapper
 # ---------------------------------------------------------------------------
 
+@dataclass
+class _Job:
+    """One candidate on its way through BRAIN in ``run_many``."""
+    index: int
+    candidate: CandidateRecord
+    sim_id: str | None = None        # None until submitted (or resubmitted)
+    started: float | None = None
+    retried_from: str | None = None  # first simulation id, once BRAIN's error was retried
+
+
 class Simulator:
     def __init__(self, client: BrainClient, memory: MemoryStore, config: Config,
                  sleep: Callable[[float], None] = time.sleep,
@@ -241,37 +257,71 @@ class Simulator:
         self.clock = clock
 
     def run(self, candidate: CandidateRecord) -> ResultRecord:
-        errors = local_validation_errors(candidate, self.config)  # may raise ConfigError
-        if errors:
-            result = ResultRecord(candidate_id=candidate.candidate_id, status="invalid",
-                                  notes=[f"invalid: {e}" for e in errors])
+        return self.run_many([candidate], max_concurrent=1)[0]
+
+    def run_many(self, candidates: list[CandidateRecord],
+                 max_concurrent: int | None = None) -> list[ResultRecord]:
+        """Results in the order of ``candidates``, each persisted as it finishes. At most
+        ``max_concurrent`` (default ``simulator.max_concurrent``) run on BRAIN at a time; a
+        resumed pending submission takes a slot too. Each simulation has its own
+        ``max_poll_seconds`` from its own submission."""
+        limit = max(1, max_concurrent or self.config.simulator.max_concurrent)
+        results: list[ResultRecord | None] = [None] * len(candidates)
+        waiting: deque[_Job] = deque()
+        for i, candidate in enumerate(candidates):
+            errors = local_validation_errors(candidate, self.config)  # may raise ConfigError
             self.memory.put_candidate(candidate)
-            self.memory.put_result(result)
-            return result
+            if errors:
+                results[i] = self._persist(ResultRecord(
+                    candidate_id=candidate.candidate_id, status="invalid",
+                    notes=[f"invalid: {e}" for e in errors]))
+                continue
+            sim_id = self.memory.pending_sim_id(candidate.candidate_id)
+            if sim_id is not None:
+                log.info("resuming pending submission %s for %s", sim_id, candidate.candidate_id)
+            waiting.append(_Job(i, candidate, sim_id))
 
-        self.memory.put_candidate(candidate)
-        sim_id = self.memory.pending_sim_id(candidate.candidate_id)
-        if sim_id is not None:
-            log.info("resuming pending submission %s for %s", sim_id, candidate.candidate_id)
-        else:
-            sim_id = self._submit(candidate)
-            if isinstance(sim_id, ResultRecord):
-                return self._persist(sim_id)
-            self.memory.put_pending(candidate.candidate_id, sim_id)
+        active: list[_Job] = []
+        while waiting or active:
+            while waiting and len(active) < limit:
+                job = waiting.popleft()
+                if job.sim_id is None:
+                    sim_id = self._submit(job.candidate)
+                    if isinstance(sim_id, ResultRecord):  # submitting failed
+                        results[job.index] = self._done(job, sim_id)
+                        continue
+                    job.sim_id = sim_id
+                    if job.retried_from is None:
+                        self.memory.put_pending(job.candidate.candidate_id, sim_id)
+                job.started = self.clock()
+                active.append(job)
+            waits = []
+            for job in list(active):
+                result, retryable, wait = self._poll_once(job)
+                if result is None:
+                    waits.append(wait)
+                    continue
+                active.remove(job)
+                if retryable and job.retried_from is None:
+                    # BRAIN's own error, not the alpha's: submit once more, first in line
+                    # (its slot just freed). The new simulation id is on the result;
+                    # pending_submissions keeps the first, since it is append-only.
+                    log.info("BRAIN error on %s for %s, submitting once more", job.sim_id,
+                             job.candidate.candidate_id)
+                    job.retried_from, job.sim_id = job.sim_id, None
+                    waiting.appendleft(job)
+                else:
+                    results[job.index] = self._done(job, result)
+            if active and waits:
+                self.sleep(min(waits))
+        return results  # type: ignore[return-value]
 
-        result, retryable = self._poll_until_done(candidate.candidate_id, sim_id)
-        if retryable:
-            # BRAIN's own error, not the alpha's: submit once more. The new simulation id
-            # is on the result (pending_submissions keeps the first; it is append-only).
-            first = sim_id
-            log.info("BRAIN error on %s for %s, submitting once more", first,
-                     candidate.candidate_id)
-            sim_id = self._submit(candidate)
-            if isinstance(sim_id, ResultRecord):
-                result = sim_id
-            else:
-                result, _ = self._poll_until_done(candidate.candidate_id, sim_id)
-            result.notes.insert(0, f"retried once after BRAIN's error on simulation {first}")
+    def _done(self, job: _Job, result: ResultRecord) -> ResultRecord:
+        if job.retried_from is None and job.sim_id is None:
+            return self._persist(result)   # first submission failed: nothing to check
+        if job.retried_from is not None:
+            result.notes.insert(0, f"retried once after BRAIN's error on simulation "
+                                   f"{job.retried_from}")
         return self._persist(self._finish(result))
 
     def recover(self, candidate: CandidateRecord, sim_id: str) -> ResultRecord | None:
@@ -333,25 +383,26 @@ class Simulator:
                     raise
                 self.sleep(BACKOFF_BASE_SECONDS * (2 ** attempt))
 
-    def _poll_until_done(self, candidate_id: str, sim_id: str) -> tuple[ResultRecord, bool]:
-        """(result, retryable): retryable when BRAIN failed with one of its own errors."""
+    def _poll_once(self, job: _Job) -> tuple[ResultRecord | None, bool, float]:
+        """One poll of a running simulation: (result or None while running, retryable,
+        seconds to wait before the next poll). retryable when BRAIN failed with one of its
+        own errors; a simulation running past ``max_poll_seconds`` becomes a timeout."""
         cfg = self.config.simulator
-        started = self.clock()
-        while True:
-            try:
-                raw = self._with_retry(lambda: self.client.poll(sim_id))
-            except TRANSIENT_ERRORS as exc:
-                return self._failure(candidate_id, sim_id, exc, "poll"), False
-            if raw.get("status") in ("complete", "failed"):
-                retryable = raw.get("status") == "failed" and bool(raw.get("retryable"))
-                return normalize(raw, candidate_id, sim_id), retryable
-            elapsed = self.clock() - started
-            if elapsed >= cfg.max_poll_seconds:
-                return ResultRecord(
-                    candidate_id=candidate_id, status="timeout", brain_sim_id=sim_id,
-                    notes=[f"timeout: no completion after {elapsed:.0f}s "
-                           f"(max_poll_seconds={cfg.max_poll_seconds:g})"],
-                ), False
-            wait = raw.get("retry_after")
-            wait = float(wait) if isinstance(wait, (int, float)) and wait > 0 else cfg.poll_interval_seconds
-            self.sleep(wait)
+        cid, sim_id = job.candidate.candidate_id, job.sim_id
+        try:
+            raw = self._with_retry(lambda: self.client.poll(sim_id))
+        except TRANSIENT_ERRORS as exc:
+            return self._failure(cid, sim_id, exc, "poll"), False, 0.0
+        if raw.get("status") in ("complete", "failed"):
+            retryable = raw.get("status") == "failed" and bool(raw.get("retryable"))
+            return normalize(raw, cid, sim_id), retryable, 0.0
+        elapsed = self.clock() - job.started
+        if elapsed >= cfg.max_poll_seconds:
+            return ResultRecord(
+                candidate_id=cid, status="timeout", brain_sim_id=sim_id,
+                notes=[f"timeout: no completion after {elapsed:.0f}s "
+                       f"(max_poll_seconds={cfg.max_poll_seconds:g})"],
+            ), False, 0.0
+        wait = raw.get("retry_after")
+        wait = float(wait) if isinstance(wait, (int, float)) and wait > 0 else cfg.poll_interval_seconds
+        return None, False, wait

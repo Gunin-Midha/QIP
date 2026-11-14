@@ -33,6 +33,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
+from .fastexpr import analyze
 from .generator import GenerationError, ask_json
 from .lever_stats import LeverStats, repair_events
 from .llm import LLMClient, ModelDown
@@ -44,6 +45,9 @@ class StrategyConfig:
     max_hypotheses: int = 3
     max_guidance_chars: int = 1500
     tag: str = "evo"
+    # arms for datasets no arm covers, per evolution (2026-11-14: one evolution added 140
+    # arms for a 20-simulation run, so the Director could not learn which were good)
+    max_new_arms: int = 8
 
 
 @dataclass
@@ -178,6 +182,22 @@ def region_notes(outcomes: list[dict], region: str, *, max_levers: int = 3) -> s
                          f"{r['lever']} {r['fixed']}/{r['improved']}/{r['events']} "
                          f"({r['failure_class']})" for r in neut) + ".")
     return "\n".join(lines)
+
+
+def prod_correlation_fields(outcomes: list[dict], region: str, spec,
+                            datafields=None) -> dict[str, int]:
+    """{datafield: our simulated alphas in ``region`` that use it and failed BRAIN's
+    PROD_CORRELATION check} from memory (latest result per candidate). The Generator treats
+    these fields as crowded: their ideas are already in production. Base fields (close,
+    adv20, ...) are left out: they appear in most alphas, so they say nothing about the idea."""
+    out: Counter = Counter()
+    for row in outcomes:
+        c, r = row["candidate"], row.get("result")
+        if c.region != region or r is None or r.checks.get("PROD_CORRELATION") is not False:
+            continue
+        used = analyze(c.expression, spec, datafields=datafields).fields_used
+        out.update(f for f in used if f not in spec.base_fields)
+    return dict(out)
 
 
 _FAILURE_ADVICE = {

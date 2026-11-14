@@ -62,6 +62,12 @@ SETTING_FLAGS = ("region", "universe", "delay", "decay", "neutralization", "trun
 
 def _run(args) -> int:
     config = load_config(args.config)
+    if args.max_concurrent is not None:
+        if args.max_concurrent < 1:
+            print("error: --max-concurrent must be at least 1", file=sys.stderr)
+            return EXIT_CONFIG
+        config = dataclasses.replace(config, simulator=dataclasses.replace(
+            config.simulator, max_concurrent=args.max_concurrent))
     playbook = Playbook.load(args.playbook)
     entries = load_candidate_file(args.candidates)
 
@@ -554,6 +560,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--brain-config", default="config/brain.yaml")
     run.add_argument("--capture-dir", default=None,
                      help="with --client real: save every raw BRAIN response here")
+    run.add_argument("--max-concurrent", type=int, default=None,
+                     help="simulations on BRAIN at once (default: simulator.max_concurrent in "
+                          "--config); over the account's limit BRAIN answers 429 and the "
+                          "client waits for a slot")
     run.set_defaults(func=_run)
 
     bandit = sub.add_parser("bandit", help="Phase 2 driver: allocation rounds over fixture arms")

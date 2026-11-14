@@ -88,7 +88,8 @@ from .lever_stats import LeverStats, RepairLearningConfig, distance, repair_even
 from .repair_agent import RepairAgent
 from .schemas import (GROUP_NEUTRALIZATIONS, NO_REGULAR_SIMULATION, REGION_SETTINGS,
                       CandidateRecord, experiment_hash)
-from .strategy import StrategyConfig, StrategyEvolution, brain_limits, region_notes
+from .strategy import (StrategyConfig, StrategyEvolution, brain_limits,
+                       prod_correlation_fields, region_notes)
 
 DECIDED = ("accept", "reject", "repair")
 
@@ -337,7 +338,9 @@ def agents_config_from_dict(raw) -> AgentsConfig:
         strategy=StrategyConfig(
             every_rounds=_pos_int(st, "strategy", "every_rounds", lo=0),
             max_hypotheses=_pos_int(st, "strategy", "max_hypotheses", lo=0),
-            max_guidance_chars=_pos_int(st, "strategy", "max_guidance_chars")),
+            max_guidance_chars=_pos_int(st, "strategy", "max_guidance_chars"),
+            max_new_arms=(_pos_int(st, "strategy", "max_new_arms", lo=0)
+                          if "max_new_arms" in st else StrategyConfig.max_new_arms)),
         floor_share=float(floor),
         max_output=_pos_int(raw, "agents", "max_output", lo=256),
         models=models_config_from_dict(raw.get("models")),
@@ -684,7 +687,14 @@ class ResearchRun:
                 self.arms[key] = dataclasses.replace(p, sources=deque(p.sources))
         self.director = Orchestrator(self.arms.keys(), seed=seed)
         self.repair_queue: dict[tuple, deque] = {k: deque() for k in self.arms}
+        # Strategy Evolution: arm -> the evolved arm that replaced it. A replaced arm gets no
+        # new slots (its queued repairs still run) and its outcomes credit the successor
+        self.successor: dict[tuple, tuple] = {}
         self.sims_used = 0
+        # alphas screened and waiting for BRAIN: sent simulator.max_concurrent at a time
+        # (OQ-3), then decided in order (_flush)
+        self.sim_queue: list[tuple[tuple, CandidateRecord, dict, bool]] = []
+        self.max_concurrent = max(1, config.simulator.max_concurrent)
         self.log: list[dict] = []
         self.stop_reason: str | None = None
         self.resumed: list[dict] = []
@@ -785,7 +795,11 @@ class ResearchRun:
             self.generators[key] = AlphaGenerator(self.llm(key[3]), self.spec, plan.settings,
                                                   cfg, datafields=fields, field_meta=meta)
         # the region's own evidence from memory, refreshed every time, then the arm's guidance
-        notes = region_notes(self.memory.candidate_outcomes(), plan.settings.region)
+        outcomes = self.memory.candidate_outcomes()
+        notes = region_notes(outcomes, plan.settings.region)
+        self.generators[key].prod_failed = prod_correlation_fields(
+            outcomes, plan.settings.region, self.spec,
+            self.catalog_of(plan.settings.region, plan.settings.delay)[0])
         bar = bar_text(self.seen_limits.get((plan.settings.region, plan.settings.delay), {}))
         bar = (f"- BRAIN's bar in this market ({plan.settings.region} delay "
                f"{plan.settings.delay}, from its checks on our alphas): {bar}.") if bar else None
@@ -942,7 +956,10 @@ class ResearchRun:
                 self._round(r)
             except LLMUnavailable as exc:  # budget used up, or the model failed
                 self.stop_reason = str(exc)
-                break
+            try:   # alphas already screened still go to BRAIN, whatever stopped the round
+                self._flush()
+            except LLMUnavailable as exc:
+                self.stop_reason = self.stop_reason or str(exc)
             if self.stop_reason:
                 break
             if self.strategist.due(r):
@@ -966,23 +983,19 @@ class ResearchRun:
         return taken
 
     def _round(self, r: int) -> None:
-        slots = min(self.budget.per_round, self.budget.max_simulations - self.sims_used)
+        slots = min(self.budget.per_round, self.budget.max_simulations - self._committed())
         entry = {"round": r, "arms": []}
         self.log.append(entry)
         for key, cand in [(k, c) for k, c in self.seed_queue if self._in_run(k)]:
-            if slots <= 0 or self.sims_used >= self.budget.max_simulations:
+            if slots <= 0 or self._committed() >= self.budget.max_simulations:
                 break
             self.seed_queue.remove((key, cand))
             arm_log = {"arm": arm_label(key), "slots": 1, "seed": cand.candidate_id,
                        "outcomes": []}
             entry["arms"].append(arm_log)
-            before = self.sims_used
             self._simulate(key, cand, arm_log, credit=False)
-            slots -= self.sims_used - before
-            out = arm_log["outcomes"][-1] if arm_log["outcomes"] else {}
-            next(n for n in self.seed_notes if n.get("candidate_id") == cand.candidate_id
-                 )["status"] = f"{out.get('decision')} / {out.get('failure_class')}"
-        if self.sims_used >= self.budget.max_simulations:
+            slots -= 1
+        if self._committed() >= self.budget.max_simulations:
             self.stop_reason = "simulation budget used up"
             return
         # queued repairs first: a near-miss alpha is the cheapest chance of an accept, and an
@@ -993,7 +1006,7 @@ class ResearchRun:
             arm_log = {"arm": arm_label(key), "slots": len(cands), "repairs_first": True}
             entry["arms"].append(arm_log)
             self._screen_and_simulate(key, cands, {}, arm_log)
-            if self.sims_used >= self.budget.max_simulations:
+            if self._committed() >= self.budget.max_simulations:
                 self.stop_reason = "simulation budget used up"
                 return
         slots -= sum(len(c) for c in first.values())
@@ -1014,7 +1027,7 @@ class ResearchRun:
             if emptied and passes < self.agents.refill_passes:
                 spare += emptied
                 passes += 1
-            spare = min(spare, self.budget.max_simulations - self.sims_used)
+            spare = min(spare, self.budget.max_simulations - self._committed())
             live = self._live_arms()
             if spare <= 0 or not live:
                 return
@@ -1044,7 +1057,14 @@ class ResearchRun:
         return alloc
 
     def _live_arms(self) -> list[tuple]:
-        return [k for k in self.arms if k[3] not in self.counter.down and self._in_run(k)]
+        return [k for k in self.arms if k[3] not in self.counter.down and self._in_run(k)
+                and k not in self.successor]
+
+    def _current(self, key: tuple) -> tuple:
+        """The arm that now stands for ``key``: itself, or its latest evolved successor."""
+        while key in self.successor:
+            key = self.successor[key]
+        return key
 
     def _run_allocation(self, r: int, alloc: dict, entry: dict, tag: str) -> tuple[int, int]:
         """Run each arm's slots. Returns (slots lost to a down generator model, slots
@@ -1062,7 +1082,7 @@ class ResearchRun:
             entry["arms"].append(arm_log)
             d, e = self._arm(r, i, key, n, arm_log, tag)
             lost, emptied = lost + d, emptied + e
-            if self.sims_used >= self.budget.max_simulations:
+            if self._committed() >= self.budget.max_simulations:
                 self.stop_reason = "simulation budget used up"
                 break
         return lost, emptied
@@ -1121,7 +1141,7 @@ class ResearchRun:
         log["outcomes"] = []
         simulated = 0
         for cand in rv.to_simulate:
-            if self.sims_used >= self.budget.max_simulations:
+            if self._committed() >= self.budget.max_simulations:
                 break
             self._simulate(key, cand, log)
             simulated += 1
@@ -1136,19 +1156,53 @@ class ResearchRun:
                 payload={"issues": r.issues, "blocking": r.blocking,
                          "revised": r.revised.expression if r.revised else None})
 
+    def _committed(self) -> int:
+        """Simulations used plus alphas queued for BRAIN: what the budget checks count."""
+        return self.sims_used + len(self.sim_queue)
+
     def _simulate(self, key: tuple, cand: CandidateRecord, log: dict, *,
                   credit: bool = True) -> None:
-        """``credit=False`` (seeds): the outcome does not update the Director's view of
-        the arm, since the alpha is not one of the arm's ideas."""
-        outcome = self.pipeline.process(cand)
+        """Queue an alpha for BRAIN; the queue goes out once it holds
+        ``simulator.max_concurrent`` alphas, and at the end of each round. ``credit=False``
+        (seeds): the outcome does not update the Director's view of the arm, since the
+        alpha is not one of the arm's ideas."""
+        self.sim_queue.append((key, cand, log, credit))
+        if len(self.sim_queue) >= self.max_concurrent:
+            self._flush()
+
+    def _flush(self) -> None:
+        """Simulate the queued alphas together, then decide each in queue order: Director
+        credit, repair child. A model failure in one repair does not stop the others'
+        bookkeeping; the first is raised after them."""
+        queued, self.sim_queue = self.sim_queue, []
+        if not queued:
+            return
+        if len(queued) > 1:
+            self._emit(f"--- BRAIN: {len(queued)} alphas at once")
+        outcomes = self.pipeline.process_many([c for _, c, _, _ in queued])
+        failure = None
+        for (key, cand, log, credit), outcome in zip(queued, outcomes):
+            try:
+                self._after_simulation(key, cand, log, credit, outcome)
+            except LLMUnavailable as exc:
+                failure = failure or exc
+        if failure is not None:
+            raise failure
+
+    def _after_simulation(self, key: tuple, cand: CandidateRecord, log: dict, credit: bool,
+                          outcome) -> None:
         if outcome.result is not None and outcome.result.status != "invalid":
             self.sims_used += 1
             self.region_sims[cand.region] = self.region_sims.get(cand.region, 0) + 1
         item = {"candidate_id": cand.candidate_id, "decision": outcome.decision,
                 "failure_class": outcome.failure_class}
         log["outcomes"].append(item)
+        seed = next((n for n in self.seed_notes if n.get("candidate_id") == cand.candidate_id),
+                    None)
+        if seed is not None:
+            seed["status"] = f"{outcome.decision} / {outcome.failure_class}"
         if outcome.decision in DECIDED and credit:
-            self.director.update(key, outcome.decision == "accept")
+            self.director.update(self._current(key), outcome.decision == "accept")
         if outcome.decision == "repair" and outcome.decision_record is not None:
             rep = self.repairer.repair(cand, outcome.decision_record, outcome.result,
                                        self._pool_expressions())
@@ -1175,13 +1229,15 @@ class ResearchRun:
                                      self.generator_config.prompt_version, known_datasets=known)
         if evo is None:
             return
-        added = []
-        base = [(k, p) for k, p in self.arms.items() if k[2] == self.generator_config.prompt_version]
+        added, replaced = [], []
+        # only the live arms of this run's regions evolve: the others get no slots in this
+        # run, and each evolved arm replaces its parent (one arm per idea, not two)
+        base = [(k, p) for k, p in self.arms.items()
+                if k not in self.successor and self._in_run(k)]
         arm_datasets = {k[0] for k in self.arms}
-        # a hypothesis on a catalog dataset no arm covers gets arms of its own (one per
-        # generator model), so the Director credits that dataset, not the arm it ran under
-        # (run rs20261104163055 ran news12 ideas as analyst4 and model51); one on an unknown
-        # dataset goes to every arm, as before
+        # a hypothesis on a catalog dataset no arm covers gets arms of its own, so the
+        # Director credits that dataset, not the arm it ran under (run rs20261104163055 ran
+        # news12 ideas as analyst4 and model51); one on an unknown dataset goes to every arm
         new_ds: dict[str, list[str]] = {}
         for ds, text in evo.hypotheses:
             if ds is not None and ds not in arm_datasets and ds in catalog_datasets:
@@ -1192,35 +1248,45 @@ class ResearchRun:
             for ds, text in evo.hypotheses:
                 if ds is None or ds == key[0] or (ds not in arm_datasets and ds not in new_ds):
                     sources.appendleft(Source("hypothesis", text))
-            self._add_arm(new_key, ArmPlan(plan.dataset, plan.settings, sources,
-                                           evo.guidance_for(plan.settings.region),
-                                           catalog=plan.catalog), added)
-        # settings from one arm per (generator model, region, delay); the new dataset's arms
-        # go only to the markets whose catalog has it
-        templates = {(k[3], k[1], k[4]): p for k, p in base}
-        for ds, texts in new_ds.items():
-            for (model, region, delay), plan in templates.items():
-                if ds not in market_ds.get((region, delay), ()):
-                    continue
-                settings = dataclasses.replace(plan.settings, dataset=ds)
-                sources = deque(Source("hypothesis", t) for t in texts)
-                self._add_arm((ds, region, evo.prompt_version, model, delay),
-                              ArmPlan(ds, settings, sources, evo.guidance_for(region),
-                                      catalog=plan.catalog), added)
+            if self._add_arm(new_key, ArmPlan(plan.dataset, plan.settings, sources,
+                                              evo.guidance_for(plan.settings.region),
+                                              catalog=plan.catalog), added, like=key):
+                self.successor[key] = new_key
+                replaced.append(arm_label(key))
+        # new datasets: at most strategy.max_new_arms arms, first one per (dataset, market)
+        # with the generator models taken in turn, then further models; only markets of
+        # this run whose catalog has the dataset, with that market's settings
+        templates = {(k[1], k[4]): p for k, p in base}
+        markets = [(ds, region, delay, plan) for ds in new_ds
+                   for (region, delay), plan in templates.items()
+                   if ds in market_ds.get((region, delay), ())]
+        models = [m for m in self.models.generator if m not in self.counter.down]
+        picks = [(*mk, models[(i + p) % len(models)]) for p in range(len(models))
+                 for i, mk in enumerate(markets)] if models else []
+        for ds, region, delay, plan, model in picks[:self.agents.strategy.max_new_arms]:
+            settings = dataclasses.replace(plan.settings, dataset=ds)
+            sources = deque(Source("hypothesis", t) for t in new_ds[ds])
+            self._add_arm((ds, region, evo.prompt_version, model, delay),
+                          ArmPlan(ds, settings, sources, evo.guidance_for(region),
+                                  catalog=plan.catalog), added)
         self.log[-1]["evolution"] = {"prompt_version": evo.prompt_version, "source": evo.source,
                                      "guidance": evo.guidance, "hypotheses": evo.hypotheses,
                                      "region_guidance": evo.region_guidance,
-                                     "new_arms": added, "notes": evo.notes}
+                                     "new_arms": added, "replaced": replaced,
+                                     "notes": evo.notes}
         self._emit(f"--- strategy evolution: {evo.prompt_version} ({evo.source}), "
-                   f"{len(added)} new arms")
+                   f"{len(replaced)} arms updated, {len(added) - len(replaced)} new-dataset arms")
 
-    def _add_arm(self, key: tuple, plan: ArmPlan, added: list[str]) -> None:
+    def _add_arm(self, key: tuple, plan: ArmPlan, added: list[str],
+                 like: tuple | None = None) -> bool:
+        """Add an arm (``like``: start from that arm's record). False if it exists."""
         if key in self.arms:
-            return
+            return False
         self.arms[key] = plan
         self.repair_queue[key] = deque()
-        if self.director.add_arm(key):
+        if self.director.add_arm(key, like=like):
             added.append(arm_label(key))
+        return True
 
     # ------------------------------------------------------------------ report
 
@@ -1235,6 +1301,7 @@ class ResearchRun:
             "run_id": self.run_id,
             "stop_reason": self.stop_reason,
             "simulations_used": self.sims_used,
+            "max_concurrent": self.max_concurrent,
             "model_calls": self.counter.calls,
             "model_calls_by_model": dict(self.counter.by_model),
             "models_down": self.down(),

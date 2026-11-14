@@ -107,13 +107,15 @@ class Orchestrator:
             give(everyone)
         return {a: slots[a] for a in self.arms}
 
-    def add_arm(self, arm: Hashable) -> bool:
-        """Add a new arm with a fresh Beta(1, 1) prior (Strategy Evolution adds one per new
-        prompt version). Returns False if the arm already exists."""
+    def add_arm(self, arm: Hashable, like: Hashable | None = None) -> bool:
+        """Add a new arm: a fresh Beta(1, 1) prior, or a copy of arm ``like``'s posterior
+        (Strategy Evolution's successor of an arm starts from what that arm showed, not
+        from scratch). Returns False if the arm already exists."""
         if arm in self.state:
             return False
         self.arms.append(arm)
-        self.state[arm] = ArmState()
+        old = self.state.get(like) if like is not None else None
+        self.state[arm] = ArmState(old.successes, old.failures) if old else ArmState()
         return True
 
     def update(self, arm: Hashable, passed: bool) -> None:

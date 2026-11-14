@@ -49,6 +49,11 @@ strategy:
   every_rounds: 2                  # OQ-13: evolve after every 2nd round; 0 = never
   max_hypotheses: 3                # new hypotheses proposed per evolution
   max_guidance_chars: 1500
+  # An evolution updates only the arms of the regions in this run: each evolved arm replaces
+  # its parent and starts from the parent's record. Arms for datasets no arm covers are
+  # capped here, spread over datasets, markets and generator models (2026-11-14: one
+  # evolution had added 140 arms to a 20-simulation run).
+  max_new_arms: 8
 
 director:
   floor_share: 0.2                 # spec 13.1 default: share of each round reserved as floor slots

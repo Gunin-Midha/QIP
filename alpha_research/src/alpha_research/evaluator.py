@@ -136,6 +136,24 @@ def gates_for(result: ResultRecord, config: Config):
     return dataclasses.replace(g, **{k: v for k, v in limits.items() if v is not None})
 
 
+# our gate -> BRAIN's check(s) for the same thing; with gates.brain_checks_only BRAIN's
+# verdict decides the gate whenever BRAIN reported every check listed
+OWN_GATE_CHECKS = {"sharpe": ("LOW_SHARPE",), "fitness": ("LOW_FITNESS",),
+                   "turnover_range": ("LOW_TURNOVER", "HIGH_TURNOVER"),
+                   "self_correlation": ("SELF_CORRELATION",),
+                   "sub_universe": ("LOW_SUB_UNIVERSE_SHARPE",)}
+
+
+def _brain_verdict(gate: GateResult, checks: dict) -> GateResult:
+    names = OWN_GATE_CHECKS.get(gate.name)
+    if not names or not all(n in checks for n in names):
+        return gate
+    ok = all(checks[n] for n in names)
+    return GateResult(gate.name, ok, gate.value, gate.threshold,
+                      f"BRAIN's {' and '.join(names)} {'PASS' if ok else 'FAIL'} decides "
+                      f"(gates.brain_checks_only)")
+
+
 def run_gates(result: ResultRecord, config: Config) -> list[GateResult]:
     g = gates_for(result, config)
     gates = [
@@ -168,6 +186,8 @@ def run_gates(result: ResultRecord, config: Config) -> list[GateResult]:
     else:
         gates.append(GateResult("sub_universe", sub >= cutoff, sub, cutoff,
                                 ">= cutoff from result"))
+    if g.brain_checks_only:
+        gates = [_brain_verdict(x, result.checks or {}) for x in gates]
 
     if g.use_brain_checks:
         ignored = set(g.brain_checks_ignored)

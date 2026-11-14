@@ -111,6 +111,11 @@ groups: [sector, industry, subindustry, market, exchange, country]
 # with a warning because they cannot be checked.
 base_fields: [close, open, high, low, volume, vwap, returns, cap, adv20]
 
+# BRAIN's limit on operators in one alpha, counting every function call and every
+# arithmetic or comparison operator ("Expression with 66 operators exceeds limit of 64",
+# 2026-11-14; this count reproduced BRAIN's 66, 66 and 71). null = not checked.
+max_operators: 64
+
 # Bare words that are values, not datafields.
 # BRAIN's own docs write both true/false and True/False.
 constants: ["nan", "true", "false", "True", "False", "gaussian", "uniform", "cauchy"]

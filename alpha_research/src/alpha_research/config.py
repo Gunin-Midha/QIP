@@ -36,6 +36,10 @@ class GatesConfig:
     # our own gates use the limit BRAIN reports for that alpha's check when it has one
     # (LOW_SHARPE -> sharpe_min, ...): BRAIN's limits differ by region and delay
     limits_from_brain: bool = False
+    # owner 2026-11-14: an alpha passes on BRAIN's checks alone. Our five gates take BRAIN's
+    # verdict for the matching check when BRAIN reports it; the overfitting, pool-diversity
+    # and risk checks are recorded but never change the decision (pipeline.py)
+    brain_checks_only: bool = False
 
 
 # gate keys a region override may set, with their allowed range
@@ -90,8 +94,8 @@ class SimulatorConfig:
     max_poll_seconds: float
     poll_interval_seconds: float
     max_retries: int
-    # OQ-3: the real concurrent-simulation limit is account-specific. Phase 1 and 2 are
-    # single-threaded; this value is recorded but no threading is implemented.
+    # simulations kept running on BRAIN at once (Simulator.run_many; one thread that polls
+    # each in turn). OQ-3: the account's real limit is unknown.
     max_concurrent: int = 1
 
 
@@ -230,6 +234,7 @@ def config_from_dict(raw: Any, source: str = "<dict>") -> Config:
         use_brain_checks=_opt_bool(g, "gates", "use_brain_checks"),
         brain_checks_ignored=_opt_names(g, "gates", "brain_checks_ignored"),
         limits_from_brain=_opt_bool(g, "gates", "limits_from_brain"),
+        brain_checks_only=_opt_bool(g, "gates", "brain_checks_only"),
     )
     if (gates.turnover_min is not None and gates.turnover_max is not None
             and gates.turnover_min > gates.turnover_max):

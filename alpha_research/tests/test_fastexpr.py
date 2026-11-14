@@ -303,3 +303,22 @@ def test_render_round_trips_every_hand_written_expression():
         except FastExprError:
             continue
         assert parse(render(tree)) == tree
+
+
+def test_unused_variables_are_errors_as_on_brain(spec):
+    # BRAIN, 2026-11-14: 'ERROR: Found unused variables "liq"'
+    e = analyze("a = rank(close); liq = rank(adv20); ts_decay_linear(a, 5)", spec).errors
+    assert e == ["variable 'liq' is defined but never used (BRAIN refuses unused variables)"]
+    # used in a later assignment counts; so does reuse after redefinition
+    assert analyze("a = rank(close); b = a * 2; b", spec).errors == []
+    assert analyze("a = rank(close); a = a + rank(volume); a", spec).errors == []
+
+
+def test_operator_limit_counts_calls_and_arithmetic_as_brain_does(spec):
+    # BRAIN, 2026-11-14: "Expression with 66 operators exceeds limit of 64"
+    assert spec.max_operators == 64
+    expr = "a = " + " + ".join(["rank(close)"] * 32) + "; a"   # 32 calls + 31 '+' = 63
+    assert analyze(expr, spec).errors == []
+    over = "a = " + " + ".join(["rank(close)"] * 33) + "; -a"  # 33 + 32 + unary minus = 66
+    assert analyze(over, spec).errors == [
+        "66 operators (calls plus arithmetic) exceed BRAIN's limit of 64"]

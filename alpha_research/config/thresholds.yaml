@@ -14,6 +14,12 @@ gates:
   # SELF_CORRELATION), so they follow BRAIN per region and delay; the numbers above are the
   # fallback (and what the agents' prompts show). Follows "BRAIN's checks only" (2026-11-04).
   limits_from_brain: true
+  # Owner 2026-11-14: "a pass has to just satisfy BRAIN's checks". Each gate above takes
+  # BRAIN's own verdict for its check when BRAIN reports one (LOW_SHARPE, LOW_FITNESS,
+  # LOW/HIGH_TURNOVER, SELF_CORRELATION, LOW_SUB_UNIVERSE_SHARPE); the numbers above apply
+  # only when it does not. Our overfitting (auditor), pool-diversity and risk checks are
+  # computed and recorded in the decision but never reject an alpha or hold it pending.
+  brain_checks_only: true
   # BRAIN checks that are about submitting, not about the alpha, so never gates: the daily
   # submission quota (REGULAR_SUBMISSION, limit 4), theme/pyramid/competition matches,
   # Osmosis allocation, and the Power Pool description and correlation (which apply to
@@ -92,4 +98,6 @@ simulator:
   max_poll_seconds: 1200   # GLB simulations took over 600 s (run rs20261111162604)
   poll_interval_seconds: 5
   max_retries: 3
-  max_concurrent: 1               # OQ-3: real limit is account-specific
+  max_concurrent: 8               # simulations on BRAIN at once (owner 2026-11-14: 8 ran together
+                                  # with no 429). OQ-3: the account's real limit may be higher;
+                                  # over it BRAIN answers 429 and the client waits for a slot

@@ -30,6 +30,7 @@ import json
 import math
 import random
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -69,6 +70,11 @@ class GeneratorConfig:
     # field_roles): identifier/text fields are not listed, date/time fields are tagged
     id_patterns: tuple = ()
     time_patterns: tuple = ()
+    # crowded fields (config/generator.yaml crowding, OQ-21): a field whose BRAIN alpha
+    # count is in the top (1 - percentile) of its dataset and at least min_alphas is
+    # listed only when the task names it; None = off
+    crowded_percentile: float | None = None
+    crowded_min_alphas: int | None = None
 
 
 def _cfg_int(d: dict, key: str, *, nullable: bool = False, minimum: int = 0) -> int | None:
@@ -108,7 +114,24 @@ def load_generator_config(path: str | Path) -> GeneratorConfig:
         ),
         datafield_exploration_share=_cfg_share(g, "datafield_exploration_share"),
         **_cfg_roles(g.get("field_roles")),
+        **_cfg_crowding(g.get("crowding")),
     )
+
+
+def _cfg_crowding(raw) -> dict:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or set(raw) - {"percentile", "min_alphas"}:
+        raise ConfigError("generator config: 'crowding' must map 'percentile' and 'min_alphas'")
+    pct, low = raw.get("percentile"), raw.get("min_alphas", 0)
+    if pct is None:
+        return {}
+    if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not 0 <= pct <= 1:
+        raise ConfigError(f"generator config: crowding.percentile must be in [0, 1], got {pct!r}")
+    if isinstance(low, bool) or not isinstance(low, int) or low < 0:
+        raise ConfigError(f"generator config: crowding.min_alphas must be an integer >= 0, "
+                          f"got {low!r}")
+    return {"crowded_percentile": float(pct), "crowded_min_alphas": low}
 
 
 def _cfg_roles(raw) -> dict:
@@ -289,22 +312,84 @@ EXTRACT_SYSTEM = (
     " Reply with a single JSON object and nothing else: no prose, no code fences.")
 
 
-def _rank_datafields(catalog: Collection[str], text: str, limit: int,
-                     meta: dict | None = None) -> list[str]:
-    """Most relevant catalog fields first: score by how many underscore-separated parts of
-    the field id occur in the text. Deterministic; ties break toward less crowded fields
-    (fewer BRAIN alphas use them, when ``meta`` says), then alphabetically."""
-    low = text.lower()
-    meta = meta or {}
+def crowded_fields(meta: dict, percentile: float | None, min_alphas: int | None,
+                   exclude: Collection[str] = ()) -> set[str]:
+    """Fields among the most used of their dataset: BRAIN alpha count at or above the
+    ``percentile`` quantile (nearest rank) of the dataset's counts and at least
+    ``min_alphas``. Ideas built on them are likely to match production alphas
+    (PROD_CORRELATION). Groups (sector, industry) and ``exclude`` (the base fields: close,
+    returns, assets, ...) are in nearly every alpha, so they are neither counted nor
+    flagged. Empty when ``percentile`` is None or the catalog has no counts."""
+    if percentile is None:
+        return set()
+    exclude = set(exclude)
+    by_ds: dict[str, list[tuple[str, float]]] = {}
+    for name, m in meta.items():
+        n = (m or {}).get("alpha_count")
+        if name in exclude or (m or {}).get("type") == "GROUP":
+            continue
+        if isinstance(n, (int, float)) and not isinstance(n, bool):
+            by_ds.setdefault(m.get("dataset") or "unknown", []).append((name, float(n)))
+    out: set[str] = set()
+    for fields in by_ds.values():
+        counts = sorted(n for _, n in fields)
+        cut = counts[min(len(counts) - 1, math.ceil(percentile * len(counts)) - 1)] \
+            if percentile > 0 else counts[0]
+        out |= {f for f, n in fields if n >= cut and n >= (min_alphas or 0)}
+    return out
 
-    def score(name: str) -> int:
-        return sum(1 for part in set(name.lower().split("_")) if len(part) >= 3 and part in low)
+
+# words that say nothing about which field a hypothesis needs
+_STOPWORDS = frozenset("""
+    the and for are was were has have had not but its into than that this these those then
+    them they their there with from over under when where which while what who whose why how
+    per one two each more most less least very also only both such same other some any all
+    use used using uses based number data field stock stocks firm firms company
+    companies share shares day days daily week weeks month months year years quarter
+    rank ranked ranking within across relative signal signals predict predicts return
+    returns outperform underperform higher lower high low level change recent smooth next
+    version form plain heavily crowded build different combine combined measure measures
+    """.split())
+_STEM = 6   # words are compared on their first letters: "raised" matches "raisednum"
+
+
+def _words(text: str) -> set[str]:
+    """Content words of ``text`` (3+ letters, no stopwords), cut to their first ``_STEM``
+    letters. Field ids are split on underscores and digits."""
+    return {w[:_STEM] for w in re.findall(r"[a-z]{3,}", text.lower()) if w not in _STOPWORDS}
+
+
+def _rank_datafields(catalog: Collection[str], text: str, limit: int,
+                     meta: dict | None = None, crowded: Collection[str] = (),
+                     dataset: str | None = None) -> list[str]:
+    """Most relevant catalog fields first. Order: ``crowded`` fields last, however
+    relevant; then the arm's own ``dataset`` ahead of other datasets (the plan chose it;
+    the exploration share covers the rest); then the text's content words (``_words``)
+    found in the field id or BRAIN's description of the field, each weighted by how rare it
+    is among the catalog's fields (inverse document frequency: "accrual" outweighs
+    "quarterly", which hundreds of descriptions share). Whole words, not substrings: "pre"
+    in "spread" no longer matches a pre_news field. Deterministic;
+    ties break toward less crowded fields (fewer BRAIN alphas use them, when ``meta``
+    says), then alphabetically."""
+    meta = meta or {}
+    crowded = set(crowded)
+    query = _words(text)
+    hits = {n: query & _words(n.replace("_", " ") + " " + ((meta.get(n) or {}).get("description")
+                                                          or "")) for n in catalog}
+    df = Counter(w for ws in hits.values() for w in ws)
+    weight = {w: math.log((1 + len(hits)) / (1 + k)) for w, k in df.items()}
+
+    def score(name: str) -> float:
+        return round(sum(weight[w] for w in hits[name]), 9)
+
+    def foreign(name: str) -> bool:
+        return dataset is not None and (meta.get(name) or {}).get("dataset") != dataset
 
     def crowd(name: str) -> float:
         n = (meta.get(name) or {}).get("alpha_count")
         return float(n) if isinstance(n, (int, float)) else float("inf")
 
-    return sorted(catalog, key=lambda n: (-score(n), crowd(n), n))[:limit]
+    return sorted(catalog, key=lambda n: (n in crowded, foreign(n), -score(n), crowd(n), n))[:limit]
 
 
 NOT_SIGNALS = {"SYMBOL", "UNIVERSE"}   # identifiers and universe flags: never sampled
@@ -329,33 +414,42 @@ def field_role(name: str, meta: dict, config: "GeneratorConfig | None") -> str:
     return "signal"
 
 
-def named_fields(catalog: Collection[str], text: str) -> list[str]:
-    """Catalog fields written out in the task text, in the order they appear."""
+def named_fields(catalog: Collection[str], text: str, exclude: Collection[str] = ()) -> list[str]:
+    """Catalog fields written out in the task text, in the order they appear. ``exclude``:
+    base fields and groups, which plain words match (high, low, returns, sector) and which
+    the prompt offers on their own lines anyway."""
     found = {m.group(): m.start() for m in re.finditer(r"[A-Za-z_][A-Za-z0-9_]*", text)
-             if m.group() in catalog}
+             if m.group() in catalog and m.group() not in exclude}
     return sorted(found, key=found.get)
 
 
 def select_datafields(catalog: Collection[str], text: str, limit: int,
                       explore_share: float = 0.0, meta: dict | None = None,
-                      config: "GeneratorConfig | None" = None) -> tuple[list[str], list[str]]:
+                      config: "GeneratorConfig | None" = None,
+                      crowded: Collection[str] = (), plain: Collection[str] = (),
+                      dataset: str | None = None) -> tuple[list[str], list[str]]:
     """(relevant, exploration) fields for the prompt. Fields the task names come first;
     then ``_rank_datafields``; the exploration part (``explore_share`` of ``limit``) is
     drawn from the rest of the catalog one dataset at a time in turn, so every dataset can
     show up, in an order fixed by the text (the same task always sees the same fields).
-    Identifier/text fields (``field_role`` 'id') are left out unless the task names them."""
+    Identifier/text fields (``field_role`` 'id') are left out unless the task names them;
+    ``crowded`` fields rank last and are never drawn for exploration. ``plain`` (base
+    fields and groups) never count as named."""
     meta = meta or {}
+    crowded = set(crowded)
     catalog = set(catalog)
-    named = named_fields(catalog, text)
+    named = named_fields(catalog, text, plain)
     pool = [f for f in catalog if f in named or field_role(f, meta, config) != "id"]
     n_explore = round(limit * explore_share) if len(pool) > limit else 0
-    ranked = [f for f in _rank_datafields(pool, text, len(pool), meta) if f not in named]
+    ranked = [f for f in _rank_datafields(pool, text, len(pool), meta, crowded, dataset)
+              if f not in named]
     relevant = (named + ranked)[:max(limit - n_explore, len(named))]
     chosen = set(relevant)
     rng = random.Random(hashlib.sha1(text.encode()).hexdigest())
     by_ds: dict[str, list[str]] = {}
     for f in sorted(pool):
-        if f not in chosen and (meta.get(f) or {}).get("type") not in NOT_SIGNALS:
+        if (f not in chosen and f not in crowded
+                and (meta.get(f) or {}).get("type") not in NOT_SIGNALS):
             by_ds.setdefault((meta.get(f) or {}).get("dataset") or "unknown", []).append(f)
     for fields in by_ds.values():
         rng.shuffle(fields)
@@ -369,7 +463,8 @@ def select_datafields(catalog: Collection[str], text: str, limit: int,
     return relevant, explore
 
 
-def _annotate(name: str, meta: dict, config: "GeneratorConfig | None" = None) -> str:
+def _annotate(name: str, meta: dict, config: "GeneratorConfig | None" = None,
+              crowded: Collection[str] = (), prod_failed: dict | None = None) -> str:
     m = meta.get(name) or {}
     bits = [TYPE_HINTS[m["type"]]] if m.get("type") in TYPE_HINTS else []
     role = field_role(name, meta, config)
@@ -379,13 +474,21 @@ def _annotate(name: str, meta: dict, config: "GeneratorConfig | None" = None) ->
         bits.append(f"cov {m['coverage'] * 100:.0f}%")
     if isinstance(m.get("alpha_count"), (int, float)):
         bits.append(f"{m['alpha_count']} alphas")
+    if name in crowded:
+        bits.append("crowded")
+    if (prod_failed or {}).get(name):
+        bits.append(f"{prod_failed[name]} of ours failed production correlation")
     return f"{name} [{', '.join(bits)}]" if bits else name
 
 
 def build_system_prompt(spec: FastExprSpec, datafields: Collection[str] | None,
                         relevance_text: str, config: GeneratorConfig,
                         guidance: str | None = None, meta: dict | None = None,
-                        neutralizations: Sequence[str] = (), market: str | None = None) -> str:
+                        neutralizations: Sequence[str] = (), market: str | None = None,
+                        prod_failed: dict | None = None, dataset: str | None = None) -> str:
+    """``prod_failed``: {field: our alphas using it that failed BRAIN's PROD_CORRELATION}
+    in this market (memory); those fields count as crowded too. ``dataset``: the arm's,
+    listed first."""
     lines = [
         "You are a quantitative researcher writing alpha expressions for the WorldQuant "
         "BRAIN platform, in the Fast Expression language.",
@@ -434,28 +537,45 @@ def build_system_prompt(spec: FastExprSpec, datafields: Collection[str] | None,
                      "region's results in the lessons below (if any) show what worked there.")
     if datafields is not None:
         meta = meta or {}
+        prod_failed = {f: n for f, n in (prod_failed or {}).items() if n}
+        crowded = (crowded_fields(meta, config.crowded_percentile, config.crowded_min_alphas,
+                                  spec.base_fields) | set(prod_failed))
+        plain = {*spec.base_fields, *spec.groups,
+                 *(f for f, m in meta.items() if (m or {}).get("type") == "GROUP")}
         shown, explore = select_datafields(datafields, relevance_text,
                                            config.max_datafields_in_prompt,
-                                           config.datafield_exploration_share, meta, config)
-        named = named_fields(set(datafields), relevance_text)
+                                           config.datafield_exploration_share, meta, config,
+                                           crowded, plain, dataset)
+        named = named_fields(set(datafields), relevance_text, plain)
+
+        def note(f: str) -> str:
+            return _annotate(f, meta, config, crowded, prod_failed)
+
         if named:
             lines.append("Fields named in the task (build the signal on these; use other "
                          "fields only to condition, scale or combine): "
-                         + ", ".join(_annotate(f, meta, config) for f in named))
+                         + ", ".join(note(f) for f in named))
         lines.append(f"Datafields (use only these and the base fields; "
                      f"{len(shown) + len(explore)} of {len(datafields)} shown). Most relevant "
                      f"to this task:")
-        lines.append("  " + ", ".join(_annotate(f, meta, config) for f in shown if f not in named))
+        lines.append("  " + ", ".join(note(f) for f in shown if f not in named))
         if explore:
             lines.append("From across the other datasets (optional; for combinations or "
                          "conditioning beyond the obvious inputs):")
-            lines.append("  " + ", ".join(_annotate(f, meta, config) for f in explore))
+            lines.append("  " + ", ".join(note(f) for f in explore))
         if meta:
             lines.append("In brackets: cov = share of stocks with a value (for a low-coverage "
                          "field consider ts_backfill or group_backfill so more stocks carry a "
                          "signal); alphas = how many BRAIN alphas already use the field (a "
                          "heavily used field is crowded and less likely to be new). Hints, "
                          "not limits: every listed field may be used.")
+        if crowded & {*named, *shown, *explore}:
+            lines.append("crowded = among the most used fields of its dataset, or one our own "
+                         "alphas built on failed BRAIN's production-correlation check (the "
+                         "idea is already in production). Crowded fields the task does not "
+                         "name are listed last, if at all. If you use a crowded field, do not write its common form "
+                         "(its plain level, change or ratio, ranked); combine or condition it "
+                         "with less used fields so the result is a different idea.")
     else:
         lines.append("No datafield catalog was supplied. Prefer the base fields. Any other "
                      "datafield name you use may not exist on the platform and will be "
@@ -624,6 +744,9 @@ class AlphaGenerator:
         self._now = now or (lambda: datetime.now(timezone.utc))
         self.guidance = guidance  # from Strategy Evolution; shown in the system prompt
         self.field_meta = field_meta or {}
+        # {field: our alphas on it that failed PROD_CORRELATION in this market}; the
+        # research loop refreshes it from memory before each batch
+        self.prod_failed: dict[str, int] = {}
 
     # ------------------------------------------------------------------ public
 
@@ -692,7 +815,9 @@ class AlphaGenerator:
                                      self.guidance, self.field_meta,
                                      neutralizations_for(self.settings.region),
                                      market=f"{self.settings.region} {self.settings.universe}, "
-                                            f"delay {self.settings.delay}")
+                                            f"delay {self.settings.delay}",
+                                     prod_failed=self.prod_failed,
+                                     dataset=self.settings.dataset)
         reply = self._ask_json(system, _generate_prompt(unit.hypothesis, unit.context, k), result)
         good, bad = self._check(self._items(reply), unit)
 
