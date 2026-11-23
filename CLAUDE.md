@@ -131,6 +131,7 @@ QIP/
   CLAUDE.md                     # this file
   alpha_research/
     REPORT.md                   # detailed build report
+    RUN_FLOW.md                 # one research run step by step, in execution order, with a real example alpha
     scripts/brain_discovery.py  # all-region catalog download, one BRAIN login (hand-run)
     README.md                   # setup / run / open questions
     pyproject.toml              # pytest pythonpath = src
