@@ -33,7 +33,7 @@ import yaml
 
 from .brain_api import (EMAIL_ENV_VAR, SECRET_ENV_VAR, BrainApiError, RealBrainClient,
                         UrllibTransport, list_datafields, list_datasets, list_operators,
-                        load_brain_config, make_session,
+                        load_brain_config, make_session, prompt_credentials,
                         simulation_options)
 from .brain_client import FixtureBrainClient, FixtureNotFoundError, SubmissionRejected
 from .compare import model_comparison
@@ -243,17 +243,33 @@ def _llm_client(args):
         if not isinstance(replies, list) or not all(isinstance(r, str) for r in replies):
             raise ConfigError("script must be a JSON list of strings")
         return ScriptedLLMClient(replies)
-    return make_real_client(args.model)
+    return make_real_client(args.model, _output_caps(args).get(args.model))
 
 
-def _llm_factory(args, models: list[str]):
+DEFAULT_AGENTS_CONFIG = "config/agents.yaml"
+
+
+def _output_caps(args) -> dict:
+    """Per-model output caps (``models.max_output``) from the agents config, if any."""
+    path = getattr(args, "agents", None)
+    if path is None and Path(DEFAULT_AGENTS_CONFIG).exists():
+        path = DEFAULT_AGENTS_CONFIG   # `generate`: use the repo config when run from it
+    return load_agents_config(path).models.max_output if path else {}
+
+
+def _llm_factory(args, models: list[str], caps: dict | None = None,
+                 pace: dict | None = None):
     """model id -> client. Scripted: one client answers for every model id. Real: one client
-    per model id, all built now so a missing key or package fails before BRAIN is called."""
+    per model id, all built now so a missing key or package fails before BRAIN is called;
+    ``caps`` (model id -> output cap) replaces the agents' cap for those models and ``pace``
+    (model id -> per-minute limits) paces their calls."""
     if args.llm == "scripted":
         scripted = _llm_client(args)
         return lambda model: scripted
-    clients = {m: make_real_client(m) for m in models}
-    return lambda model: clients[model] if model in clients else make_real_client(model)
+    caps, pace = caps or {}, pace or {}
+    make = lambda m: make_real_client(m, caps.get(m), pace.get(m))
+    clients = {m: make(m) for m in models}
+    return lambda model: clients[model] if model in clients else make(model)
 
 
 def _generate(args) -> int:
@@ -299,8 +315,11 @@ def _biometric_prompt(url: str) -> None:
 
 
 def _brain_session(config):
-    """A BRAIN session that prompts for biometric verification in a terminal."""
-    return make_session(config, on_biometric=_biometric_prompt if sys.stdin.isatty() else None)
+    """A BRAIN session that, in a terminal, asks for the login when a new one is needed
+    (saved session expired, no BRAIN login in the environment) and for biometric verification."""
+    tty = sys.stdin.isatty()
+    return make_session(config, on_biometric=_biometric_prompt if tty else None,
+                        ask_credentials=prompt_credentials if tty else None)
 
 
 def _brain_auth(args) -> int:
@@ -485,7 +504,8 @@ def _research(args) -> int:
     if args.model:
         agents = dataclasses.replace(agents, models=agents.models.with_default(args.model))
         agents.check_models()
-    llm_factory = _llm_factory(args, agents.used_models())  # before logging in to BRAIN
+    llm_factory = _llm_factory(args, agents.used_models(),  # before logging in to BRAIN
+                               agents.models.max_output, agents.models.pace)
     brain_config = load_brain_config(args.brain_config)
     client = RealBrainClient(_brain_session(brain_config), brain_config, capture_dir=args.capture_dir)
     memory = MemoryStore(args.data_dir)
@@ -593,7 +613,7 @@ def _models(args) -> int:
         failed = 0
         for m in agents.used_models():
             try:
-                reply = make_real_client(m).complete(
+                reply = make_real_client(m, agents.models.max_output.get(m)).complete(
                     "Reply with the single word OK.", "Say OK.", max_output=256)
                 print(f"ok      {m}: {reply.strip()[:40]!r}")
             except LLMUnavailable as exc:
@@ -678,6 +698,9 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--datafields", help="datafield catalog: JSON list or one id per line")
     gen.add_argument("--fastexpr", default="config/fastexpr.yaml")
     gen.add_argument("--generator-config", default="config/generator.yaml")
+    gen.add_argument("--agents", default=None,
+                     help=f"agents config (default {DEFAULT_AGENTS_CONFIG} if present); only "
+                          "its models.max_output (per-model output caps) is used here")
     gen.add_argument("--llm", choices=["real", "scripted"], default="real")
     gen.add_argument("--model", default=os.environ.get("ALPHA_RESEARCH_MODEL", DEFAULT_MODEL))
     gen.add_argument("--llm-script", help="JSON list of replies for --llm scripted (offline)")

@@ -170,16 +170,16 @@ def test_progress_lines_come_as_each_finishes_then_decisions_in_order(memory, ma
                     sleep=vc.sleep, clock=vc.clock, out=out)
     pipe.process_many(cands(candidate, 3))
     lines = out.getvalue().splitlines()
-    progress = [ln for ln in lines if ln.startswith("  BRAIN: ")]
+    progress = [ln for ln in lines if " of 3)" in ln]
     assert [ln.split()[1] for ln in progress] == ["c1", "c2", "c0"]
-    assert progress[0] == "  BRAIN: c1 finished (1 of 3), complete: Sharpe 1.00, fitness 0.50, turnover 0.20"
+    assert progress[0] == "   0m00s  c1  Sharpe  1.00  fitness  0.50  turnover  20%   (1 of 3)"
     decided = [ln.split(" | ")[0] for ln in lines if " | " in ln]
     assert decided == ["c0", "c1", "c2"] and lines.index(progress[-1]) < lines.index(
         next(ln for ln in lines if " | " in ln))
     # one alpha on its own: no progress line, as before
     out.truncate(0), out.seek(0)
     pipe.process_many([candidate(candidate_id="solo", expression="rank(-ts_delta(close, 9))")])
-    assert not [ln for ln in out.getvalue().splitlines() if ln.startswith("  BRAIN: ")]
+    assert not [ln for ln in out.getvalue().splitlines() if " of 1)" in ln]
 
 
 class ProgressBrain(SlowBrain):
@@ -210,11 +210,12 @@ def test_status_lines_while_running_and_a_line_before_fetching(memory, make_conf
     p.process_many([candidate(candidate_id=f"rs20261115045859r01a{i}_001",
                               expression=f"rank(-ts_delta(close, {i + 2}))") for i in range(3)])
     lines = out.getvalue().splitlines()
-    status = [ln for ln in lines if " running, " in ln]
-    assert status and status[0].startswith("  BRAIN: 3 running, 0 of 3 finished: r01a0_001 0m30s 40%")
-    fetching = [ln for ln in lines if "done on BRAIN, fetching" in ln]
-    assert len(fetching) == 3 and fetching[0].startswith("  BRAIN: rs20261115045859r01a0_001 done")
-    assert lines.index(fetching[0]) < lines.index(next(ln for ln in lines if "finished (1 of 3)" in ln))
+    # one status line for the batch (elapsed, done, running, BRAIN's progress), no ids
+    status = [ln for ln in lines if " running" in ln]
+    assert status and status[0] == "   0m30s  0 of 3 done, 3 running (BRAIN 40%)"
+    fetching = [ln for ln in lines if "fetching results" in ln]
+    assert len(fetching) == 3 and fetching[0].split()[1] == "r01a0_001"   # run prefix dropped
+    assert lines.index(fetching[0]) < lines.index(next(ln for ln in lines if "(1 of 3)" in ln))
     assert brain.on_ready is None            # the hook is removed after the batch
 
 
@@ -226,3 +227,47 @@ def test_no_status_lines_when_switched_off(memory, make_config, candidate, playb
                  out=out)
     p.process_many(cands(candidate, 2))
     assert " running, " not in out.getvalue()
+
+
+def test_a_terminal_sees_one_line_per_finished_alpha(memory, make_config, candidate, playbook):
+    import io
+
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    brain, vc, out = ProgressBrain(polls=2), VirtualClock(), Tty()
+    p = Pipeline(make_config(simulator__max_concurrent=2), playbook, brain, memory,
+                 sleep=vc.sleep, clock=vc.clock, out=out)
+    p.process_many([candidate(candidate_id=f"t{i}", lever="speed_up", parent_id="x",
+                              expression=f"rank(-ts_delta(close, {i + 30}))") for i in range(2)])
+    text = out.getvalue()
+    # the "fetching" note is overwritten in place by the result, with the fix named
+    assert text.count("\r\033[K") == 2
+    shown = [seg.split("\r\033[K")[-1] for seg in text.splitlines()]
+    assert sum("t0 (speed_up)" in ln and "Sharpe" in ln for ln in shown) == 1
+
+
+def test_streaming_decides_each_alpha_as_it_finishes_and_fills_freed_slots(
+        memory, make_config, playbook, candidate):
+    # owner 2026-11-23: a slow alpha must not hold up the others' decisions, and a freed
+    # BRAIN slot takes the next alpha at once
+    brain = SlowBrain(polls_by={"c0": 6, "c1": 1, "c2": 2})       # c0 is the slow one
+    vc = VirtualClock()
+    pipe = Pipeline(make_config(simulator__max_concurrent=3), playbook, brain, memory,
+                    sleep=vc.sleep, clock=vc.clock)
+    decided, extra = [], [candidate(candidate_id="x1", expression="rank(-ts_delta(close, 21))"),
+                          candidate(candidate_id="dup", expression="rank(-ts_delta(close, 3))")]
+
+    def more(free):
+        out, extra[:] = extra[:free], extra[free:]
+        return out
+    outs = pipe.process_many(cands(candidate, 3), more=more,
+                             on_outcome=lambda c, o: decided.append((c.candidate_id, o.decision)))
+    order = [cid for cid, _ in decided]
+    assert order.index("c1") < order.index("c0") and order.index("c2") < order.index("c0")
+    assert "x1" in brain.submits and brain.submits.index("x1") > brain.submits.index("c2")
+    assert order.index("x1") < order.index("c0")          # the added alpha beat the slow one
+    assert ("dup", "duplicate") in decided                # same experiment as c1: not run
+    assert [o.candidate_id for o in outs] == ["c0", "c1", "c2"]
+    assert brain.max_active <= 3

@@ -62,16 +62,18 @@ class Outcome:
     decision_record: DecisionRecord | None = None
 
     def line(self) -> str:
+        """``r01a0_001 | repair / sharpe | Sharpe 1.00 | fitness 0.50 | turnover 20%``:
+        the id without its research run prefix, values that exist, labeled."""
         r = self.result
-
-        def fmt(v):
-            return "None" if v is None else f"{v:.4f}"
-
-        return " | ".join([
-            self.candidate_id, self.decision, str(self.failure_class),
-            fmt(r.sharpe if r else None), fmt(r.fitness if r else None),
-            fmt(r.turnover if r else None),
-        ])
+        what = self.decision
+        if self.failure_class not in (None, "none"):
+            what += f" / {self.failure_class}"
+        parts = [_short(self.candidate_id), what]
+        if r is not None:
+            parts += [f"Sharpe {r.sharpe:.2f}" if r.sharpe is not None else None,
+                      f"fitness {r.fitness:.2f}" if r.fitness is not None else None,
+                      f"turnover {r.turnover * 100:.0f}%" if r.turnover is not None else None]
+        return " | ".join(x for x in parts if x)
 
 
 def load_candidate_file(path: str | Path) -> list[CandidateEntry]:
@@ -121,31 +123,68 @@ class Pipeline:
         self.auditor = Auditor(memory, config)
         self.out = out
 
+    # ---- live BRAIN lines while a batch runs (owner 2026-11-23: short and aligned) ----
+    # one status line a minute for the whole batch, one line per finished alpha with the
+    # fix it tried; in a terminal the "fetching" note is overwritten by the result
+
+    def _begin_batch(self, candidates: list[CandidateRecord]) -> None:
+        self._t0 = self.simulator.clock()
+        self._levers = {c.candidate_id: c.lever for c in candidates}
+        self._width = max((len(self._name(c.candidate_id)) for c in candidates), default=0)
+        self._open: str | None = None   # candidate whose "fetching" line is not finished
+        self._tty = bool(getattr(self.out, "isatty", lambda: False)())
+
+    def _name(self, cid: str) -> str:
+        lever = getattr(self, "_levers", {}).get(cid)
+        return f"{_short(cid)} ({lever})" if lever else _short(cid)
+
+    def _head(self, cid: str | None = None) -> str:
+        t = _clock(self.simulator.clock() - self._t0)
+        return f"  {t:>6}  " + (f"{self._name(cid):<{self._width}}  " if cid else "")
+
+    def _close_line(self) -> None:
+        if self._open is not None:
+            print(file=self.out, flush=True)
+            self._open = None
+
     def _progress(self, r: ResultRecord, finished: int, total: int) -> None:
-        """One line as each of several simulations finishes; decisions follow in order once
-        all are done."""
+        """A line as each of several simulations finishes (decisions follow, in order,
+        once the whole batch is in)."""
         if r.status == "complete":
-            stats = ", ".join(f"{k} {v:.2f}" for k, v in (("Sharpe", r.sharpe), ("fitness", r.fitness),
-                                                           ("turnover", r.turnover)) if v is not None)
-            what = f"complete: {stats}" if stats else "complete"
+            parts = [f"Sharpe {r.sharpe:5.2f}" if r.sharpe is not None else None,
+                     f"fitness {r.fitness:5.2f}" if r.fitness is not None else None,
+                     f"turnover {r.turnover * 100:3.0f}%" if r.turnover is not None else None]
+            what = "  ".join(x for x in parts if x) or "complete"
         else:
             what = r.status
-        print(f"  BRAIN: {r.candidate_id} finished ({finished} of {total}), {what}", file=self.out,
-              flush=True)
+        line = f"{self._head(r.candidate_id)}{what}   ({finished} of {total})"
+        if self._open == r.candidate_id and self._tty:
+            print("\r\033[K" + line, file=self.out, flush=True)   # replaces "fetching ..."
+            self._open = None
+        else:
+            self._close_line()
+            print(line, file=self.out, flush=True)
 
     def _status(self, snap: dict) -> None:
-        """While simulations run: each alpha's time on BRAIN and BRAIN's progress."""
-        def one(cid, secs, prog):
-            p = "" if prog is None else f" {prog * 100 if prog <= 1 else prog:.0f}%"
-            return f"{_short(cid)} {_clock(secs)}{p}"
-        parts = ", ".join(one(*x) for x in snap["running"])
+        """While simulations run: how many are done and the range of BRAIN's progress."""
+        self._close_line()
+        progs = [p * 100 if p <= 1 else p for _, _, p in snap["running"] if p is not None]
+        rng = ""
+        if progs:
+            lo, hi = min(progs), max(progs)
+            rng = f" (BRAIN {lo:.0f}%)" if round(lo) == round(hi) else f" (BRAIN {lo:.0f}-{hi:.0f}%)"
         tail = f", {snap['waiting']} waiting" if snap["waiting"] else ""
-        print(f"  BRAIN: {len(snap['running'])} running, {snap['finished']} of "
-              f"{snap['total']} finished{tail}: {parts}", file=self.out, flush=True)
+        print(f"{self._head()}{snap['finished']} of {snap['total']} done, "
+              f"{len(snap['running'])} running{rng}{tail}", file=self.out, flush=True)
 
     def _fetching(self, candidate_id: str) -> None:
-        print(f"  BRAIN: {candidate_id} done on BRAIN, fetching its results and checks "
-              "(can take a few minutes)", file=self.out, flush=True)
+        self._close_line()
+        text = f"{self._head(candidate_id)}simulated, fetching results and checks ..."
+        if self._tty:
+            print(text, end="", file=self.out, flush=True)
+            self._open = candidate_id
+        else:
+            print(text, file=self.out, flush=True)
 
     def _emit(self, outcome: Outcome) -> Outcome:
         if self.out is not None:
@@ -155,31 +194,80 @@ class Pipeline:
     def process(self, candidate: CandidateRecord) -> Outcome:
         return self.process_many([candidate])[0]
 
-    def process_many(self, candidates: list[CandidateRecord]) -> list[Outcome]:
+    def process_many(self, candidates: list[CandidateRecord], *,
+                     on_outcome: Callable[[CandidateRecord, Outcome], None] | None = None,
+                     more: Callable[[int], list[CandidateRecord]] | None = None
+                     ) -> list[Outcome]:
         """Outcomes in the order of ``candidates``. Duplicates (of memory or of an earlier
-        candidate in the list) are skipped; the rest are simulated together, then
-        evaluated in order."""
+        candidate in the list) are skipped; the rest are simulated together. Without
+        ``on_outcome`` they are evaluated in order once all are in. With it (streaming,
+        owner 2026-11-23: a slow alpha no longer holds up the others' decisions), each is
+        evaluated the moment its result is in and passed to ``on_outcome``, and
+        ``more(free slots)`` may add alphas to the running batch (checked for duplicates
+        the same way; their outcomes reach only ``on_outcome``)."""
         outcomes: list[Outcome | None] = [None] * len(candidates)
         to_run, seen = [], set()
         for i, candidate in enumerate(candidates):
-            h = experiment_id(candidate)
-            if h in seen or self.loop.is_duplicate(candidate):
-                log.info("duplicate of an earlier experiment, skipped: %s", candidate.candidate_id)
+            if self._duplicate(candidate, seen):
                 outcomes[i] = self._emit(Outcome(candidate.candidate_id, "duplicate", None))
+                if on_outcome is not None:
+                    on_outcome(candidate, outcomes[i])
                 continue
-            seen.add(h)
             to_run.append((i, candidate))
         live = self.out is not None
-        results = self.simulator.run_many(
-            [c for _, c in to_run],
-            on_done=self._progress if live and len(to_run) > 1 else None,
-            on_status=self._status if live else None,
-            on_ready=self._fetching if live else None)
-        for (i, candidate), result in zip(to_run, results):
+        if live:
+            self._begin_batch([c for _, c in to_run])
+        streaming = on_outcome is not None
+        index = {c.candidate_id: i for i, c in to_run}
+
+        def decide(candidate: CandidateRecord, result: ResultRecord) -> None:
             if result.status != "invalid":
                 self.auditor.register_variant(candidate.family, candidate.candidate_id)
-            outcomes[i] = self._evaluate(candidate, result)
+            if live:
+                if self._open == candidate.candidate_id and self._tty:
+                    print("\r\033[K", end="", file=self.out)   # the decision replaces the note
+                    self._open = None
+                self._close_line()
+            outcome = self._evaluate(candidate, result)
+            if candidate.candidate_id in index:
+                outcomes[index[candidate.candidate_id]] = outcome
+            on_outcome(candidate, outcome)
+
+        def extra(free: int) -> list[CandidateRecord]:
+            out = []
+            for c in more(free):
+                if self._duplicate(c, seen):
+                    dup = self._emit(Outcome(c.candidate_id, "duplicate", None))
+                    on_outcome(c, dup)
+                    continue
+                out.append(c)
+            if live and out:
+                self._levers.update({c.candidate_id: c.lever for c in out})
+            return out
+
+        results = self.simulator.run_many(
+            [c for _, c in to_run],
+            on_done=self._progress if live and len(to_run) > 1 and not streaming else None,
+            on_status=self._status if live else None,
+            on_ready=self._fetching if live else None,
+            on_result=decide if streaming else None,
+            more=extra if streaming and more is not None else None)
+        if live:
+            self._close_line()
+        if not streaming:
+            for (i, candidate), result in zip(to_run, results):
+                if result.status != "invalid":
+                    self.auditor.register_variant(candidate.family, candidate.candidate_id)
+                outcomes[i] = self._evaluate(candidate, result)
         return outcomes  # type: ignore[return-value]
+
+    def _duplicate(self, candidate: CandidateRecord, seen: set) -> bool:
+        h = experiment_id(candidate)
+        if h in seen or self.loop.is_duplicate(candidate):
+            log.info("duplicate of an earlier experiment, skipped: %s", candidate.candidate_id)
+            return True
+        seen.add(h)
+        return False
 
     def recover(self, candidate: CandidateRecord, sim_id: str) -> Outcome | None:
         """Decide an earlier submission that BRAIN finished after our wait ended (its

@@ -60,7 +60,7 @@ Tests and `--llm scripted` need neither. Set only the keys for the providers you
 read -s GEMINI_API_KEY && export GEMINI_API_KEY          # gemini-* ids (free tier: Flash models)
 read -s GROQ_API_KEY && export GROQ_API_KEY              # groq:... ids (free plan: Qwen, gpt-oss)
 read -s NVIDIA_API_KEY && export NVIDIA_API_KEY          # nvidia:... ids (build.nvidia.com: Llama, DeepSeek)
-read -s GITHUB_MODELS_TOKEN && export GITHUB_MODELS_TOKEN  # github:... ids (optional: hosted GPT models, ~50 calls/day)
+read -s CEREBRAS_API_KEY && export CEREBRAS_API_KEY      # cerebras:<name> ids (optional; trial credit, no permanent free tier)
 read -s OPENROUTER_API_KEY && export OPENROUTER_API_KEY  # plain <maker>/<model> ids (free ones end in :free)
 pip install -e ".[llm]"                                  # only for Claude (claude-* ids, paid)
 read -s ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY
@@ -72,8 +72,9 @@ model; ChatGPT's own API has no free tier), `nvidia:deepseek-ai/deepseek-v4.1-fl
 `nvidia:meta/llama-3.2-90b-vision-instruct`. Each arm's critic is the first listed model from
 another maker; Llama on NVIDIA is the default for the agents that run every round, so
 Gemini's 20 calls a day go to its own arm. Keys come from aistudio.google.com (Gemini),
-console.groq.com (Groq), build.nvidia.com (NVIDIA), github.com/settings/tokens (a
-fine-grained token with the Models read permission) and openrouter.ai (OpenRouter).
+console.groq.com (Groq), build.nvidia.com (NVIDIA), cloud.cerebras.ai (Cerebras) and
+openrouter.ai (OpenRouter). GitHub Models was retired on 2026-07-30; `github:` ids now fail
+with that reason.
 
 Model ids change. Before a run:
 
@@ -250,8 +251,15 @@ Each round:
    (dataset × region × prompt version × generator model) by Thompson sampling, with a
    floor for every arm.
    It starts from the outcomes already in memory, so a second run continues the first.
-2. **Repair queue first**: queued repair children from any arm take up to
-   `repair.max_share_per_round` (0.5) of the round's slots before the Director allocates
+2. **Repair waves first**: a near miss gets up to `repair.fixes_per_wave` (4) different fixes
+   (sized by `repair.wave_tiers` on its distance to accept: 4 at <= 0.15, 2 at <= 0.4, none
+   beyond; none with little real edge or a failing check no lever fixes)
+   (one per kind of change first, at most `model_levers_per_wave` 1 model-written) that are
+   simulated together. When all are in, the next wave starts from the child closest to
+   accept if it got closer than the parent (levers that helped its siblings first), else
+   from the same parent with its next levers; the Director is credited once per wave.
+   Queued waves are taken whole, up to `repair.waves_per_round` (2) and
+   `repair.max_share_per_round` (1.0) of the round's slots, before the Director allocates
    the rest, so a repair is never stranded in an arm that gets no slot. Then children
    waiting for an arm take that arm's slots. At the start of a run, every `repair`
    decision in memory whose child never reached BRAIN (the run stopped, or no slot) is
@@ -375,9 +383,14 @@ the report lists calls per model.
 - **Generators are compared by the bandit.** Every model in `models.generator` is its own
   arm, with its own copy of the plan's hypotheses, so the models work through the same
   ideas and the Director moves slots toward the one that gets accepted more.
-- **Generator and Critic never share a provider.** The primary critic for an arm is the
-  first entry in `models.critic` whose provider differs from the arm's generator, so they
-  don't share blind spots. A config where some generator has no such critic is refused
+- **Generator and Critic never share a provider.** The primary critic for an arm is an
+  entry in `models.critic` whose provider differs from the arm's generator, so they don't
+  share blind spots: with `models.critic_pick: balanced` the one with the fewest calls so
+  far in the run (so reviews spread over the critics), with `first` the first listed.
+- **Pacing.** `models.pace` gives a model's free-tier limits (`calls_per_minute`,
+  `tokens_per_minute`); its calls wait until they fit instead of collecting 429s. A reply
+  cut off mid-transfer is retried like a server error, and a 429 that names no wait gets
+  one retry after 20 s. A config where some generator has no such critic is refused
   (exit 2).
 - **Critics are compared as shadows.** With `shadow_critics: true` every other critic model
   reviews the same batch. All verdicts go to memory (`critic_reviews`), but only the
@@ -388,7 +401,10 @@ the report lists calls per model.
 - **Check the Gemini ids** in `config/agents.yaml` against Google's current model list
   (https://ai.google.dev/gemini-api/docs/models) before a real run. With thinking models,
   thinking counts against the output cap; if a reply comes back empty with
-  `MAX_TOKENS`, raise `max_output`.
+  `MAX_TOKENS` (Gemini) or `finish_reason length` (hosted), give that model its own cap
+  in `models.max_output` in `config/agents.yaml` (model id -> tokens). It replaces the
+  agents' cap on every call to that model, in `research`, `generate` and `models --check`,
+  so other models keep the smaller cap (Groq's free plan counts tokens per minute).
 
 The report has a `comparison` section, and `cli compare` prints the same tables from
 memory across every run so far:
@@ -484,9 +500,14 @@ set, so the results of a hand rescue become evidence for the learner too.
   repair budget and an out-of-sample test (OQ-12) remain the main guards.
 - **Distance to accept** = the sum of each failing class's normalized shortfall (an
   unmeasured failure adds `repair.unmeasured_failure_penalty`). The learner's reward is half
-  "did the target class get fixed" and half "did the whole alpha get closer".
-- **Repair budget per original idea** (`config/agents.yaml` `repair`): `max_depth` 2,
-  `max_trials_per_root` 4, `patience` 2 (stop after two children that do not get closer),
+  "did the target class get fixed" (an improvement counts by the share of the gap it
+  closed) and half "did the whole alpha get closer". Each (class, lever) also keeps its
+  past gains; for an alpha that misses a class by a known amount, the lever's estimate
+  blends in the chance its past gain covers it (`repair.gain_weight`), so a big gain that
+  never carried an alpha over the bar still ranks first for one that needs less.
+- **Repair budget per original idea** (`config/agents.yaml` `repair`): `max_depth` 3,
+  `max_trials_per_root` 12, `patience` 8 (two waves of children that do not get closer;
+  owner 2026-11-23: a cost limit only, since overfitting checks now just raise a flag),
   and at most `max_resume` 3 lost repairs resumed per run, closest to accept first.
   `cli repair` obeys it too (`--ignore-budget` to override; extra simulations still count
   as trials).
@@ -652,10 +673,13 @@ screenshot values (aggregate plus yearly rows for 2019 to 2023).
   screened alphas and sends them 3 at a time (and at each round's end). Over the real
   limit BRAIN answers 429 and the client waits for a slot. Raise the value once a run
   shows no 429 waits. Raised to 8 the same day (8 submitted within 6 s, no 429). A
-  `BRAIN: <id> finished (k of N)` line prints as each simulation finishes; the decision
-  lines follow in order once the whole batch is done. While alphas run, a status line every
-  `simulator.progress_every_seconds` (60) shows each one's time on BRAIN and BRAIN's
-  progress, and a `done on BRAIN, fetching` line marks the minutes spent fetching results.
+  line prints as each simulation finishes (`   7m30s  r01a27_001_c1 (speed_up)  Sharpe
+  0.91  fitness 0.41  turnover 20%   (3 of 5)`; ids without the run prefix, a repair child
+  with its fix); the decision lines (`r01a27_001_c1 | repair / sharpe | Sharpe 0.91 | ...`)
+  follow as each alpha is decided, the moment its result is in (research runs; `cli run` still decides a batch in order once all are in), and a ready repair wave takes a freed slot at once. While alphas run, one status line every
+  `simulator.progress_every_seconds` (60) gives the batch's time, how many are done and the
+  range of BRAIN's progress; a `simulated, fetching results and checks ...` note marks the
+  minutes spent fetching, and a terminal overwrites it with the result line.
 - **Power Pool candidates** (`power_pool.py`, recorded only): a result whose regular-alpha
   misses BRAIN marks only WARNING, with every ruled check passing and POWER_POOL_CORRELATION
   not failed, gets a `power_pool_candidate` reason and a console line; `cli power-pool`
@@ -695,7 +719,8 @@ screenshot values (aggregate plus yearly rows for 2019 to 2023).
   `config/thresholds.yaml`). Review them, and the lever-learning settings in the `repair`
   section of `config/agents.yaml`.
 - **OQ-16 Overfitting and repair budget defaults.** `auditor.min_deflated_sharpe` 0.0 with
-  `trials_scope: dataset`; repair `max_depth` 2, `max_trials_per_root` 4, `patience` 2;
+  `trials_scope: dataset` (a flag only under `gates.brain_checks_only`); repair `max_depth`
+  3, `max_trials_per_root` 12, `patience` 8 (2026-11-23);
   `director.max_arm_share` 0.4; generator `datafield_exploration_share` 0.3. Review them.
 - **OQ-17 Consultant checks.** Submission-only checks: decided by the owner 2026-11-14
   (`gates.submission_checks`: counted, but only once every alpha check passes; a failure

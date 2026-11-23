@@ -11,9 +11,12 @@ Method
 1. A repair event is a child candidate with a lever whose parent and child both have a
    decision. Its target is the parent's failure class.
 2. Reward, in [0, 1], per failure class = 0.5 x class part + 0.5 x overall part.
-     class part    1.0 the child is accepted or the class no longer fails; 0.5 the class
-                   still fails but its slack improved (e.g. Sharpe 1.14 -> 1.21 against
-                   1.25); 0.0 otherwise
+     class part    1.0 the child is accepted or the class no longer fails; when the class
+                   still fails but its slack improved, the share of the gap it closed
+                   (Sharpe 1.20 -> 1.50 against 1.58 closes 0.30 of 0.38: 0.79), so a
+                   large gain that still misses the bar counts almost as a fix and a tiny
+                   one almost as nothing (owner 2026-11-23: the same change may carry an
+                   alpha that needs less); 0.0 otherwise
      overall part  1.0 if the child is accepted, else the share by which the child's
                    distance to accept (``distance``) fell below the parent's, in [0, 1]
    A child that did not complete (BRAIN rejected the rewrite) gets 0. The overall part is
@@ -57,6 +60,13 @@ Method
    (``order: learned``) or one posterior draw (``order: thompson``, explores more). Ties
    keep playbook order, so with no evidence the playbook order is used, and
    ``order: playbook`` turns learning off.
+   Gain match (owner 2026-11-23): each (class, lever) also keeps its past gains in slack
+   (child minus parent, in the gate's own units, e.g. +0.35 Sharpe). When the alpha being
+   repaired misses a class by ``need``, the lever's estimate for that class becomes
+   (1 - gain_weight) x posterior mean + gain_weight x P(gain >= need), with
+   P = (gains >= need + 1) / (gains + 2), once it has ``min_gain_evidence`` gains. A lever
+   whose +0.35 never carried its alphas over the bar then ranks first for an alpha that
+   needs +0.10.
    Two levers are placed by rule, not score: ``flip_sign`` first (it applies only when
    Sharpe is negative, and then a near miss of -1.1 becomes +1.1, the most direct fix there
    is) and ``model_repair`` last (the catch-all after the mechanical levers; it costs a
@@ -96,6 +106,18 @@ class RepairLearningConfig:
     max_depth: int = 2                   # repair generations below the original candidate
     max_trials_per_root: int = 4         # repair simulations per original candidate
     patience: int = 2                    # stop a lineage after this many non-improving children
+    gain_weight: float = 0.5             # weight of P(past gain >= needed gain) in a lever's estimate
+    min_gain_evidence: int = 2           # gains a (class, lever) needs before the match is used
+    fixes_per_wave: int = 4              # repair children written and simulated together
+    waves_per_round: int = 2             # repair waves a research round may start
+    fill_freed_slots: bool = True        # start ready waves in BRAIN slots freed mid-batch
+    model_levers_per_wave: int = 1       # model-written fixes per wave (model calls are scarce)
+    # wave size by how close and how real the alpha is (owner 2026-11-23: many fixes only
+    # for alphas that are really close and have value). ((max distance or None, fixes), ...)
+    wave_tiers: tuple = ()               # empty: fixes_per_wave for every alpha
+    value_sharpe_share: float | None = None   # below this share of the Sharpe bar: low_value_fixes
+    low_value_fixes: int = 1
+    blocked_fixes: int = 1               # fails a BRAIN check no playbook lever addresses
     unmeasured_failure_penalty: float = 0.5   # distance added by a failure with no value
     region_prior_strength: float = 2.0   # events the all-region estimate counts for in a region
 
@@ -137,8 +159,49 @@ class RepairLearningConfig:
                    max_depth=count("max_depth", 1),
                    max_trials_per_root=count("max_trials_per_root", 1),
                    patience=count("patience", 1),
+                   gain_weight=float(num("gain_weight", 0, 1)),
+                   min_gain_evidence=count("min_gain_evidence", 1),
+                   fixes_per_wave=count("fixes_per_wave", 1),
+                   waves_per_round=count("waves_per_round", 1),
+                   fill_freed_slots=_flag(sec, "fill_freed_slots", d.fill_freed_slots),
+                   model_levers_per_wave=count("model_levers_per_wave", 0),
+                   wave_tiers=_wave_tiers(sec.get("wave_tiers")),
+                   value_sharpe_share=(None if sec.get("value_sharpe_share") is None
+                                       else float(num("value_sharpe_share", 0, 2))),
+                   low_value_fixes=count("low_value_fixes", 0),
+                   blocked_fixes=count("blocked_fixes", 0),
                    unmeasured_failure_penalty=float(num("unmeasured_failure_penalty", 0, 10)),
                    region_prior_strength=float(num("region_prior_strength", 0, 1000)))
+
+
+def _flag(sec: dict, key: str, default: bool) -> bool:
+    v = sec.get(key, default)
+    if not isinstance(v, bool):
+        raise ConfigError(f"agents config: repair.{key} must be true or false")
+    return v
+
+
+def _wave_tiers(raw) -> tuple:
+    if raw is None:
+        return ()
+    bad = ConfigError("agents config: repair.wave_tiers must be a list of {max_distance: "
+                      "number or null, fixes: integer >= 0}, distances increasing, the last null")
+    if not isinstance(raw, list) or not raw:
+        raise bad
+    out, last = [], -1.0
+    for t in raw:
+        if not isinstance(t, dict) or set(t) != {"max_distance", "fixes"}:
+            raise bad
+        d, n = t["max_distance"], t["fixes"]
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+            raise bad
+        if d is not None and (isinstance(d, bool) or not isinstance(d, (int, float)) or d <= last):
+            raise bad
+        out.append((None if d is None else float(d), n))
+        last = float("inf") if d is None else float(d)
+    if out[-1][0] is not None:
+        raise bad
+    return tuple(out)
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +285,46 @@ def distance(decision: DecisionRecord | None, result: ResultRecord | None,
     return round(total, 6)
 
 
+def wave_size(decision: DecisionRecord | None, result: ResultRecord | None,
+              config: RepairLearningConfig, playbook: Playbook) -> tuple[int, str]:
+    """(fixes for this alpha's next repair wave, why). The tier of its distance to accept
+    (``wave_tiers``), then at most ``blocked_fixes`` when it fails a class no playbook
+    lever addresses (no fix can make it pass, e.g. BRAIN's ASI checks), and at most
+    ``low_value_fixes`` when its best Sharpe (raw or risk-neutralized, either sign) is
+    below ``value_sharpe_share`` of the Sharpe bar (little real edge to save)."""
+    dist = distance(decision, result, config.unmeasured_failure_penalty)
+    n, why = config.fixes_per_wave, "default size"
+    for limit, fixes in config.wave_tiers:
+        if limit is None or (dist is not None and dist <= limit):
+            n = fixes
+            why = (f"distance to accept {dist}" if dist is not None else "distance unknown") \
+                + (f" <= {limit}" if limit is not None else "")
+            break
+    blocked = sorted(c for c in failing_classes(decision, result) if not playbook.entries.get(c))
+    if blocked and n > config.blocked_fixes:
+        n, why = config.blocked_fixes, f"fails {', '.join(blocked)}, which no lever fixes"
+    share = config.value_sharpe_share
+    if share is not None and n > config.low_value_fixes and decision is not None:
+        bar = next((g.threshold for g in decision.gate_results
+                    if g.name in ("sharpe", "brain:LOW_SHARPE")
+                    and isinstance(g.threshold, (int, float))), None)
+        best = _best_sharpe(result)
+        if bar and best is not None and best < share * bar:
+            n, why = config.low_value_fixes, (f"best Sharpe {best:.2f} < {share:g} x bar "
+                                              f"{bar:g}: little edge")
+    return n, why
+
+
+def _best_sharpe(result: ResultRecord | None) -> float | None:
+    if result is None:
+        return None
+    vals = [abs(result.sharpe)] if isinstance(result.sharpe, (int, float)) else []
+    rn = (result.alt_stats or {}).get("risk_neutralized") or {}
+    if isinstance(rn.get("sharpe"), (int, float)):
+        vals.append(abs(rn["sharpe"]))
+    return max(vals) if vals else None
+
+
 # ---------------------------------------------------------------------------
 # events and statistics
 # ---------------------------------------------------------------------------
@@ -262,9 +365,20 @@ def _outcome(cls, dp, rp, dc, rc, complete, fails_now, overall):
     fixed = complete and (dc.decision == "accept" or cls not in fails_now)
     improved = (complete and not fixed and before is not None and after is not None
                 and after > before)
-    part = 1.0 if fixed else 0.5 if improved else 0.0
+    part = 1.0 if fixed else gap_closed(before, after) if improved else 0.0
     reward = 0.5 * part + 0.5 * overall if complete else 0.0
     return round(reward, 6), fixed, improved, before, after
+
+
+def gap_closed(before: float | None, after: float | None) -> float:
+    """Share of a failing class's gap a change closed, in [0, 1]: slack -0.38 -> -0.08 is
+    0.79. A class that was not failing (slack >= 0) or a slack without a value gives 0.5,
+    the old flat credit for an improvement."""
+    if before is None or after is None:
+        return 0.0
+    if before >= 0:
+        return 0.5
+    return round(min(1.0, max(0.0, (after - before) / -before)), 6)
 
 
 def _overall_gain(dp, rp, dc, rc, penalty: float) -> float:
@@ -365,6 +479,7 @@ class LeverRecord:
     events: int = 0
     fixed: int = 0
     improved: int = 0
+    gains: list = field(default_factory=list)   # slack after - before, target/secondary only
 
 
 @dataclass
@@ -389,7 +504,29 @@ class LeverStats:
                 rec.events += 1
                 rec.fixed += e.fixed
                 rec.improved += e.improved
+                if e.role != "part" and e.slack_before is not None and e.slack_after is not None:
+                    rec.gains.append(round(e.slack_after - e.slack_before, 6))
         return stats
+
+    def gains(self, failure_class: str, lever: str, region: str | None = None) -> list[float]:
+        """Past slack gains of a lever for a class: the region's own when it has
+        evidence, else every region's."""
+        own = self.by_region.get((region, failure_class, lever)) if region else None
+        if own is not None and own.gains:
+            return own.gains
+        return self.records.get((failure_class, lever), LeverRecord()).gains
+
+    def estimate(self, failure_class: str, lever: str, region: str | None = None,
+                 need: float | None = None, gain_weight: float = 0.5,
+                 min_gain_evidence: int = 2) -> float:
+        """Posterior mean, blended with P(past gain >= need) when the alpha misses the
+        class by ``need`` and the lever has enough past gains (module doc, point 6)."""
+        mean = self.mean(failure_class, lever, region)
+        gains = self.gains(failure_class, lever, region)
+        if need is None or need <= 0 or len(gains) < min_gain_evidence or not gain_weight:
+            return mean
+        reach = (sum(g >= need for g in gains) + 1) / (len(gains) + 2)
+        return (1 - gain_weight) * mean + gain_weight * reach
 
     def posterior(self, failure_class: str, lever: str,
                   region: str | None = None) -> tuple[float, float]:
@@ -417,7 +554,8 @@ class LeverStats:
         rows = [{"failure_class": cls, "lever": lever, "events": r.events,
                  "evidence_weight": round(r.n, 3), "fixed": r.fixed, "improved": r.improved,
                  "mean_reward": round(r.reward / r.n, 3) if r.n else None,
-                 "posterior_mean": round(self.mean(cls, lever), 3)}
+                 "posterior_mean": round(self.mean(cls, lever), 3),
+                 "median_gain": _median(r.gains)}
                 for (cls, lever), r in self.records.items()]
         return sorted(rows, key=lambda x: (x["failure_class"], -x["posterior_mean"]))
 
@@ -431,11 +569,32 @@ class LeverStats:
         return sorted(rows, key=lambda x: (x["region"], x["failure_class"], -x["posterior_mean"]))
 
 
+def _median(xs: list[float]) -> float | None:
+    if not xs:
+        return None
+    s = sorted(xs)
+    m = len(s) // 2
+    return round(s[m] if len(s) % 2 else (s[m - 1] + s[m]) / 2, 4)
+
+
+def needs(decision: DecisionRecord | None, result: ResultRecord | None,
+          classes: Iterable[str]) -> dict[str, float]:
+    """{class: gain in slack still needed to pass} for the failing classes with a value."""
+    out = {}
+    for cls in classes:
+        s = slack(cls, decision, result)
+        if s is not None and s < 0:
+            out[cls] = round(-s, 6)
+    return out
+
+
 def rank_levers(playbook: Playbook, primary: str, failing: Iterable[str], stats: LeverStats,
                 config: RepairLearningConfig, rng: random.Random | None = None,
-                region: str | None = None) -> list[tuple[Lever, float]]:
+                region: str | None = None,
+                need: dict[str, float] | None = None) -> list[tuple[Lever, float]]:
     """The primary class's levers plus its learned combinations, best first, each with its
-    score (see module doc), using the region's estimates when ``region`` is given."""
+    score (see module doc), using the region's estimates when ``region`` is given and the
+    gain match when ``need`` ({class: gain needed}) is given."""
     if config.order == "playbook":
         return _pin([(lv, 0.0) for lv in playbook.entries.get(primary, [])])
 
@@ -459,7 +618,8 @@ def rank_levers(playbook: Playbook, primary: str, failing: Iterable[str], stats:
             if config.order == "thompson":
                 score += w * rng.betavariate(*stats.posterior(cls, lv.name, region))
             else:
-                score += w * stats.mean(cls, lv.name, region)
+                score += w * stats.estimate(cls, lv.name, region, (need or {}).get(cls),
+                                            config.gain_weight, config.min_gain_evidence)
         scored.append((-score, pos, lv))
     scored.sort(key=lambda t: (t[0], t[1]))
     return _pin([(lv, round(-s, 4)) for s, _, lv in scored])
@@ -486,4 +646,12 @@ def successful_examples(events: Iterable[RepairEvent], failure_class: str,
     good.sort(key=lambda e: (region is not None and e.region != region, -e.reward))  # stable
     return [{"lever": e.lever, "region": e.region, "before": e.parent_expression,
              "after": e.child_expression, "settings_change": e.settings_change,
-             "result": "fixed" if e.fixed else "improved"} for e in good[:limit]]
+             "result": "fixed" if e.fixed else _improved_text(e)} for e in good[:limit]]
+
+
+def _improved_text(e: RepairEvent) -> str:
+    if e.slack_before is None or e.slack_after is None:
+        return "improved"
+    gain = e.slack_after - e.slack_before
+    return (f"improved by {gain:+.3g}, closing {gap_closed(e.slack_before, e.slack_after):.0%} "
+            f"of the gap (still {-e.slack_after:.3g} short)")

@@ -15,7 +15,7 @@ and never needs a network.
   GEMINI_KEY_ENV_VAR and sent only in the ``x-goog-api-key`` header.
 * ``ChatCompletionsLLMClient`` calls a hosted chat-completions endpoint with ``urllib``
   for hosted models (Qwen, gpt-oss, Llama, DeepSeek...). The host comes from the model id:
-  ``<host>:<maker>/<model>`` goes to that host (``groq``, ``nvidia``, ``github``), and a
+  ``<host>:<maker>/<model>`` goes to that host (``groq``, ``nvidia``, ``cerebras``), and a
   plain ``<maker>/<model>`` goes to OpenRouter (free variants end in ``:free``). With a
   host prefix the maker may be left out when the name says it (``groq:gpt-oss-120b``,
   ``groq:llama-3.3-70b-versatile``): BARE_MODEL_MAKERS gives the provider and, where the
@@ -39,6 +39,7 @@ compare providers by this name, never by client class.
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
@@ -59,6 +60,9 @@ GEMINI_TIMEOUT_SECONDS = 300.0   # thinking models can take minutes on a long pr
 HOSTED_TIMEOUT_SECONDS = 300.0
 RATE_LIMIT_MAX_WAIT_SECONDS = 60.0   # a longer requested wait is a daily quota: give up
 RATE_LIMIT_RETRIES = 3
+# a 429 that names no wait (OpenRouter's "Provider returned error": the free host behind a
+# model is busy) gets one retry after this many seconds before the model is given up
+UNSTATED_RATE_LIMIT_WAIT_SECONDS = 20.0
 SERVER_ERROR_STATUSES = (500, 502, 503, 504)
 SERVER_ERROR_WAITS_SECONDS = (10.0, 30.0, 60.0)   # one retry after each wait
 # host -> (chat-completions URL, key environment variable). The default host serves
@@ -67,11 +71,17 @@ HOSTS = {
     "openrouter": ("https://openrouter.ai/api/v1/chat/completions", "OPENROUTER_API_KEY"),
     "groq": ("https://api.groq.com/openai/v1/chat/completions", "GROQ_API_KEY"),
     "nvidia": ("https://integrate.api.nvidia.com/v1/chat/completions", "NVIDIA_API_KEY"),
-    "github": ("https://models.github.ai/inference/chat/completions", "GITHUB_MODELS_TOKEN"),
+    "cerebras": ("https://api.cerebras.ai/v1/chat/completions", "CEREBRAS_API_KEY"),
 }
+# hosts that are gone: a "<host>:" id fails with this reason instead of a confusing reply
+# (models.github.ai answers a bare "OK" to every request since the shutdown)
+RETIRED_HOSTS = {"github": "GitHub Models was retired on 2026-07-30"}
 DEFAULT_HOST = "openrouter"
 # where each host lists its models (default: the chat URL with chat/completions -> models)
-MODEL_LIST_URLS = {"github": "https://models.github.ai/catalog/models"}
+MODEL_LIST_URLS: dict[str, str] = {}
+# hosts that take a bare model name as is (Cerebras serves "gpt-oss-120b", not
+# "openai/gpt-oss-120b"); elsewhere BARE_MODEL_MAKERS adds the namespace
+BARE_NAMES_AS_IS = {"cerebras"}
 # a hosted id without "<maker>/": name prefix -> (provider, namespace the host expects or
 # None to send the name as is). gpt-oss and GPT ids are namespaced on every host we use.
 BARE_MODEL_MAKERS = {
@@ -134,7 +144,15 @@ def split_hosted(model: str) -> tuple[str, str] | None:
     provider, namespace = _bare_maker(model)
     if provider is None:
         return None
+    if host in BARE_NAMES_AS_IS:
+        namespace = None
     return host, f"{namespace}/{model}" if namespace else model
+
+
+def _check_not_retired(model_or_host: str) -> None:
+    host = model_or_host.partition(":")[0]
+    if host in RETIRED_HOSTS:
+        raise LLMUnavailable(f"host {host!r} is gone: {RETIRED_HOSTS[host]}")
 
 
 class LLMUnavailable(RuntimeError):
@@ -251,10 +269,21 @@ def _post_json(transport: Transport, sleep: Callable[[float], None], url: str, b
     """POST with waits on short rate limits and temporary server errors. Returns (status,
     raw body, parsed JSON or {})."""
     rate_limited = server_errors = 0
+    unstated_retried = False
     while True:
         try:
             status, raw = transport(url, body, headers, timeout)
-        except (OSError, TimeoutError) as exc:  # network failure -> clean exit
+        except (OSError, TimeoutError, http.client.HTTPException) as exc:
+            # a dropped connection or a reply cut off mid-transfer (IncompleteRead, run
+            # 2026-11-23): retried like a temporary server error, then a clean failure
+            if server_errors < len(SERVER_ERROR_WAITS_SECONDS):
+                wait = SERVER_ERROR_WAITS_SECONDS[server_errors]
+                server_errors += 1
+                log.warning("%s: connection failed (%s); waiting %.0fs before retry %d of %d",
+                            model, type(exc).__name__, wait, server_errors,
+                            len(SERVER_ERROR_WAITS_SECONDS))
+                sleep(wait)
+                continue
             raise LLMUnavailable(f"model call failed: {type(exc).__name__}: {exc}") from exc
         try:
             data = json.loads(raw) if raw else {}
@@ -262,6 +291,9 @@ def _post_json(transport: Transport, sleep: Callable[[float], None], url: str, b
             data = {}
         if status == 429 and rate_limited < RATE_LIMIT_RETRIES:
             wait = rate_limit_wait(data, raw)
+            if wait is None and not unstated_retried:
+                unstated_retried = True
+                wait = UNSTATED_RATE_LIMIT_WAIT_SECONDS - 1
             if wait is not None and wait <= RATE_LIMIT_MAX_WAIT_SECONDS:
                 rate_limited += 1
                 log.warning("%s is rate-limited; waiting %.0fs before retry %d of %d",
@@ -307,6 +339,8 @@ class GeminiLLMClient:
         if status != 200:
             msg = (data.get("error") or {}).get("message") if isinstance(data, dict) else None
             raise LLMUnavailable(f"model call failed: HTTP {status}: {msg or 'no message'}")
+        usage = (data.get("usageMetadata") or {}) if isinstance(data, dict) else {}
+        self.last_usage = usage.get("totalTokenCount")
         candidates = data.get("candidates") if isinstance(data, dict) else None
         if not candidates:
             block = (data.get("promptFeedback") or {}).get("blockReason")
@@ -317,8 +351,8 @@ class GeminiLLMClient:
                        if isinstance(p, dict) and not p.get("thought"))
         if not text.strip():
             finish = first.get("finishReason")
-            hint = ("; thinking used the whole output cap, raise max_output in "
-                    "config/agents.yaml" if finish == "MAX_TOKENS" else "")
+            hint = ("; thinking used the whole output cap, raise this model's cap in "
+                    "models.max_output in config/agents.yaml" if finish == "MAX_TOKENS" else "")
             raise LLMUnavailable(f"model returned an empty reply (finishReason {finish}){hint}")
         return text
 
@@ -330,6 +364,7 @@ class ChatCompletionsLLMClient:
     def __init__(self, model: str, api_key: str | None = None, *,
                  transport: Transport | None = None, timeout: float = HOSTED_TIMEOUT_SECONDS,
                  sleep: Callable[[float], None] = time.sleep):
+        _check_not_retired(model)
         hosted = split_hosted(model)
         if hosted is None:
             raise LLMUnavailable(f"not a hosted model id: {model!r} (expected maker/model)")
@@ -364,6 +399,8 @@ class ChatCompletionsLLMClient:
             if not msg and raw and not data:  # not JSON, e.g. a proxy's "error code: 1010"
                 msg = raw[:200].decode("utf-8", "replace").strip()
             raise LLMUnavailable(f"model call failed: HTTP {status}: {msg or 'no message'}")
+        usage = (data.get("usage") or {}) if isinstance(data, dict) else {}
+        self.last_usage = usage.get("total_tokens")   # what the host counts, reasoning included
         choices = data.get("choices") if isinstance(data, dict) else None
         if not choices:
             raise LLMUnavailable("model returned no choices")
@@ -371,8 +408,8 @@ class ChatCompletionsLLMClient:
         text = _THINK_RE.sub("", (first.get("message") or {}).get("content") or "")
         if not text.strip():
             finish = first.get("finish_reason")
-            hint = ("; reasoning used the whole output cap, raise max_output in "
-                    "config/agents.yaml" if finish == "length" else "")
+            hint = ("; reasoning used the whole output cap, raise this model's cap in "
+                    "models.max_output in config/agents.yaml" if finish == "length" else "")
             raise LLMUnavailable(f"model returned an empty reply (finish_reason {finish}){hint}")
         return text
 
@@ -382,6 +419,7 @@ def list_models(host: str, api_key: str | None = None, *,
                 timeout: float = HOSTED_TIMEOUT_SECONDS) -> list[str]:
     """Model ids a host serves now, sorted (``cli models``), from its model list endpoint.
     Ids come back as the host names them; prefix them with ``<host>:`` in the config."""
+    _check_not_retired(host)
     if host not in HOSTS:
         raise LLMUnavailable(f"unknown host {host!r}; known: {sorted(HOSTS)}")
     chat_url, env_var = HOSTS[host]
@@ -402,13 +440,103 @@ def list_models(host: str, api_key: str | None = None, *,
     if status != 200:
         raise LLMUnavailable(f"model list failed: HTTP {status}: {raw[:200]!r}")
     items = data.get("data") if isinstance(data, dict) else data
-    ids = [i.get("id") for i in items or [] if isinstance(i, dict)]
-    return sorted(i for i in ids if isinstance(i, str))
+    ids = sorted(i.get("id") for i in items or []
+                 if isinstance(i, dict) and isinstance(i.get("id"), str))
+    if not ids:  # not a model list (e.g. a retired host's placeholder reply)
+        head = (raw or b"")[:200].decode("utf-8", "replace").strip()
+        raise LLMUnavailable(f"model list from {host} had no model ids; the reply was: "
+                             f"{head!r} (check that {env_var} is valid)")
+    return ids
 
 
-def make_real_client(model: str) -> LLMClient:
-    """The real model client for a model id. Kept here so no other module has to name a
-    provider."""
+class OutputCapClient:
+    """A client whose every call uses ``max_output`` in place of the cap the agent asked
+    for: reasoning models spend part of the cap thinking, so they need a larger one than
+    the agents' default (``models.max_output`` in config/agents.yaml)."""
+
+    def __init__(self, inner: LLMClient, max_output: int):
+        self.inner = inner
+        self.max_output = max_output
+        self.model = inner.model
+        self.provider = getattr(inner, "provider", provider_of(inner.model))
+
+    def complete(self, system: str, user: str, *, max_output: int = 4096) -> str:
+        return self.inner.complete(system, user, max_output=self.max_output)
+
+    @property
+    def last_usage(self):
+        return getattr(self.inner, "last_usage", None)
+
+
+class PacedClient:
+    """Waits before a call so the model's calls and tokens in the last ``window`` seconds
+    stay within its free-tier limits (``models.pace`` in config/agents.yaml), instead of
+    sending and collecting 429s. A call's tokens are what the host reported (``usage``,
+    reasoning included), else (prompt + reply characters) / 4; the next call's size is
+    estimated as its prompt plus the average reply so far. A call larger than the whole
+    budget still goes when the window is empty."""
+
+    def __init__(self, inner: LLMClient, calls_per_minute: int | None = None,
+                 tokens_per_minute: int | None = None, *,
+                 clock: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], None] = time.sleep, window: float = 60.0):
+        self.inner = inner
+        self.model = inner.model
+        self.provider = getattr(inner, "provider", provider_of(inner.model))
+        self.calls_per_minute = calls_per_minute
+        self.tokens_per_minute = tokens_per_minute
+        self._clock, self._sleep, self._window = clock, sleep, window
+        self._log: list[tuple[float, int]] = []   # (time sent, tokens)
+        self._reply_tokens = 1500.0               # running estimate of a reply's size
+
+    def _room(self, est: int) -> float:
+        """Seconds to wait before a call of ``est`` tokens fits (0 = send now)."""
+        now = self._clock()
+        self._log = [(t, n) for t, n in self._log if now - t < self._window]
+        if not self._log:
+            return 0.0
+        full = ((self.calls_per_minute is not None and len(self._log) >= self.calls_per_minute)
+                or (self.tokens_per_minute is not None
+                    and sum(n for _, n in self._log) + est > self.tokens_per_minute))
+        if not full:
+            return 0.0
+        return max(0.5, self._log[0][0] + self._window - now + 0.5)
+
+    def complete(self, system: str, user: str, *, max_output: int = 4096) -> str:
+        prompt = (len(system) + len(user)) // 4
+        est = prompt + int(self._reply_tokens)
+        waited = 0.0
+        while (wait := self._room(est)) > 0:
+            if not waited:
+                log.warning("%s: pacing to its free-tier limit; waiting %.0fs", self.model, wait)
+            self._sleep(wait)
+            waited += wait
+        sent = self._clock()
+        reply = self.inner.complete(system, user, max_output=max_output)
+        used = getattr(self.inner, "last_usage", None)
+        if not isinstance(used, int) or used <= 0:
+            used = prompt + len(reply) // 4
+        self._reply_tokens = 0.7 * self._reply_tokens + 0.3 * max(used - prompt, 0)
+        self._log.append((sent, used))
+        return reply
+
+
+def make_real_client(model: str, max_output: int | None = None,
+                     pace: dict | None = None) -> LLMClient:
+    """The real model client for a model id; ``max_output`` (if given) replaces every
+    call's output cap, ``pace`` ({calls_per_minute, tokens_per_minute}) paces its calls.
+    Kept here so no other module has to name a provider."""
+    client = _real_client(model)
+    if max_output:
+        client = OutputCapClient(client, max_output)
+    if pace:
+        client = PacedClient(client, pace.get("calls_per_minute"),
+                             pace.get("tokens_per_minute"))
+    return client
+
+
+def _real_client(model: str) -> LLMClient:
+    _check_not_retired(model)
     provider = provider_of(model)
     if split_hosted(model):  # before the others: google/... is a hosted id, not Gemini's API
         return ChatCompletionsLLMClient(model)

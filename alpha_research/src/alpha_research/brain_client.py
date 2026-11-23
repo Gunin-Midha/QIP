@@ -46,6 +46,11 @@ class FixtureNotFoundError(LookupError):
     pass
 
 
+class BrainLoginRequired(Exception):
+    """BRAIN refuses every request until someone logs in again. Raised by real clients so
+    callers that keep going past one failed lookup still stop on this one."""
+
+
 class SubmissionRejected(Exception):
     """BRAIN refused the submission itself (bad settings or expression). The simulator
     records a failed result instead of retrying."""

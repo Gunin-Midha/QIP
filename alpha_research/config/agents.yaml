@@ -54,12 +54,42 @@ repair:
   examples_in_prompt: 3            # past repairs that worked, shown to the repair model
   resume_from_memory: true         # at start, re-repair parents whose child was never simulated
   max_resume: 3                    # ... at most this many, closest to accept first
-  max_share_per_round: 0.5         # queued repairs take up to this share of a round's slots first
-  # Lineage budget (owner 2026-11-04: repairs must not concentrate on the few near misses;
-  # every repair simulation also counts against the alpha in the overfitting check)
-  max_depth: 2                     # repair generations below the original candidate
-  max_trials_per_root: 4           # repair simulations per original candidate
-  patience: 2                      # stop a lineage after this many children that do not get closer
+  max_share_per_round: 1.0         # queued repairs take up to this share of a round's slots first
+  # Repair waves (owner 2026-11-23): a near miss gets fixes_per_wave different fixes (one
+  # per kind of change first) simulated together; when all are back, the next wave starts
+  # from the best child if it got closer to accept, else from the same parent with its next
+  # levers. Two waves of 4 fill one BRAIN batch of 8; with --per-round 12 a round is 8
+  # repairs + 4 new alphas. Model calls are the scarce budget: at most
+  # model_levers_per_wave model-written fixes per wave, the rest are mechanical.
+  fixes_per_wave: 4
+  waves_per_round: 2               # repair waves a round may start (first, or in freed slots)
+  fill_freed_slots: true           # owner 2026-11-23: each alpha is decided as it finishes; a
+                                   # ready wave takes a BRAIN slot freed mid-batch at once
+  model_levers_per_wave: 1
+  # Wave size by how close and how real the alpha is (owner 2026-11-23: many fixes only for
+  # alphas that are really close and have value). Distance to accept = sum of each failing
+  # check's normalized shortfall (lever_stats.distance). In memory on 2026-11-23 both
+  # accepts came from parents at distance <= 0.1, while most run repairs were at 1-7.
+  # Owner 2026-11-23: tight, since model calls and simulations are scarce; far, low-edge
+  # and blocked alphas get no fix at all (the decision stays "repair", nothing is queued).
+  # On memory: 21 alphas get 4, 22 get 2, 53 get 0; both accepts' parents (distance 0.1
+  # and 0.0) keep 4.
+  wave_tiers:
+    - {max_distance: 0.15, fixes: 4}
+    - {max_distance: 0.4, fixes: 2}
+    - {max_distance: null, fixes: 0}
+  value_sharpe_share: 0.8          # best Sharpe (raw or risk-neutralized) below 0.8 x the bar:
+  low_value_fixes: 0               # ... no fix (little real edge)
+  blocked_fixes: 0                 # fails a BRAIN check no lever fixes (e.g. ASI checks): no fix
+  # Gain match (owner 2026-11-23): a lever's past gains count for an alpha that needs less,
+  # even when they never carried an alpha over the bar.
+  gain_weight: 0.5                 # weight of P(past gain >= the gain this alpha needs)
+  min_gain_evidence: 2             # past gains a (class, lever) needs before it is used
+  # Lineage budget. Owner 2026-11-23: BRAIN's checks decide; overfitting checks only raise a
+  # flag, so the budget is a cost limit now, not an overfitting guard (was 2 / 4 / 2).
+  max_depth: 3                     # repair generations below the original candidate
+  max_trials_per_root: 12          # repair simulations per original candidate (3 waves of 4)
+  patience: 8                      # stop after this many children that do not get closer (2 waves)
   # Per region (2026-11-11, OQ-18): lever estimates are also kept per region, starting from
   # the all-region estimate worth this many repairs, so each region learns its own order.
   region_prior_strength: 2
@@ -101,9 +131,10 @@ max_output: 4096                   # output cap for one model call
 #
 # Owner's choice: free API keys only (2026-11-03); no Mistral, add GPT, Llama and DeepSeek
 # (2026-11-04). Hosted ids: <host>:<maker>/<model>, or <host>:<model> when the name says the
-# maker (groq:gpt-oss-120b). Hosts: groq, nvidia (build.nvidia.com), github (GitHub Models:
-# the hosted GPT models, ~50 calls/day) and OpenRouter for a plain <maker>/<model>; each
-# host's key variable is listed in README.
+# maker (groq:gpt-oss-120b). Hosts: groq, nvidia (build.nvidia.com), cerebras (bare names
+# such as cerebras:gpt-oss-120b; no permanent free tier since 2026, a 30-day trial credit)
+# and OpenRouter for a plain <maker>/<model>; each host's key variable is listed in README.
+# GitHub Models was retired on 2026-07-30 (github: ids fail with that reason).
 # Ids change often: before a run, `cli models --host nvidia --filter deepseek` lists what a
 # host serves and `cli models --check` sends one tiny call to every model below. A model
 # that fails during a run is dropped for the rest of it (research.py), so one bad id or
@@ -120,15 +151,43 @@ models:
     - gemini-3.6-flash
     - groq:qwen/qwen3.8-27b
     - groq:gpt-oss-120b            # the open-weight GPT model (ChatGPT's own API has no free tier)
-    - nvidia/nemotron-3-ultra-550b-a55b:free   # OpenRouter (~50 free calls/day for all its
-                                               # free models): generator only, owner 2026-11-04;
-                                               # stands in while no free host serves Llama/DeepSeek
-  critic:                          # preference order; an arm's primary critic is the first one
-    - groq:gpt-oss-120b            # from a different provider than the arm's generator that
-    - groq:qwen/qwen3.8-27b        # is not down
+    - nvidia/nemotron-3.5-lightning:free       # OpenRouter (~50 free calls/day for all its
+                                               # free models): generator only. Replaced
+                                               # nemotron-3-ultra (empty replies) 2026-11-23;
+                                               # first test: 3 valid, 0 rejected at a 16k cap
+    - baidu/ernie-5.5-flash-preview:free       # OpenRouter, shares the 50/day; new maker.
+                                               # Test 2026-11-23: 3 valid, 0 rejected (16k cap)
+  # An arm's primary critic is a critic from another maker than its generator that is up.
+  # critic_pick balanced (owner 2026-11-23): the one with the fewest calls so far this run,
+  # so the reviews spread over the critics (run rs20261123174845: gpt-oss reviewed 4 of 5
+  # arms and was also judge, repair, strategy and default, and hit Groq's per-minute limit
+  # within the first round); first = the first listed.
+  critic_pick: balanced
+  critic:
+    - groq:gpt-oss-120b
+    - groq:qwen/qwen3.8-27b
+    - nvidia/nemotron-3.5-lightning:free     # OpenRouter (shares the ~50 free calls a day)
     - gemini-3.6-flash
   shadow_critics: false            # true = the other critics review every batch too (recorded only)
   prefilter: null
-  debate: null
-  repair: null
+  debate: null                     # contested alphas only: rare
+  repair: groq:qwen/qwen3.8-27b    # was the default (gpt-oss); at most one call per repair wave
   strategy: groq:gpt-oss-120b
+  # Free-tier limits each model's calls are paced to (llm.PacedClient waits before a call
+  # instead of collecting 429s; a call's tokens are what the host reports, reasoning
+  # included). Builder values 2026-11-23 from the limits the hosts reported before (Groq:
+  # 8,000 tokens a minute for gpt-oss, 7,000 for Qwen; Gemini free Flash about 10 calls a
+  # minute; OpenRouter free models 20 calls a minute): check console.groq.com (Settings ->
+  # Limits) and aistudio.google.com/rate-limit, and lower a value if 429s still appear.
+  pace:
+    groq:gpt-oss-120b: {calls_per_minute: 30, tokens_per_minute: 8000}
+    groq:qwen/qwen3.8-27b: {calls_per_minute: 30, tokens_per_minute: 7000}
+    gemini-3.6-flash: {calls_per_minute: 10}
+    nvidia/nemotron-3.5-lightning:free: {calls_per_minute: 20}
+    baidu/ernie-5.5-flash-preview:free: {calls_per_minute: 20}
+  # Per-model output cap: replaces the agents' cap (max_output above, generator.yaml's for
+  # the Generator) on every call to that model. Reasoning models think inside the cap and
+  # return nothing when it runs out (finish_reason length).
+  max_output:
+    nvidia/nemotron-3.5-lightning:free: 16384
+    baidu/ernie-5.5-flash-preview:free: 16384    # reasoning model: empty at 4096 (2026-11-23)

@@ -55,6 +55,8 @@ it. The file holds the session cookie only, never the email or password.
 from __future__ import annotations
 
 import base64
+import getpass
+import http.client
 import http.cookiejar
 import json
 import math
@@ -69,7 +71,7 @@ from typing import Callable, Protocol
 
 import yaml
 
-from .brain_client import SubmissionRejected
+from .brain_client import BrainLoginRequired, SubmissionRejected
 from .config import ConfigError
 from .schemas import CandidateRecord
 
@@ -90,7 +92,7 @@ class BrainApiError(RuntimeError):
     """A non-transient API error: unexpected status code or unusable body."""
 
 
-class BrainAuthError(BrainApiError):
+class BrainAuthError(BrainApiError, BrainLoginRequired):
     """Missing credentials, wrong credentials, or a login step we cannot do here."""
 
 
@@ -262,6 +264,8 @@ class UrllibTransport:
             return Response(exc.code, _lower(exc.headers), exc.read())
         except TimeoutError as exc:
             raise TimeoutError(f"{method} {url} timed out") from exc
+        except http.client.HTTPException as exc:   # reply cut off mid-transfer: retried
+            raise ConnectionError(f"{method} {url} failed: {type(exc).__name__}") from exc
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, TimeoutError):
                 raise TimeoutError(f"{method} {url} timed out") from exc
@@ -283,6 +287,18 @@ def credentials_from_env() -> tuple[str, str]:
     return email, secret
 
 
+def prompt_credentials() -> tuple[str, str]:
+    """Ask for the BRAIN login in the terminal (the password is not echoed). Used when a
+    new login is needed and the environment has no credentials. Kept in memory for this
+    process only; never written anywhere."""
+    print("BRAIN needs a new login (the saved session expired).", flush=True)
+    email = os.environ.get(EMAIL_ENV_VAR) or input("BRAIN email: ").strip()
+    secret = os.environ.get(SECRET_ENV_VAR) or getpass.getpass("BRAIN password: ")
+    if not email or not secret:
+        raise BrainAuthError("no BRAIN login given")
+    return email, secret
+
+
 class BrainSession:
     """Authenticated requests. Logs in lazily, logs in again once on a 401 (sessions
     expire), waits out 429 rate limits up to ``rate_limit_max_wait`` and turns 5xx into
@@ -291,9 +307,11 @@ class BrainSession:
     def __init__(self, transport: Transport, email: str, secret: str, *,
                  sleep: Callable[[float], None] = time.sleep,
                  rate_limit_max_wait: float = 900.0, api_root: str = API_ROOT,
-                 on_biometric: Callable[[str], None] | None = None):
+                 on_biometric: Callable[[str], None] | None = None,
+                 ask_credentials: Callable[[], tuple[str, str]] | None = None):
         self.transport = transport
         self.on_biometric = on_biometric
+        self.ask_credentials = ask_credentials   # a new login without credentials asks here
         self._email = email
         self._secret = secret
         self.sleep = sleep
@@ -316,6 +334,8 @@ class BrainSession:
         return self.transport.request(method, url, body, headers)
 
     def authenticate(self) -> None:
+        if (self._email is None or self._secret is None) and self.ask_credentials is not None:
+            self._email, self._secret = self.ask_credentials()
         if self._email is None or self._secret is None:
             raise BrainAuthError(f"BRAIN needs a new login (the saved session is no longer "
                                  f"accepted): set {EMAIL_ENV_VAR} and {SECRET_ENV_VAR}")
@@ -395,9 +415,11 @@ class BrainSession:
 
 def make_session(config: BrainApiConfig, *, sleep: Callable[[float], None] = time.sleep,
                  transport: Transport | None = None,
-                 on_biometric: Callable[[str], None] | None = None) -> BrainSession:
-    """The real session. Fails fast (before any request) when credentials are missing and
-    there is no saved session to reuse.
+                 on_biometric: Callable[[str], None] | None = None,
+                 ask_credentials: Callable[[], tuple[str, str]] | None = None) -> BrainSession:
+    """The real session. Fails fast (before any request) when credentials are missing, there
+    is no saved session to reuse and nothing can ask for them (``ask_credentials``, e.g.
+    ``prompt_credentials`` in a terminal); with it, a new login asks when it is needed.
     ``on_biometric(url)`` is called when BRAIN asks for biometric verification and must
     return once the person has verified at ``url``; without it that login fails."""
     transport = transport or UrllibTransport(config.request_timeout_seconds,
@@ -405,11 +427,11 @@ def make_session(config: BrainApiConfig, *, sleep: Callable[[float], None] = tim
     try:
         email, secret = credentials_from_env()
     except BrainAuthError:
-        if not getattr(transport, "restored", False):
+        if not getattr(transport, "restored", False) and ask_credentials is None:
             raise
-        email = secret = None   # the saved session is used; a new login would need them
+        email = secret = None   # the saved session is used; a new login asks or needs them
     return BrainSession(transport, email, secret, sleep=sleep, rate_limit_max_wait=config.rate_limit_max_wait_seconds,
-                        on_biometric=on_biometric)
+                        on_biometric=on_biometric, ask_credentials=ask_credentials)
 
 
 def _expect(resp: Response, what: str, *ok: int):

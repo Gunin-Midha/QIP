@@ -143,7 +143,7 @@ def test_gemini_call_shape_and_thought_parts_skipped(monkeypatch):
     ((429, json.dumps({"error": {"message": "quota exceeded"}}).encode()), "HTTP 429: quota exceeded"),
     ((500, b"not json"), "HTTP 500: no message"),
     ((200, json.dumps({"promptFeedback": {"blockReason": "SAFETY"}}).encode()), "SAFETY"),
-    (gemini_reply([{"text": "x", "thought": True}], finish="MAX_TOKENS"), "raise max_output"),
+    (gemini_reply([{"text": "x", "thought": True}], finish="MAX_TOKENS"), "models.max_output"),
     (gemini_reply([]), "empty reply"),
     (ConnectionError("down"), "down"),
 ])
@@ -212,7 +212,7 @@ def test_hosted_strips_inline_thinking(monkeypatch):
     assert ChatCompletionsLLMClient("groq:qwen/qwen3.8-27b", transport=transport) \
         .complete("s", "u").strip() == '{"final": 2}'
     transport, _ = fake_transport(hosted_reply("<think>ran out of room", finish="length"))
-    with pytest.raises(LLMUnavailable, match="raise max_output"):
+    with pytest.raises(LLMUnavailable, match="models.max_output"):
         ChatCompletionsLLMClient("groq:qwen/qwen3.8-27b", transport=transport).complete("s", "u")
 
 
@@ -223,7 +223,10 @@ def test_hosted_rejects_an_id_without_a_maker():
 
 def test_new_hosts_and_bare_ids():
     assert split_hosted("groq:gpt-oss-120b") == ("groq", "openai/gpt-oss-120b")
-    assert split_hosted("github:gpt-4.1-mini") == ("github", "openai/gpt-4.1-mini")
+    assert split_hosted("cerebras:gpt-oss-120b") == ("cerebras", "gpt-oss-120b")  # as is
+    assert split_hosted("cerebras:qwen-3-32b") == ("cerebras", "qwen-3-32b")
+    assert provider_of("cerebras:gpt-oss-120b") == "openai"
+    assert provider_of("cerebras:llama-3.3-70b") == "meta"
     assert split_hosted("groq:llama-3.3-70b-versatile") == ("groq", "llama-3.3-70b-versatile")
     assert split_hosted("nvidia:meta/llama-3.3-70b-instruct") == \
         ("nvidia", "meta/llama-3.3-70b-instruct")
@@ -258,8 +261,11 @@ def test_list_models():
 
     assert list_models("nvidia", api_key="k", transport=transport) == ["a/y", "b/x"]
     assert seen == {"url": "https://integrate.api.nvidia.com/v1/models", "body": None}
-    gh = lambda url, body, headers, timeout: (200, json.dumps([{"id": "openai/gpt-x"}]).encode())
-    assert list_models("github", api_key="k", transport=gh) == ["openai/gpt-x"]
+    seen.clear()
+    plain = lambda url, body, headers, timeout: (seen.update(url=url) or 200,
+                                                 json.dumps([{"id": "gpt-x"}]).encode())
+    assert list_models("cerebras", api_key="k", transport=plain) == ["gpt-x"]  # bare list
+    assert seen["url"] == "https://api.cerebras.ai/v1/models"
     with pytest.raises(LLMUnavailable, match="HTTP 401"):
         list_models("groq", api_key="k", transport=lambda *a: (401, b"no"))
     with pytest.raises(LLMUnavailable, match="unknown host"):
@@ -272,7 +278,7 @@ def test_list_models():
     ((502, b""), "HTTP 502: no message"),
     ((403, b"error code: 1010\n"), "HTTP 403: error code: 1010"),
     ((200, json.dumps({"choices": []}).encode()), "no choices"),
-    (hosted_reply(None, finish="length"), "raise max_output"),
+    (hosted_reply(None, finish="length"), "models.max_output"),
     (hosted_reply("  "), "empty reply"),
     (ConnectionError("down"), "down"),
 ])
@@ -334,9 +340,24 @@ def test_gemini_waits_and_retries_on_a_short_rate_limit(monkeypatch):
     assert llm.complete("s", "u") == "ok" and slept == [44.0] and len(calls) == 2
 
 
+def test_an_unstated_wait_gets_one_retry_after_20s(monkeypatch):
+    # OpenRouter's "Provider returned error" (the free host is busy) names no wait
+    monkeypatch.setenv("GROQ_API_KEY", "dummy")
+    busy = (429, json.dumps({"error": {"message": "Provider returned error"}}).encode())
+    transport, calls = sequence_transport(busy, hosted_reply("ok"))
+    slept = []
+    llm = ChatCompletionsLLMClient("groq:qwen/qwen3.8-27b", transport=transport, sleep=slept.append)
+    assert llm.complete("s", "u") == "ok" and slept == [20.0] and len(calls) == 2
+    transport, calls = sequence_transport(busy)
+    slept = []
+    llm = ChatCompletionsLLMClient("groq:qwen/qwen3.8-27b", transport=transport, sleep=slept.append)
+    with pytest.raises(LLMUnavailable, match="Provider returned error"):
+        llm.complete("s", "u")
+    assert slept == [20.0] and len(calls) == 2           # one retry only
+
+
 @pytest.mark.parametrize("reply", [
     (429, json.dumps({"error": {"message": "Daily quota used. Please try again in 5h3m"}}).encode()),
-    (429, json.dumps({"error": {"message": "Rate limit reached"}}).encode()),
 ])
 def test_long_or_unknown_waits_fail_without_sleeping(monkeypatch, reply):
     monkeypatch.setenv("GROQ_API_KEY", "dummy")
@@ -389,3 +410,140 @@ def test_client_errors_are_not_retried(monkeypatch):
     with pytest.raises(LLMUnavailable, match="HTTP 403"):
         llm.complete("s", "u")
     assert slept == [] and len(calls) == 1
+
+
+def test_output_cap_client_replaces_every_calls_cap(monkeypatch):
+    from alpha_research.llm import OutputCapClient
+    inner = ScriptedLLMClient(["a", "b"])
+    capped = OutputCapClient(inner, 16384)
+    assert capped.complete("s", "u", max_output=256) == "a"
+    assert capped.complete("s", "u") == "b"
+    assert [c["max_output"] for c in inner.calls] == [16384, 16384]
+    assert capped.model == inner.model
+
+
+def test_make_real_client_wraps_only_when_a_cap_is_given(monkeypatch):
+    from alpha_research.llm import OutputCapClient
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    plain = make_real_client("nvidia/x:free")
+    capped = make_real_client("nvidia/x:free", 16384)
+    assert isinstance(plain, ChatCompletionsLLMClient)
+    assert isinstance(capped, OutputCapClient) and capped.max_output == 16384
+    assert capped.model == "nvidia/x:free" and capped.provider == "nvidia"
+
+
+def test_research_llm_factory_applies_per_model_caps(monkeypatch):
+    from types import SimpleNamespace
+    from alpha_research.cli import _llm_factory
+    from alpha_research.llm import ChatCompletionsLLMClient, OutputCapClient
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    f = _llm_factory(SimpleNamespace(llm="real"), ["a/b:free", "groq:qwen/q"],
+                     {"a/b:free": 16384})
+    assert isinstance(f("a/b:free"), OutputCapClient) and f("a/b:free").max_output == 16384
+    assert isinstance(f("groq:qwen/q"), ChatCompletionsLLMClient)
+
+
+def test_list_models_without_ids_says_what_came_back():
+    with pytest.raises(LLMUnavailable, match="no model ids.*'OK'"):
+        list_models("nvidia", api_key="k", transport=lambda *a: (200, b"OK"))
+
+
+def test_retired_github_host_fails_clearly(monkeypatch):
+    for call in (lambda: make_real_client("github:openai/gpt-4.1-mini"),
+                 lambda: ChatCompletionsLLMClient("github:openai/gpt-4.1-mini", api_key="k"),
+                 lambda: list_models("github", api_key="k")):
+        with pytest.raises(LLMUnavailable, match="retired on 2026-07-30"):
+            call()
+
+
+def test_cerebras_client_sends_the_bare_name(monkeypatch):
+    monkeypatch.setenv("CEREBRAS_API_KEY", "k")
+    seen = {}
+
+    def transport(url, body, headers, timeout):
+        seen.update(url=url, body=json.loads(body))
+        return 200, json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode()
+
+    c = ChatCompletionsLLMClient("cerebras:gpt-oss-120b", transport=transport)
+    assert c.complete("s", "u") == "ok" and c.host == "cerebras" and c.provider == "openai"
+    assert seen["url"] == "https://api.cerebras.ai/v1/chat/completions"
+    assert seen["body"]["model"] == "gpt-oss-120b"
+
+
+def test_a_cut_off_reply_is_retried_like_a_server_error(monkeypatch):
+    # run 2026-11-23 crashed on http.client.IncompleteRead from a model host
+    import http.client
+    monkeypatch.setenv("GROQ_API_KEY", "dummy")
+    replies = [http.client.IncompleteRead(b"x"), hosted_reply("ok")]
+
+    def transport(url, body, headers, timeout):
+        r = replies.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
+    slept = []
+    llm = ChatCompletionsLLMClient("groq:qwen/qwen3.8-27b", transport=transport, sleep=slept.append)
+    assert llm.complete("s", "u") == "ok" and slept == [10.0]
+    always = lambda *a: (_ for _ in ()).throw(http.client.IncompleteRead(b""))
+    llm = ChatCompletionsLLMClient("groq:qwen/qwen3.8-27b", transport=always, sleep=lambda s: None)
+    with pytest.raises(LLMUnavailable, match="IncompleteRead"):
+        llm.complete("s", "u")
+
+
+def test_usage_is_read_from_hosted_replies(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "dummy")
+    body = json.loads(hosted_reply("ok")[1])
+    body["usage"] = {"total_tokens": 5123}
+    llm = ChatCompletionsLLMClient("groq:qwen/qwen3.8-27b",
+                                   transport=lambda *a: (200, json.dumps(body).encode()))
+    llm.complete("s", "u")
+    assert llm.last_usage == 5123
+
+
+class _Timed:
+    model, provider = "m", "x"
+
+    def __init__(self, usage=None):
+        self.last_usage, self.calls = usage, 0
+
+    def complete(self, system, user, *, max_output=4096):
+        self.calls += 1
+        return "r" * 400
+
+
+def test_pacing_waits_for_the_token_budget_before_sending():
+    from alpha_research.llm import PacedClient
+    now = [0.0]
+    slept = []
+
+    def sleep(s):
+        slept.append(round(s, 1))
+        now[0] += s
+    inner = _Timed(usage=5000)          # the host says each call cost 5,000 tokens
+    paced = PacedClient(inner, tokens_per_minute=8000, clock=lambda: now[0], sleep=sleep)
+    paced.complete("s" * 4000, "u")     # empty window: goes at once
+    assert slept == []
+    now[0] += 10
+    paced.complete("s" * 4000, "u")     # 5,000 + ~3,250 would pass 8,000: waits for the window
+    assert slept == [50.5] and inner.calls == 2
+
+
+def test_pacing_by_calls_per_minute():
+    from alpha_research.llm import PacedClient
+    now, slept = [0.0], []
+    paced = PacedClient(_Timed(), calls_per_minute=2, clock=lambda: now[0],
+                        sleep=lambda s: (slept.append(s), now.__setitem__(0, now[0] + s)))
+    paced.complete("s", "u")
+    paced.complete("s", "u")
+    assert slept == []
+    paced.complete("s", "u")            # third call in the same minute waits
+    assert len(slept) == 1 and slept[0] == pytest.approx(60.5)
+
+
+def test_make_real_client_adds_pacing(monkeypatch):
+    from alpha_research.llm import OutputCapClient, PacedClient
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    c = make_real_client("nvidia/x:free", 16384, {"tokens_per_minute": 8000})
+    assert isinstance(c, PacedClient) and isinstance(c.inner, OutputCapClient)
+    assert c.tokens_per_minute == 8000 and c.model == "nvidia/x:free"

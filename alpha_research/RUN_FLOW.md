@@ -16,18 +16,19 @@ cli research
  └─ 2. Start of run: seeds, recover lost results, resume open repairs
  └─ 3. For each round (up to --rounds):
  │     3.1 Seeds first
- │     3.2 Queued repairs take up to half the slots
+ │     3.2 Queued repair waves go first (whole waves, up to 2)
  │     3.3 Director allocates the remaining slots to arms
  │     3.4 For each arm with slots:
  │     │     a. Generator writes alphas (model call)
  │     │     b. Pre-Filter
  │     │     c. Critic (model call) + Debate judge (model call, contested only)
  │     │     d. Queue for BRAIN; when 8 are queued (or the round ends): flush
- │     3.5 Flush: simulate together on BRAIN, then for each alpha in order:
+ │     3.5 Flush: simulate together on BRAIN; each alpha is decided as it finishes:
  │     │     e. Simulator: submit, poll, fetch results and checks, store
  │     │     f. Evaluate: gates, risk, decision, overfitting, diversity, store
- │     │     g. Director credit
- │     │     h. Repair Agent writes a child (queued for a later round)
+ │     │     g. Director credit (a repair wave: once, when all its children are in)
+ │     │     h. Repair Agent writes a wave of up to 4 different fixes; when a wave is
+ │     │        done, the next wave starts from its best child or from the same parent
  │     3.6 Refill emptied slots (once)
  │     3.7 Every 2nd round: Strategy Evolution
  └─ 4. Lesson Writer (model call)
@@ -117,11 +118,15 @@ Three steps before round 1, in this order:
    but may have finished on BRAIN (`memory.unfinished_submissions()`) is polled once. If
    it finished, it is decided like any other result and credited to its arm. This costs no
    simulation budget.
-3. **Resume open repairs** (`_resume_repairs`). A repair decision in memory with no child
-   yet gets a child now: closest to accept first, at most `repair.max_resume` (3), only
-   for regions in this run. The child joins its arm's repair queue.
+3. **Resume open repairs** (`_resume_repairs`). An open repair in memory gets a new wave
+   now: closest to accept first, at most `repair.max_resume` (3) waves, only for regions
+   in this run. An original alpha in repair with no child starts from itself. Children of
+   one parent with no child of their own were a wave that stopped before its next one: the
+   next wave starts from the best of them if it got closer than the parent, else from the
+   parent again (`_next_start`), and not at all if one of them was accepted.
 
-   Console: `--- resumed 2 repair(s) from memory: [...]`
+   Console: `--- resumed 2 repair wave(s) from memory:` then one line per parent,
+   `    r01a36_001_r1  4 fixes: speed_up, neutralize_crowding, size_tilt, wrap_in_smoothing`
 
 ## 3. A round (`_round`)
 
@@ -131,11 +136,13 @@ Three steps before round 1, in this order:
 Queued seeds take one slot each. A seed's outcome does not update the Director
 (`credit=False`): a seed is not one of the arm's own ideas.
 
-### 3.2 Queued repairs take up to half the slots
-`repair.max_share_per_round: 0.5`, so ceil(0.5 × 5) = 3 of the 5 slots at most. The
-Repair Agent's children from earlier rounds (or resumed from memory) go first, taken in
-turn from each arm. Near misses are the cheapest chance of an accept, and an arm the
-Director gives no slot would otherwise never run its repairs.
+### 3.2 Queued repair waves go first
+Queued waves are taken whole, in turn from each arm, at most `repair.waves_per_round` (2)
+and at most `repair.max_share_per_round` (1.0) of the slots. A wave that does not fit what
+is left waits for the next round. Two waves of 4 fill one BRAIN batch of 8, so with
+`--per-round 12` a round is 8 repairs plus 4 new alphas. Near misses are the cheapest
+chance of an accept, and an arm the Director gives no slot would otherwise never run its
+repairs.
 
 ### 3.3 The Director allocates the rest (`_allocate`, `orchestrator.py`)
 This is how it decides what to work on:
@@ -284,12 +291,17 @@ Alphas wait in `sim_queue`. The queue is flushed when it holds
 count queued alphas as used, so a run never queues more than `--max-simulations`.
 
 ### 3.5 Flush: BRAIN, then decisions (`_flush` → `pipeline.py:Pipeline.process_many`)
-Console: `--- BRAIN: 5 alphas at once`
+Console: `--- BRAIN: simulating 5 alphas together`
 
 1. **Duplicate check** again, against memory and within the batch.
 2. **Simulator** (`simulator.py:Simulator.run_many`), see e.
-3. Then, **one alpha at a time in queue order**: register the variant, evaluate (f),
-   credit the Director (g), repair (h).
+3. **Each alpha is decided the moment its result is in** (owner 2026-11-23: a 25-minute
+   GLB alpha no longer holds up seven 3-minute ones): register the variant, evaluate (f),
+   credit the Director (g), repair (h). When a slot frees and a repair wave is ready, it is
+   screened like any repair and joins the running batch at once (`_top_up`; console
+   `--- BRAIN: 2 repair fix(es) join the running batch: ...`), within the simulation
+   budget and the round's `repair.waves_per_round`; `repair.fill_freed_slots: false`
+   turns this off. The round goes on when the last alpha of the batch is in.
 
 #### e. Simulator: submit, poll, fetch, store
 For each alpha:
@@ -304,11 +316,14 @@ For each alpha:
    BRAIN's simulation id → `pending_submissions` table.
 4. **Poll** until done: up to 8 at once; the next is submitted as soon as one finishes.
    Every 60 s:
-   `BRAIN: 5 running, 1 of 5 finished: r01a27_001_c1 6m40s 45%, ...`. A simulation past
+   one status line (`   6m40s  1 of 5 done, 4 running (BRAIN 15-45%)`) only when
+   `simulator.progress_every_seconds` is set (null since 2026-11-23: no periodic lines). A
+   simulation past
    `max_poll_seconds` (1200 s) becomes a `timeout`, which is recovered at a later run's
    start. Network errors are retried 3 times (1, 2, 4 s). A BRAIN-side error listed in
    `brain.yaml retry_error_messages` is resubmitted once.
-5. **Fetch** (console `BRAIN: <id> done on BRAIN, fetching its results and checks`): the
+5. **Fetch** (console `   7m02s  r01a27_001_c1  simulated, fetching results and checks ...`,
+   which a terminal overwrites with the result line): the
    alpha (`/alphas/<id>`: IS aggregates, checks), yearly stats, daily PnL, self-correlation
    and the full `/check` (submission checks, which can take minutes).
 6. **Translate** to our `ResultRecord`. Values become fractions, margin becomes bps, and
@@ -320,7 +335,8 @@ For each alpha:
 8. **Metric validator** notes (fitness recomputed, yearly consistency, margin).
 9. **Store the result** → `results` table, including the full daily PnL.
 
-Console: `BRAIN: rs20261114174347r01a27_001_c1 finished (3 of 5), complete: Sharpe 0.91, fitness 0.41, turnover 0.20`
+Console: `   7m30s  r01a27_001_c1  Sharpe  0.91  fitness  0.41  turnover  20%   (3 of 5)`
+(a repair child shows its fix: `r01a27_001_c1_r2a (neutralize_statistical)`)
 
 **Example result**, BRAIN alpha `mLa2vm82`:
 
@@ -392,7 +408,7 @@ Sharpe has the highest priority. Raw Sharpe 0.91 is below the near-miss bar of
 the factor route applies:
 
 ```
-rs20261114174347r01a27_001_c1 | repair | sharpe | 0.9100 | 0.4100 | 0.2040
+r01a27_001_c1 | repair / sharpe | Sharpe 0.91 | fitness 0.41 | turnover 20%
 reasons: ... "factor neutralization first: risk-neutralized Sharpe 2.28 vs raw 0.91",
          "playbook has sharpe levers"
 ```
@@ -402,23 +418,47 @@ reasons: ... "factor neutralization first: risk-neutralized Sharpe 2.28 vs raw 0
 (or its evolved successor) gets one success (accept) or one failure (anything else). The
 next allocation's draws reflect it immediately. Pending results and seeds are not credited.
 
-The example's repair counted as one failure for the Nemotron pv1/EUR arm.
+The example's repair counted as one failure for the Nemotron pv1/EUR arm. Repair-wave
+children are not credited one by one: the arm gets one credit when the whole wave is in
+(a success if any child was accepted).
 
-#### h. Repair Agent (`repair_agent.py:RepairAgent.repair`), model call only for model levers
-Only when the decision is **repair**:
-1. **Lineage budget** (`lever_stats.family_budget`). No child if:
-   - it would exceed generation `max_depth` (2);
-   - the lineage already used `max_trials_per_root` (4) repair simulations;
-   - `patience` (2) children in a row got no closer to accept;
+Overfitting is a flag only (`gates.brain_checks_only`): an accept whose deflated Sharpe
+misses `auditor.min_deflated_sharpe` stays an accept, and the console prints
+`  flag: <id>: overfitting: deflated Sharpe ...` (report: `overfitting_flags`).
+
+#### h. Repair Agent (`repair_agent.py:RepairAgent.repair_wave`), one model call per wave at most
+Only when the decision is **repair** and the alpha is not itself part of a wave (a wave
+child's next step is decided when its whole wave is in, see below):
+1. **Lineage budget** (`lever_stats.family_budget`), a cost limit now that overfitting is
+   a flag only. No wave if:
+   - it would exceed generation `max_depth` (3);
+   - the lineage already used `max_trials_per_root` (12) repair simulations;
+   - `patience` (8, two waves) children in a row got no closer to accept;
    - any member of the lineage was already accepted.
 2. **Rank the levers** for the failure class (`rank_levers`): the learned success rate of
    each (class, lever) from every earlier parent→child pair in memory, per region with
    shrinkage toward all regions, plus a bonus for levers that also help the alpha's other
    failing classes. `flip_sign` is pinned first and `model_repair` last. On the "factor
    neutralization first" route, the `neutralize_*` levers go first and `flip_sign` is
-   skipped.
-3. Levers already used in this lineage are skipped. The first lever that applies makes
-   the child:
+   skipped. **Gain match:** each (class, lever) also keeps its past gains (e.g. +0.35
+   Sharpe); when this alpha misses a class by a known amount, a lever's estimate blends
+   in the chance its past gain covers that amount (`repair.gain_weight` 0.5, after
+   `min_gain_evidence` 2 gains). A lever that improved alphas a lot without carrying them
+   over the bar ranks first for an alpha that needs less. The reward itself counts an
+   improvement by the share of the gap it closed (1.20 -> 1.50 against 1.58: 0.79), not a
+   flat 0.5.
+3. **The wave.** Levers of every class the alpha fails (primary first), skipping levers
+   used along the lineage and levers already tried on this same parent. One lever of each
+   kind of change (smoothing, shape, neutralization, universe/tilt, data, sign, each model
+   lever; `repair_agent.LEVER_KINDS`) goes first in rank order, then a second of any kind;
+   levers that helped a sibling in the last wave go before all of them; `model_repair`
+   stays last. The wave's size depends on the alpha (`lever_stats.wave_size`): 4 fixes at
+   distance to accept <= 0.15, 2 up to 0.4, none beyond (`repair.wave_tiers`), and none
+   when its best Sharpe (raw or risk-neutralized) is below 0.8 x the bar
+   (`value_sharpe_share`) or it fails a BRAIN check no lever fixes, such as the ASI checks
+   (`blocked_fixes`): the decision stays "repair" but nothing is queued. Those
+   levers that apply make the children, with at most `repair.model_levers_per_wave` (1)
+   model-written fix:
    - **mechanical levers**, no model: `increase_decay`, `neutralize_statistical`,
      `size_tilt` (× (0.25 + rank(cap))), `speed_up`, `backfill_fields`, `rank_transform`,
      ...;
@@ -427,8 +467,14 @@ Only when the decision is **repair**:
      failed, the lever and its step, `<past_repairs>` that worked, the Lesson Writer's
      `<lessons>`, `<pool>`, `<partner_fields>` for `blend_other_dataset`). The reply is
      validated like any model expression.
-4. The child, id `<parent>_r<generation>`, joins **this arm's repair queue**. It runs in
-   a later round, ahead of new ideas (3.2).
+4. The children, ids `<parent>_r<generation>a`, `b`, `c`, `d`, join **this arm's repair
+   queue** as one wave. They run together in a later round, ahead of new ideas (3.2).
+5. **When the whole wave is in** (`_finish_wave`): one Director credit; if a child was
+   accepted the lineage is done. Otherwise the next wave starts from the child closest to
+   accept, if it is closer than the parent, with the levers of the other children that
+   got closer first; if no child got closer, from the same parent with its next 4 levers.
+   Console: `  repair wave <parent>/w1 done: next from <child>: distance to accept 0.84 -> 0.31; wave [...]`.
+   Report: `repair_waves` (each wave's fixes, results and what came next).
 
 **Example.** The lever chosen was `neutralize_statistical`. The expression stayed the
 same and the neutralization changed from SECTOR to STATISTICAL. The child is
@@ -444,7 +490,7 @@ same and the neutralization changed from SECTOR to STATISTICAL. The child is
 
 Decision: **repair / recent_sharpe** (recent_sharpe comes before sub_universe in the
 priority list). The lineage then hit the depth limit, since a further child would be
-generation 3 > `max_depth` 2. The owner rescued it by hand with `cli repair` and
+generation 3 > `max_depth` 2 (the limit then; now 3, and the repair goes in waves of 4). The owner rescued it by hand with `cli repair` and
 `cli run` (files `candidates/rescue_20261115_*.json`). After 38 variants,
 `hand_20261115_eur_37_blend_half_analyst` was accepted: the reversal blended 1:1 with
 analyst69 revision breadth and tilted by size, with PROD_CORRELATION 0.645 (BRAIN
@@ -536,7 +582,7 @@ Not stored:
 - the Pre-Filter's drops (they are in the run report).
 
 The repair queue lives in memory only, but nothing is lost: at the next start,
-`_resume_repairs` rebuilds children for repair decisions that have none.
+`_resume_repairs` starts a wave for open repairs (see 2.3).
 
 ## What each model call costs (per arm batch)
 

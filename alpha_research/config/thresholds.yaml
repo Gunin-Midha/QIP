@@ -65,10 +65,12 @@ diversity:
 auditor:
   os_is_ratio_floor: null         # OQ-8
   deflation_method: "expected_max_normal"   # documented in auditor.py
-  # Overfitting guard (owner 2026-11-04: ensure no overfitting; values are builder defaults,
-  # OQ-16). An accept is rejected unless its Sharpe, deflated for the number of trials
-  # (auditor.py), stays above min_deflated_sharpe. trials_scope: lineage (its repair
-  # family) | dataset (every simulation on its dataset) | all.
+  # Overfitting check (builder defaults, OQ-16): an accept's Sharpe, deflated for the
+  # number of trials (auditor.py), is compared with min_deflated_sharpe. With
+  # gates.brain_checks_only (owner 2026-11-14, confirmed 2026-11-23) a miss never rejects:
+  # it is recorded on the decision and printed as a flag ("overfitting_flags" in the run
+  # report). trials_scope: lineage (its repair family) | dataset (every simulation on its
+  # dataset) | all.
   min_deflated_sharpe: 0.0
   trials_scope: dataset
 
@@ -98,11 +100,13 @@ repair:
 
 # Simulator
 simulator:
-  max_poll_seconds: 1200   # GLB simulations took over 600 s (run rs20261111162604)
+  max_poll_seconds: 1800   # GLB simulations took over 600 s (run rs20261111162604); ASI
+                           # model110 repairs were still running after 18 min (2026-11-23)
   poll_interval_seconds: 5
   max_retries: 3
-  progress_every_seconds: 60      # status line while simulations run (each alpha's BRAIN
-                                  # progress); null = only a line as each one finishes
+  progress_every_seconds: null    # status line every N s while simulations run; null = only
+                                  # a line as each one finishes (owner 2026-11-23: no
+                                  # periodic status lines)
   max_concurrent: 8               # simulations on BRAIN at once (owner 2026-11-14: 8 ran together
                                   # with no 429). OQ-3: the account's real limit may be higher;
                                   # over it BRAIN answers 429 and the client waits for a slot

@@ -264,7 +264,10 @@ class Simulator:
                  max_concurrent: int | None = None,
                  on_done: Callable[[ResultRecord, int, int], None] | None = None,
                  on_status: Callable[[dict], None] | None = None,
-                 on_ready: Callable[[str], None] | None = None) -> list[ResultRecord]:
+                 on_ready: Callable[[str], None] | None = None,
+                 on_result: Callable[[CandidateRecord, ResultRecord], None] | None = None,
+                 more: Callable[[int], list[CandidateRecord]] | None = None
+                 ) -> list[ResultRecord]:
         """Results in the order of ``candidates``, each persisted as it finishes. At most
         ``max_concurrent`` (default ``simulator.max_concurrent``) run on BRAIN at a time; a
         resumed pending submission takes a slot too. Each simulation has its own
@@ -274,22 +277,35 @@ class Simulator:
         ``simulator.progress_every_seconds`` while alphas run: {"running": [(candidate id,
         seconds since submission, BRAIN's progress or None)], "waiting", "finished",
         "total"}. ``on_ready(candidate id)`` is called when BRAIN has finished an alpha and
-        its results are being fetched, for a client with an ``on_ready`` hook."""
+        its results are being fetched, for a client with an ``on_ready`` hook.
+        ``on_result(candidate, result)`` is called with each persisted result as soon as it
+        is in (invalid ones at once), so a caller can decide it without waiting for the
+        batch. ``more(free slots)`` is asked after each result for alphas to add to the
+        running batch (a freed slot is used at once); their results come through
+        ``on_result`` and are appended to the returned list."""
         limit = max(1, max_concurrent or self.config.simulator.max_concurrent)
         results: list[ResultRecord | None] = [None] * len(candidates)
         waiting: deque[_Job] = deque()
-        for i, candidate in enumerate(candidates):
+
+        def add(i: int, candidate: CandidateRecord) -> bool:
+            """Queue one alpha; False when it is invalid (its result is recorded now)."""
             errors = local_validation_errors(candidate, self.config)  # may raise ConfigError
             self.memory.put_candidate(candidate)
             if errors:
                 results[i] = self._persist(ResultRecord(
                     candidate_id=candidate.candidate_id, status="invalid",
                     notes=[f"invalid: {e}" for e in errors]))
-                continue
+                if on_result is not None:
+                    on_result(candidate, results[i])
+                return False
             sim_id = self.memory.pending_sim_id(candidate.candidate_id)
             if sim_id is not None:
                 log.info("resuming pending submission %s for %s", sim_id, candidate.candidate_id)
             waiting.append(_Job(i, candidate, sim_id))
+            return True
+
+        for i, candidate in enumerate(candidates):
+            add(i, candidate)
 
         active: list[_Job] = []
         total = len(waiting)
@@ -301,23 +317,38 @@ class Simulator:
                 job = next((j for j in active if j.sim_id == sim_id), None)
                 on_ready(job.candidate.candidate_id if job else sim_id)
             self.client.on_ready = ready
+        def topup() -> int:
+            """Alphas ``more`` adds to the batch; returns how many were queued."""
+            free = limit - len(active) - len(waiting)
+            if more is None or free <= 0:
+                return 0
+            added = 0
+            for candidate in more(free):
+                results.append(None)
+                added += add(len(results) - 1, candidate)
+            return added
+
         try:
             return self._loop(waiting, active, results, limit, total, on_done, on_status, every,
-                              last_status)
+                              last_status, on_result, topup)
         finally:
             if hooked:
                 self.client.on_ready = None
 
     def _loop(self, waiting, active, results, limit, total, on_done, on_status, every,
-              last_status) -> list[ResultRecord]:
+              last_status, on_result=None, topup=None) -> list[ResultRecord]:
         finished = 0
 
         def done(job: _Job, result: ResultRecord) -> None:
-            nonlocal finished
+            nonlocal finished, total
             results[job.index] = self._done(job, result)
             finished += 1
             if on_done is not None:
                 on_done(results[job.index], finished, total)
+            if on_result is not None:
+                on_result(job.candidate, results[job.index])
+            if topup is not None:
+                total += topup()
 
         while waiting or active:
             while waiting and len(active) < limit:

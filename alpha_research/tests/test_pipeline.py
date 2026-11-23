@@ -51,7 +51,7 @@ def test_pipeline_acceptance(tmp_path, config, playbook):
 
     lines = out.strip().splitlines()
     assert len(lines) == 31
-    assert lines[0].startswith("acc_01 | accept | none | 1.8500 | ")
+    assert lines[0].startswith("acc_01 | accept | Sharpe 1.85 | ")
 
     assert pipe.pool.count() == 5
     assert pipe.pool.matrix().shape[1] == 5
@@ -83,7 +83,7 @@ def test_cli_success(tmp_path, capsys):
                    "--playbook", str(PLAYBOOK), "--fixtures-dir", str(BRAIN_DIR),
                    "--data-dir", str(tmp_path / "d")])
     assert rc == 0
-    assert "div_01 | reject | self_correlation" in capsys.readouterr().out
+    assert "div_01 | reject / self_correlation" in capsys.readouterr().out
 
 
 def test_cli_config_error_when_holdout_unset(tmp_path, no_holdout_config):

@@ -87,8 +87,10 @@ from .evaluator import FACTOR_FIRST
 from .fastexpr import (Assign, Binary, Call, ComplexityLimits, FastExprError, FastExprSpec,
                        Name, Num, Unary, analyze, catalog, catalog_for, parse, render)
 from .generator import GenerationError, ask_json, crowded_fields, dataset_category, field_role
-from .lever_stats import (LeverStats, RepairLearningConfig, combo_parts, failing_classes,
-                          family_budget, rank_levers, repair_events, successful_examples)
+from .lever_stats import (PINNED_LAST, LeverStats, RepairLearningConfig, combo_parts,
+                          failing_classes, wave_size,
+                          family_budget, needs, rank_levers, repair_events,
+                          successful_examples)
 from .llm import LLMClient, ModelDown
 from .memory import MemoryStore
 from .prompts import repair_system, repair_user
@@ -110,6 +112,28 @@ class RepairOutcome:
     lever: str | None = None
     notes: list[str] = field(default_factory=list)
     llm_calls: int = 0
+    children: list[CandidateRecord] = field(default_factory=list)   # a wave (repair_wave)
+
+
+# what kind of change a lever makes: a wave tries one lever of each kind before a second of
+# any kind, so its fixes are different ideas, not near copies (model levers: their own kind)
+LEVER_KINDS = {
+    "increase_decay": "smoothing", "speed_up": "smoothing", "lengthen_ts_window": "smoothing",
+    "wrap_in_smoothing": "smoothing", "hump": "smoothing",
+    "rank_transform": "shape", "winsorize": "shape", "volatility_scale": "shape",
+    "tighten_truncation": "shape",
+    "set_neutralization": "neutralization",
+    "change_universe": "universe", "liquidity_tilt": "universe", "size_tilt": "universe",
+    "backfill_fields": "data", "flip_sign": "sign",
+}
+
+
+def lever_kind(name: str) -> str:
+    if name.startswith("neutralize_"):
+        return "neutralization"
+    if combo_parts(name):
+        return "combination"
+    return LEVER_KINDS.get(name, name)
 
 
 # ---------------------------------------------------------------------------
@@ -650,7 +674,8 @@ class RepairAgent:
                result: ResultRecord | None, stats: LeverStats) -> list[tuple[Lever, float]]:
         failing = failing_classes(decision, result) | {decision.failure_class}
         ranked = rank_levers(self.playbook, decision.failure_class, failing, stats,
-                             self.learning, self.rng, region=candidate.region)
+                             self.learning, self.rng, region=candidate.region,
+                             need=needs(decision, result, failing))
         if any(r.startswith(FACTOR_FIRST) for r in decision.reasons):
             # BRAIN's risk-neutralized Sharpe is far better than the raw one: remove the
             # factors first, and never flip the sign of a signal that only needs them gone
@@ -686,6 +711,101 @@ class RepairAgent:
         out.notes.append("repair exhausted: every lever for this failure class was tried or "
                          "did not apply")
         return out
+
+    def repair_wave(self, candidate: CandidateRecord, decision: DecisionRecord,
+                    result: ResultRecord | None = None,
+                    pool_expressions: list[str] | None = None, *,
+                    size: int | None = None,
+                    priority: Collection[str] = ()) -> RepairOutcome:
+        """Up to ``size`` (``fixes_per_wave``) children of different levers, to simulate
+        together. Levers come from every class the alpha fails (primary first), skipping
+        levers along its lineage and levers already tried on this same parent (an earlier
+        wave); ``priority`` levers (ones that helped a sibling) go first, then one lever of
+        each kind (LEVER_KINDS) in rank order before a second of any kind. At most
+        ``model_levers_per_wave`` model levers are tried, since model calls are the scarce
+        budget. The lineage's repair budget caps the wave."""
+        out = RepairOutcome(candidate.candidate_id)
+        if not self.playbook.entries.get(decision.failure_class):
+            out.notes.append(f"no playbook entry for {decision.failure_class!r}")
+            return out
+        events, stats, outcomes = self.evidence()
+        left, why = family_budget(candidate, outcomes, self.learning)
+        if left <= 0:
+            out.notes.append(f"no repair: {why}")
+            return out
+        if size is None:
+            size, why = wave_size(decision, result, self.learning, self.playbook)
+            out.notes.append(f"wave size {size}: {why}")
+        size = min(size, left)
+        if size <= 0:
+            out.notes.append("no repair: wave size 0")
+            return out
+        tried = set(self.memory.lineage_levers(candidate.candidate_id))
+        tried |= {r["candidate"].lever for r in outcomes
+                  if r["candidate"].parent_id == candidate.candidate_id and r["candidate"].lever}
+        options = self._wave_options(candidate, decision, result, stats, tried, priority)
+        out.notes.append("wave order: " + ", ".join(lv.name for _, lv in options))
+        seen = {(candidate.expression, candidate.universe, candidate.decay,
+                 candidate.neutralization, candidate.truncation)}
+        model_tries = 0
+        for d, lever in options:
+            if len(out.children) >= size:
+                break
+            mechanical = lever.name in MECHANICAL or (
+                combo_parts(lever.name) and all(x in MECHANICAL for x in combo_parts(lever.name)))
+            if not mechanical:
+                if self.llm is None or model_tries >= self.learning.model_levers_per_wave:
+                    continue
+                model_tries += 1
+            child = self._try(candidate, lever, d, result, pool_expressions, events, out)
+            if child is None:
+                continue
+            key = (child.expression, child.universe, child.decay, child.neutralization,
+                   child.truncation)
+            if key in seen:
+                out.notes.append(f"{lever.name}: same experiment as another fix in this wave")
+                continue
+            seen.add(key)
+            if self.memory.has_result_for_hash(experiment_hash(child)):
+                out.notes.append(f"{lever.name}: skipped (this experiment is already in memory)")
+                continue
+            out.children.append(dataclasses.replace(
+                child, candidate_id=self._free_id(child.candidate_id, out.children)))
+            out.notes.append(f"{lever.name}: applied")
+        if out.children:
+            out.child, out.lever = out.children[0], out.children[0].lever
+        else:
+            out.notes.append("repair exhausted: every lever for the failing classes was "
+                             "tried or did not apply")
+        return out
+
+    def _wave_options(self, candidate, decision, result, stats, tried,
+                      priority) -> list[tuple[DecisionRecord, Lever]]:
+        """(decision with the lever's class as failure class, lever) in wave order."""
+        failing = failing_classes(decision, result) | {decision.failure_class}
+        order = [decision.failure_class] + sorted(failing - {decision.failure_class})
+        ranked: list[tuple[DecisionRecord, Lever]] = []
+        names: set[str] = set()
+        for cls in order:
+            if not self.playbook.entries.get(cls):
+                continue
+            d = dataclasses.replace(decision, failure_class=cls)
+            for lever, _ in self.ranked(candidate, d, result, stats):
+                if lever.name not in tried and lever.name not in names:
+                    names.add(lever.name)
+                    ranked.append((d, lever))
+        first = [x for p in priority for x in ranked if x[1].name == p]
+        last = [x for x in ranked if x[1].name in PINNED_LAST and x not in first]
+        rest = [x for x in ranked if x not in first and x not in last]
+        kinds = {lever_kind(lv.name) for _, lv in first}
+        spread = []
+        for x in rest:   # one lever per kind, in rank order
+            k = lever_kind(x[1].name)
+            if k not in kinds:
+                kinds.add(k)
+                spread.append(x)
+        # the catch-all model_repair stays last: it costs a model call
+        return first + spread + [x for x in rest if x not in spread] + last
 
     def variants(self, candidate: CandidateRecord, decision: DecisionRecord,
                  result: ResultRecord | None = None, *, limit: int | None = None,

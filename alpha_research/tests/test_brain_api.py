@@ -681,7 +681,7 @@ def fake_cli_session(monkeypatch, bcfg):
     def _install(routes):
         transport = FakeTransport(routes)
         holder["transport"] = transport
-        monkeypatch.setattr(cli, "make_session", lambda cfg, on_biometric=None: BrainSession(
+        monkeypatch.setattr(cli, "make_session", lambda cfg, on_biometric=None, ask_credentials=None: BrainSession(
             transport, "me@example.com", SECRET, sleep=lambda s: None, on_biometric=on_biometric))
         monkeypatch.setattr(cli.time, "sleep", lambda s: None)
         return transport
@@ -974,3 +974,34 @@ def test_cli_brain_logout(tmp_path, capsys):
     assert not path.exists() and "deleted the saved BRAIN session" in capsys.readouterr().out
     assert cli.main(["brain", "logout", "--brain-config", str(cfg)]) == 0
     assert "no saved BRAIN session" in capsys.readouterr().out
+
+
+def test_an_expired_session_asks_for_the_login_when_it_can(monkeypatch):
+    # 2026-11-23: a run stopped because the saved session expired and the terminal had no
+    # BRAIN_EMAIL/BRAIN_PASSWORD; in a terminal the session now asks instead
+    monkeypatch.delenv(brain_api.EMAIL_ENV_VAR, raising=False)
+    monkeypatch.delenv(brain_api.SECRET_ENV_VAR, raising=False)
+    cfg = brain_api.brain_config_from_dict({"settings": {"instrumentType": "EQUITY"}})
+    asked = []
+    ask = lambda: asked.append(1) or ("me@example.com", SECRET)
+    t = SavedFake({("GET", "/operators"): [ok(status=401), ok([])]})
+    s = brain_api.make_session(cfg, transport=t, ask_credentials=ask)
+    s.request("GET", "/operators")
+    assert asked == [1] and t.paths() == ["/operators", "/authentication", "/operators"]
+    assert t.saves == 1
+    # no saved session and no credentials: allowed when it can ask, asked at first use
+    fresh = SavedFake({("GET", "/operators"): [ok([])]}, restored=False)
+    s = brain_api.make_session(cfg, transport=fresh, ask_credentials=ask)
+    s.request("GET", "/operators")
+    assert asked == [1, 1]
+
+
+def test_prompt_credentials_prefers_the_environment(monkeypatch):
+    monkeypatch.setenv(brain_api.EMAIL_ENV_VAR, "me@example.com")
+    monkeypatch.delenv(brain_api.SECRET_ENV_VAR, raising=False)
+    monkeypatch.setattr(brain_api.getpass, "getpass", lambda prompt: "typed")
+    monkeypatch.setattr("builtins.input", lambda prompt: pytest.fail("email is in the env"))
+    assert brain_api.prompt_credentials() == ("me@example.com", "typed")
+    monkeypatch.setattr(brain_api.getpass, "getpass", lambda prompt: "")
+    with pytest.raises(BrainAuthError, match="no BRAIN login"):
+        brain_api.prompt_credentials()

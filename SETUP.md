@@ -53,7 +53,10 @@ any key. If they fail, stop here and ask in the group.
 | Gemini | aistudio.google.com | Sign in, **Get API key**, **Create API key**. Then open aistudio.google.com/rate-limit and check that `gemini-3.6-flash` is listed for free. |
 | Groq (for Qwen and gpt-oss) | console.groq.com | Sign up, **API Keys**, **Create API Key**. Check that `qwen/qwen3.8-27b` and `gpt-oss-120b` are in **Models**. |
 | NVIDIA (for Llama and DeepSeek) | build.nvidia.com | Sign in (may ask for phone verification), open any model, **Get API Key**. The key starts with `nvapi-`. |
-| GitHub Models (optional, hosted GPT) | github.com/settings/tokens | **Fine-grained token**, permission **Models: read**. About 50 calls a day. |
+| OpenRouter (for the `:free` generators) | openrouter.ai | Sign in, **Settings → Keys → Create Key**. Free models share about 50 calls a day (about 1,000 after buying $10 of credit). |
+| Cerebras (optional) | cloud.cerebras.ai | **API Keys**. No permanent free tier as of 2026-11: a trial credit for 30 days that may need a card. Ids are bare names, e.g. `cerebras:gpt-oss-120b`. |
+
+GitHub Models is not an option any more: GitHub retired it on 2026-07-30.
 
 Treat a key like a password. Never paste it into chat, a file in the repo, or a commit.
 
@@ -68,7 +71,8 @@ read -s BRAIN_PASSWORD && export BRAIN_PASSWORD
 read -s GEMINI_API_KEY && export GEMINI_API_KEY
 read -s GROQ_API_KEY && export GROQ_API_KEY
 read -s NVIDIA_API_KEY && export NVIDIA_API_KEY
-read -s GITHUB_MODELS_TOKEN && export GITHUB_MODELS_TOKEN   # only if you made one
+read -s OPENROUTER_API_KEY && export OPENROUTER_API_KEY
+read -s CEREBRAS_API_KEY && export CEREBRAS_API_KEY         # only if you made one
 ```
 
 Type the line exactly as shown: the word after `read -s` is the variable's name, not your
@@ -85,7 +89,10 @@ BRAIN may ask for biometric verification on every new login (our consultant acco
 does). The command then prints a link: open it in a browser, verify, come back to the
 terminal and press Enter. The session is then saved (outside the repo, in
 `~/.config/qip/brain_session.txt`, readable only by you) and the next commands reuse it, so
-you verify again only when BRAIN ends the session. `brain logout` deletes it.
+you verify again only when BRAIN ends the session. When it does, even in the middle of
+a research run, the command asks for your BRAIN email and password in the terminal (if
+they are not exported) and then for the biometric check, and carries on. `brain logout`
+deletes it.
 
 ```bash
 PYTHONPATH=src python3 -m alpha_research.cli brain auth          # login works?

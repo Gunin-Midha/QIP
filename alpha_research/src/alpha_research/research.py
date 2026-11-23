@@ -61,6 +61,7 @@ import dataclasses
 import hashlib
 import json
 import math
+import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -70,7 +71,7 @@ from typing import Callable, TextIO
 
 import yaml
 
-from .brain_client import BrainClient
+from .brain_client import BrainClient, BrainLoginRequired
 from .config import Config, ConfigError
 from .critic import Critic, DebateJudge, ReviewOutcome, SparseFieldRule, review_and_debate
 from .compare import arm_models, model_comparison
@@ -187,6 +188,15 @@ class ModelsConfig:
     debate: str
     repair: str
     strategy: str
+    # model id -> output cap that replaces the agents' cap on every call to that model
+    # (reasoning models think inside the cap; e.g. 16384 for a model that needs room)
+    max_output: dict = field(default_factory=dict)
+    # model id -> {calls_per_minute, tokens_per_minute}: free-tier limits to pace calls to
+    pace: dict = field(default_factory=dict)
+    # how an arm's primary critic is chosen among the critics from another maker that are
+    # up: "balanced" (the one with the fewest calls so far this run, ties in list order) or
+    # "first" (the first listed)
+    critic_pick: str = "balanced"
 
     def all_models(self) -> list[str]:
         return list(dict.fromkeys([*self.generator, *self.critic, self.prefilter, self.debate,
@@ -313,9 +323,27 @@ def models_config_from_dict(sec) -> ModelsConfig:
     shadows = sec.get("shadow_critics")
     if not isinstance(shadows, bool):
         raise ConfigError("agents config: models.shadow_critics must be true or false")
+    caps = sec.get("max_output") or {}
+    if not isinstance(caps, dict) or not all(
+            isinstance(m, str) and m and isinstance(v, int) and not isinstance(v, bool)
+            and v >= 256 for m, v in caps.items()):
+        raise ConfigError("agents config: models.max_output must map model ids to "
+                          "integers >= 256")
+    pace = sec.get("pace") or {}
+    keys = {"calls_per_minute", "tokens_per_minute"}
+    if not isinstance(pace, dict) or not all(
+            isinstance(m, str) and isinstance(v, dict) and v and set(v) <= keys
+            and all(isinstance(x, int) and not isinstance(x, bool) and x >= 1 for x in v.values())
+            for m, v in pace.items()):
+        raise ConfigError("agents config: models.pace must map model ids to "
+                          "{calls_per_minute, tokens_per_minute} positive integers")
+    pick = sec.get("critic_pick", "balanced")
+    if pick not in ("balanced", "first"):
+        raise ConfigError("agents config: models.critic_pick must be balanced or first")
     return ModelsConfig(default=default, generator=_model_list(sec, "generator", default),
                         critic=_model_list(sec, "critic", default), shadow_critics=shadows,
-                        **single)
+                        max_output=dict(caps), pace={m: dict(v) for m, v in pace.items()},
+                        critic_pick=pick, **single)
 
 
 def agents_config_from_dict(raw) -> AgentsConfig:
@@ -398,6 +426,11 @@ class ArmPlan:
     sources: deque = field(default_factory=deque)   # Source objects, used round-robin
     guidance: str | None = None
     catalog: Path | None = None   # the region/delay's datafield catalog (plan v2)
+
+
+def _short_id(candidate_id: str) -> str:
+    """A candidate id without its research run prefix (rs + 14 digits), for the console."""
+    return re.sub(r"^rs\d{14}", "", candidate_id) or candidate_id
 
 
 def arm_label(key: tuple) -> str:
@@ -721,12 +754,22 @@ class ResearchRun:
         # alphas screened and waiting for BRAIN: sent simulator.max_concurrent at a time
         # (OQ-3), then decided in order (_flush)
         self.sim_queue: list[tuple[tuple, CandidateRecord, dict, bool]] = []
+        self._in_flight = 0   # alphas of the current batch not decided yet (budget counts them)
+        self._round_waves = 0  # repair waves started this round (repair.waves_per_round)
         self.max_concurrent = max(1, config.simulator.max_concurrent)
         self.log: list[dict] = []
         self.stop_reason: str | None = None
         self.resumed: list[dict] = []
         self.power_pool: list[dict] = []   # Power Pool candidates this run (recorded only)
         self.recovered: list[dict] = []
+        self._resume_rows: list[tuple] = []
+        # repair waves (owner 2026-11-23): fixes_per_wave children of one parent simulated
+        # together; when all are decided the next wave starts from the best child if it got
+        # closer to accept, else from the same parent with its next levers
+        self.waves: dict[str, dict] = {}       # wave id -> {arm, parent, children, pending, done}
+        self.wave_of: dict[str, str] = {}      # child id -> wave id, until it is decided
+        self.wave_log: list[dict] = []
+        self.overfitting_flags: list[dict] = []   # deflated-Sharpe misses, recorded only
         self.warm_started = self._warm_start()
         self.region_sims, self.run_regions = self._pick_regions()
 
@@ -753,14 +796,21 @@ class ResearchRun:
         return dict(self.counter.down)
 
     def _critics_for(self, key: tuple) -> tuple[str | None, list[str]]:
-        """(primary critic model, shadow critic models) for an arm. The primary is the
-        first critic from another provider that is not down; with none left, the rules-only
-        critic (None)."""
+        """(primary critic model, shadow critic models) for an arm. The primary is a critic
+        from another provider that is not down: the one with the fewest model calls so far
+        in this run (``models.critic_pick: balanced``, ties in list order, so no single
+        model carries every arm's review into its rate limit) or the first listed
+        (``first``); with none left, the rules-only critic (None)."""
         if not self.agents.critic_model:
             return None, []
         g = provider_of(key[3])
-        primary = next((c for c in self.models.critic
-                        if provider_of(c) != g and c not in self.counter.down), None)
+        eligible = [c for c in self.models.critic
+                    if provider_of(c) != g and c not in self.counter.down]
+        if self.models.critic_pick == "balanced" and eligible:
+            primary = min(eligible, key=lambda c: (self.counter.by_model.get(c, 0),
+                                                   eligible.index(c)))
+        else:
+            primary = eligible[0] if eligible else None
         shadows = ([cm for cm in self.critics
                     if cm not in (primary, None) and cm not in self.counter.down]
                    if self.models.shadow_critics else [])
@@ -778,15 +828,26 @@ class ResearchRun:
         return key if key in self.arms else None
 
     def _warm_start(self) -> int:
+        """Credit the Director with every decided alpha in memory, counted the way a run
+        counts them: repair children of one parent (its waves) as one result, a success
+        when any of them was accepted; every other alpha as itself."""
         n = 0
         outcomes = self.memory.candidate_outcomes()
         models = arm_models(outcomes, self.memory.critic_reviews())
+        waves: dict[str, list[tuple[tuple, bool]]] = {}
         for row in outcomes:
             c, d = row["candidate"], row["decision"]
             key = self._arm_of(c, models.get(c.candidate_id))
-            if d is not None and d.decision in DECIDED and key is not None:
-                self.director.update(key, d.decision == "accept")
-                n += 1
+            if d is None or d.decision not in DECIDED or key is None:
+                continue
+            if c.parent_id and c.lever and c.lever != "critic_revision":
+                waves.setdefault(c.parent_id, []).append((key, d.decision == "accept"))
+                continue
+            self.director.update(key, d.decision == "accept")
+            n += 1
+        for members in waves.values():
+            self.director.update(members[0][0], any(ok for _, ok in members))
+            n += 1
         return n
 
     def _pick_regions(self) -> tuple[dict[str, int], list[str] | None]:
@@ -841,37 +902,164 @@ class ResearchRun:
     # ------------------------------------------------------------------ run
 
     def _resume_repairs(self) -> None:
-        """Queue a child for the repair decisions in memory that have no child yet, closest
-        to accept first, at most ``repair.max_resume``; the Repair Agent's lineage budget
-        still applies to each."""
+        """Start a repair wave for the open repairs in memory, closest to accept first, at
+        most ``repair.max_resume`` waves; the lineage budget still applies to each. An open
+        root (a repair decision with no child) starts from itself. Children of one parent
+        with no child of their own were a wave that stopped before its next one: the next
+        wave starts from the best of them if it got closer than the parent, else from the
+        parent again (_next_start)."""
         outcomes = self.memory.candidate_outcomes()
         parents = {row["candidate"].parent_id for row in outcomes}
+        by_id = {row["candidate"].candidate_id: row for row in outcomes}
         models = arm_models(outcomes, self.memory.critic_reviews())
         cfg = self.agents.repair
-        open_rows = []
+        roots, groups = [], {}
         for row in outcomes:
             c, d = row["candidate"], row["decision"]
-            if d is None or d.decision != "repair" or c.candidate_id in parents:
+            if d is None or c.candidate_id in parents:
                 continue
-            key = self._arm_of(c, models.get(c.candidate_id))
+            if c.parent_id and c.parent_id in by_id:
+                groups.setdefault(c.parent_id, []).append(row)
+            elif d.decision == "repair":
+                roots.append((row, row, ()))
+        starts = []
+        for pid, rows in groups.items():
+            if any(r["decision"].decision == "accept" for r in rows):
+                continue   # the wave already produced an accept: the lineage is done
+            parent = by_id[pid]
+            start = self._next_start(
+                (parent["candidate"], parent["decision"], parent["result"]),
+                [(r["candidate"], r["decision"], r["result"]) for r in rows])
+            if start is not None:
+                c, d, res, priority, _ = start
+                starts.append(({"candidate": c, "decision": d, "result": res}, parent, priority))
+        for row, origin, priority in roots + starts:
+            c = row["candidate"]
+            key = self._arm_of(c, models.get(c.candidate_id) or
+                               models.get(origin["candidate"].candidate_id))
             if key is None or not self._in_run(key):
                 continue
-            dist = distance(d, row["result"], cfg.unmeasured_failure_penalty)
-            open_rows.append((float("inf") if dist is None else dist, len(open_rows), key, row))
-        open_rows.sort(key=lambda t: (t[0], t[1]))
-        for _, _, key, row in open_rows:
-            if sum(1 for i in self.resumed if "child" in i) >= cfg.max_resume:
+            dist = distance(row["decision"], row["result"], cfg.unmeasured_failure_penalty)
+            starts_row = (float("inf") if dist is None else dist, c.candidate_id, key, row,
+                          priority)
+            self._resume_rows.append(starts_row)
+        self._resume_rows.sort(key=lambda t: (t[0], t[1]))
+        for _, _, key, row, priority in self._resume_rows:
+            if sum(1 for i in self.resumed if i.get("children")) >= cfg.max_resume:
                 break
-            c, d = row["candidate"], row["decision"]
-            rep = self.repairer.repair(c, d, row["result"], self._pool_expressions())
+            c = row["candidate"]
+            rep = self._start_wave(key, c, row["decision"], row["result"], priority)
             item = {"parent": c.candidate_id, "arm": arm_label(key), "notes": rep.notes}
-            if rep.child is not None:
-                self.repair_queue[key].append(rep.child)
-                item["child"] = rep.child.candidate_id
+            if rep.children:
+                item["children"] = [x.candidate_id for x in rep.children]
+                item["fixes"] = [x.lever for x in rep.children]
             self.resumed.append(item)
-        if self.resumed:
-            self._emit(f"--- resumed {len(self.resumed)} repair(s) from memory: "
-                       f"{[i.get('child') for i in self.resumed]}")
+        waves = [i for i in self.resumed if i.get("children")]
+        if waves:
+            self._emit(f"--- resumed {len(waves)} repair wave(s) from memory:")
+            width = max(len(_short_id(i["parent"])) for i in waves)
+            for i in waves:
+                self._emit(f"    {_short_id(i['parent']):<{width}}  {len(i['fixes'])} fixes: "
+                           f"{', '.join(i['fixes'])}")
+
+    def _next_start(self, parent: tuple, siblings: list[tuple]):
+        """Where the next wave starts after a wave of ``siblings`` (candidate, decision,
+        result) of ``parent``: (candidate, decision, result, priority levers, why), or None.
+        The best sibling still in repair that got closer to accept than the parent, with
+        the levers of the other siblings that got closer first; else the parent itself,
+        whose tried levers the Repair Agent skips; None when the parent is not in repair."""
+        pen = self.agents.repair.unmeasured_failure_penalty
+        pc, pd, pr = parent
+        pdist = distance(pd, pr, pen)
+        scored = []
+        for c, d, r in siblings:
+            dist = distance(d, r, pen)
+            if d is not None and d.decision == "repair" and dist is not None:
+                scored.append((dist, c.candidate_id, c, d, r))
+        closer = sorted(x for x in scored if pdist is None or x[0] < pdist)
+        if closer:
+            best = closer[0]
+            priority = [x[2].lever for x in closer[1:] if x[2].lever]
+            return (best[2], best[3], best[4], priority,
+                    f"from {best[1]}: distance to accept {pdist} -> {best[0]}")
+        if pd is not None and pd.decision == "repair":
+            return pc, pd, pr, (), "no child got closer: the next levers on the same parent"
+        return None
+
+    def _start_wave(self, key: tuple, cand: CandidateRecord, decision, result,
+                    priority=()):
+        """Ask the Repair Agent for a wave of fixes of ``cand`` and queue them together."""
+        rep = self.repairer.repair_wave(cand, decision, result, self._pool_expressions(),
+                                        priority=priority)
+        if rep.children:
+            wid = f"{cand.candidate_id}/w{len(self.wave_log) + 1}"
+            ids = [c.candidate_id for c in rep.children]
+            self.waves[wid] = {"arm": key, "parent": (cand, decision, result),
+                               "pending": set(ids), "done": []}
+            for c in rep.children:
+                self.wave_of[c.candidate_id] = wid
+                self.repair_queue[key].append(c)
+            self.wave_log.append({"wave": wid, "parent": cand.candidate_id, "arm": arm_label(key),
+                                  "fixes": {c.candidate_id: c.lever for c in rep.children},
+                                  "size": next((n for n in rep.notes
+                                                if n.startswith("wave size")), None),
+                                  "priority": list(priority)})
+        return rep
+
+    def _wave_done(self, cid: str, cand: CandidateRecord | None = None, outcome=None) -> None:
+        """A wave child was decided (``outcome``) or dropped before BRAIN (None)."""
+        wid = self.wave_of.pop(cid, None)
+        wave = self.waves.get(wid) if wid else None
+        if wave is None:
+            return
+        wave["pending"].discard(cid)
+        if outcome is not None:
+            wave["done"].append((cand, outcome))
+        if not wave["pending"]:
+            self._finish_wave(wid)
+
+    def _finish_wave(self, wid: str) -> None:
+        """Every child of the wave is decided: one Director credit for the wave, then the
+        next wave (_next_start) unless a child was accepted."""
+        wave = self.waves.pop(wid)
+        key, done = wave["arm"], wave["done"]
+        entry = next(e for e in self.wave_log if e["wave"] == wid)
+        pen = self.agents.repair.unmeasured_failure_penalty
+        entry["results"] = {c.candidate_id: {
+            "decision": f"{o.decision} / {o.failure_class}",
+            "distance": distance(o.decision_record, o.result, pen)} for c, o in done}
+        accepted = [c.candidate_id for c, o in done if o.decision == "accept"]
+        if any(o.decision in DECIDED for _, o in done):
+            self.director.update(self._current(key), bool(accepted))
+        parent = _short_id(wave["parent"][0].candidate_id)
+        if accepted:
+            entry["next"] = f"accepted: {accepted}"
+            self._emit(f"  repair of {parent}: accepted {', '.join(map(_short_id, accepted))}")
+            return
+        if not any(o.result is not None and o.result.status == "complete" for _, o in done):
+            # every child timed out or failed on BRAIN: BRAIN may still finish them, and the
+            # next run's start recovers them; a new wave now would only guess
+            entry["next"] = "none: no child completed (timeouts are recovered next run)"
+            self._emit(f"  repair of {parent}: waiting, no fix completed on BRAIN "
+                       "(timeouts are recovered at the next run's start)")
+            return
+        start = self._next_start(wave["parent"],
+                                 [(c, o.decision_record, o.result) for c, o in done])
+        if start is None:
+            entry["next"] = "none: the parent is no longer in repair"
+            self._emit(f"  repair of {parent}: stopped, the parent is no longer in repair")
+            return
+        c, d, r, priority, why = start
+        rep = self._start_wave(key, c, d, r, priority)
+        entry["next"] = (f"{why}; wave {[x.candidate_id for x in rep.children]}"
+                         if rep.children else f"{why}; no wave: {rep.notes[-1]}")
+        base = (f"from {_short_id(c.candidate_id)}" if c is not wave["parent"][0]
+                else "no fix got closer, same parent")
+        if rep.children:
+            self._emit(f"  repair of {parent}: next wave {base}, {len(rep.children)} fixes: "
+                       f"{', '.join(x.lever for x in rep.children)}")
+        else:
+            self._emit(f"  repair of {parent}: {base}; stopped ({rep.notes[-1]})")
 
     def _recover_submissions(self) -> None:
         """Results BRAIN finished after an earlier run stopped waiting (our timeout, or a
@@ -890,8 +1078,10 @@ class ResearchRun:
                 continue
             try:
                 out = self.pipeline.recover(c, p["brain_sim_id"])
+            except BrainLoginRequired:
+                raise   # every later BRAIN call would fail the same way: stop now
             except Exception as exc:  # a lookup that goes wrong never stops the run
-                log.warning("recovering %s failed: %s", c.candidate_id, exc)
+                self._emit(f"  recovering {c.candidate_id} failed: {exc}")
                 out = None
             if out is None:
                 still += 1
@@ -1033,16 +1223,36 @@ class ResearchRun:
         return self.report()
 
     def _take_repairs(self, cap: int) -> dict[tuple, list[CandidateRecord]]:
-        """Up to ``cap`` queued repairs, one arm at a time in turn, oldest first."""
+        """Up to ``cap`` queued repairs as whole waves (at most ``repair.waves_per_round``),
+        one arm at a time in turn, oldest first. A wave that does not fit what is left of
+        ``cap`` waits for the next round, unless nothing was taken yet (then its first
+        ``cap`` children go now and the rest later)."""
         taken: dict[tuple, list[CandidateRecord]] = {}
-        while cap > 0 and any(q for k, q in self.repair_queue.items() if self._in_run(k)):
+        waves, limit = 0, self.agents.repair.waves_per_round - self._round_waves
+        progress = True
+        while cap > 0 and waves < limit and progress:
+            progress = False
             for key, queue in self.repair_queue.items():
-                if queue and cap > 0 and self._in_run(key):
-                    taken.setdefault(key, []).append(queue.popleft())
-                    cap -= 1
+                if not queue or cap <= 0 or waves >= limit or not self._in_run(key):
+                    continue
+                wid = self.wave_of.get(queue[0].candidate_id)
+                size = 1 if wid is None else sum(
+                    1 for c in queue if self.wave_of.get(c.candidate_id) == wid)
+                if size > cap and taken:
+                    continue
+                group = [queue.popleft()]
+                while (queue and wid is not None and len(group) < cap
+                       and self.wave_of.get(queue[0].candidate_id) == wid):
+                    group.append(queue.popleft())
+                taken.setdefault(key, []).extend(group)
+                cap -= len(group)
+                waves += 1
+                self._round_waves += 1
+                progress = True
         return taken
 
     def _round(self, r: int) -> None:
+        self._round_waves = 0
         slots = min(self.budget.per_round, self.budget.max_simulations - self._committed())
         entry = {"round": r, "arms": []}
         self.log.append(entry)
@@ -1183,6 +1393,21 @@ class ResearchRun:
     def _screen_and_simulate(self, key: tuple, batch: list[CandidateRecord],
                              rationales: dict[str, str], log: dict) -> int:
         """Pre-Filter, Critic and judge, then simulate. Returns how many were simulated."""
+        go = self._screen(key, batch, rationales, log)
+        simulated = 0
+        for i, cand in enumerate(go):
+            if self._committed() >= self.budget.max_simulations:
+                for c in go[i:]:
+                    self._wave_done(c.candidate_id)
+                break
+            self._simulate(key, cand, log)
+            simulated += 1
+        return simulated
+
+    def _screen(self, key: tuple, batch: list[CandidateRecord], rationales: dict[str, str],
+                log: dict) -> list[CandidateRecord]:
+        """Pre-Filter, Critic and judge: the alphas that may go to BRAIN. Wave children
+        stopped here close their place in the wave."""
         pf = self.prefilter.run(batch)
         log["prefilter_dropped"] = [[c.candidate_id, why] for c, why in pf.dropped]
         primary, shadows = self._critics_for(key)
@@ -1199,13 +1424,11 @@ class ResearchRun:
         log["critic_dropped"] = [[c.candidate_id, why] for c, why in rv.dropped]
         log["revised"] = [c.candidate_id for c in rv.to_simulate if c.lever == "critic_revision"]
         log["outcomes"] = []
-        simulated = 0
-        for cand in rv.to_simulate:
-            if self._committed() >= self.budget.max_simulations:
-                break
-            self._simulate(key, cand, log)
-            simulated += 1
-        return simulated
+        going = {c.candidate_id for c in rv.to_simulate}
+        for c in batch:   # wave children the Pre-Filter or Critic stopped
+            if c.candidate_id in self.wave_of and c.candidate_id not in going:
+                self._wave_done(c.candidate_id)
+        return list(rv.to_simulate)
 
     def _record_reviews(self, key: tuple, critic_model: str | None, role: str,
                         reviews: dict) -> None:
@@ -1217,8 +1440,9 @@ class ResearchRun:
                          "revised": r.revised.expression if r.revised else None})
 
     def _committed(self) -> int:
-        """Simulations used plus alphas queued for BRAIN: what the budget checks count."""
-        return self.sims_used + len(self.sim_queue)
+        """Simulations used plus alphas queued for or running on BRAIN: what the budget
+        checks count."""
+        return self.sims_used + len(self.sim_queue) + self._in_flight
 
     def _simulate(self, key: tuple, cand: CandidateRecord, log: dict, *,
                   credit: bool = True) -> None:
@@ -1231,23 +1455,69 @@ class ResearchRun:
             self._flush()
 
     def _flush(self) -> None:
-        """Simulate the queued alphas together, then decide each in queue order: Director
-        credit, repair child. A model failure in one repair does not stop the others'
-        bookkeeping; the first is raised after them."""
+        """Simulate the queued alphas together and decide each the moment its result is in
+        (owner 2026-11-23: a slow alpha must not hold up the others): Director credit,
+        repair wave. When a slot frees, ready repair waves are screened and added to the
+        running batch (``_top_up``), within the simulation budget. A model failure in one
+        repair does not stop the others' bookkeeping; the first is raised at the end."""
         queued, self.sim_queue = self.sim_queue, []
         if not queued:
             return
         if len(queued) > 1:
-            self._emit(f"--- BRAIN: {len(queued)} alphas at once")
-        outcomes = self.pipeline.process_many([c for _, c, _, _ in queued])
-        failure = None
-        for (key, cand, log, credit), outcome in zip(queued, outcomes):
+            self._emit(f"--- BRAIN: simulating {len(queued)} alphas together")
+        meta = {c.candidate_id: (key, c, log, credit) for key, c, log, credit in queued}
+        failures: list[Exception] = []
+        self._in_flight = len(queued)
+
+        def on_outcome(cand: CandidateRecord, outcome) -> None:
+            key, c, log, credit = meta.pop(cand.candidate_id)
+            self._in_flight -= 1
             try:
-                self._after_simulation(key, cand, log, credit, outcome)
+                self._after_simulation(key, c, log, credit, outcome)
             except LLMUnavailable as exc:
-                failure = failure or exc
-        if failure is not None:
-            raise failure
+                failures.append(exc)
+
+        def more(free: int) -> list[CandidateRecord]:
+            if failures or self.stop_reason:
+                return []
+            try:
+                added = self._top_up(free)
+            except LLMUnavailable as exc:
+                failures.append(exc)
+                return []
+            for key, c, log in added:
+                meta[c.candidate_id] = (key, c, log, True)
+            self._in_flight += len(added)
+            return [c for _, c, _ in added]
+
+        try:
+            self.pipeline.process_many([c for _, c, _, _ in queued], on_outcome=on_outcome,
+                                       more=more)
+        finally:
+            self._in_flight = 0
+        if failures:
+            raise failures[0]
+
+    def _top_up(self, free: int) -> list[tuple[tuple, CandidateRecord, dict]]:
+        """Ready repair waves for ``free`` freed BRAIN slots (whole waves when they fit),
+        screened like any repair, within the simulation budget: (arm, alpha, arm log)."""
+        cap = min(free, self.budget.max_simulations - self._committed())
+        if cap <= 0 or not self.agents.repair.fill_freed_slots:
+            return []
+        out = []
+        for key, cands in self._take_repairs(cap).items():
+            arm_log = {"arm": arm_label(key), "slots": len(cands), "repairs_mid_batch": True}
+            if self.log:
+                self.log[-1]["arms"].append(arm_log)
+            go = self._screen(key, cands, {}, arm_log)
+            room = cap - len(out)
+            for c in go[room:]:            # over budget: their place in the wave is closed
+                self._wave_done(c.candidate_id)
+            out += [(key, c, arm_log) for c in go[:room]]
+        if out:
+            self._emit(f"--- BRAIN: {len(out)} repair fix(es) join the running batch: "
+                       f"{', '.join(_short_id(c.candidate_id) for _, c, _ in out)}")
+        return out
 
     def _after_simulation(self, key: tuple, cand: CandidateRecord, log: dict, credit: bool,
                           outcome) -> None:
@@ -1268,15 +1538,22 @@ class ResearchRun:
                     None)
         if seed is not None:
             seed["status"] = f"{outcome.decision} / {outcome.failure_class}"
-        if outcome.decision in DECIDED and credit:
+        flag = next((r for r in (rec.reasons if rec else [])
+                     if r.startswith("recorded, not applied") and "overfitting" in r), None)
+        if flag is not None:   # owner 2026-11-23: overfitting checks raise a flag only
+            item["overfitting_flag"] = flag
+            self.overfitting_flags.append({"candidate_id": cand.candidate_id, "flag": flag})
+            self._emit(f"  flag: {cand.candidate_id}: {flag.split(': ', 1)[-1]}")
+        in_wave = cand.candidate_id in self.wave_of
+        if outcome.decision in DECIDED and credit and not in_wave:  # a wave: one credit at its end
             self.director.update(self._current(key), outcome.decision == "accept")
-        if outcome.decision == "repair" and outcome.decision_record is not None:
-            rep = self.repairer.repair(cand, outcome.decision_record, outcome.result,
-                                       self._pool_expressions())
+        if in_wave:   # the wave decides where repair goes next, once all its children are in
+            self._wave_done(cand.candidate_id, cand, outcome)
+        elif outcome.decision == "repair" and outcome.decision_record is not None:
+            rep = self._start_wave(key, cand, outcome.decision_record, outcome.result)
             item["repair"] = rep.notes
-            if rep.child is not None:
-                self.repair_queue[key].append(rep.child)
-                item["repair_child"] = rep.child.candidate_id
+            if rep.children:
+                item["repair_wave"] = [c.candidate_id for c in rep.children]
 
     def _market_datasets(self) -> dict[tuple, set[str]]:
         """{(region, delay): datasets in that market's catalog} for every market with an arm."""
@@ -1387,6 +1664,8 @@ class ResearchRun:
             "arms": arms,
             "recovered_results": self.recovered,
             "resumed_repairs": self.resumed,
+            "repair_waves": self.wave_log,
+            "overfitting_flags": self.overfitting_flags,
             "seeds": self.seed_notes,
             **_lever_tables(LeverStats.from_events(
                 repair_events(self.memory.candidate_outcomes(), self.agents.repair),

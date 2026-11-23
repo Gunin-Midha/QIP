@@ -115,13 +115,14 @@ def test_repair_events_reward_fixes_improvements_and_collateral(memory, candidat
     ev = {e.lever: e for e in repair_events(memory.candidate_outcomes())}
     assert ev["liquidity_tilt"].reward == 1.0 and ev["liquidity_tilt"].fixed
     # sub-universe slack improved (-0.40 -> -0.13), but Sharpe now fails and the alpha as a
-    # whole is further from accept: 0.5 x 0.5 (class improved) + 0.5 x 0 (no overall gain)
+    # whole is further from accept: 0.5 x 0.675 (class improved, 0.27 of its 0.40 gap
+    # closed) + 0.5 x 0 (no overall gain)
     assert ev["rank_transform"].improved and ev["rank_transform"].collateral == ("sharpe",)
-    assert ev["rank_transform"].reward == 0.25
+    assert ev["rank_transform"].reward == pytest.approx(0.5 * 0.27 / 0.40)
     assert ev["backfill_fields"].reward == 0.0 and not ev["backfill_fields"].improved
     stats = LeverStats.from_events(ev.values())
     assert stats.mean("sub_universe", "liquidity_tilt") == pytest.approx(2 / 3)
-    assert stats.mean("sub_universe", "rank_transform") == pytest.approx(1.25 / 3)
+    assert stats.mean("sub_universe", "rank_transform") == pytest.approx((1 + 0.3375) / 3)
     assert stats.mean("sub_universe", "never_tried") == 0.5
     rows = stats.table()
     assert rows[0]["lever"] == "liquidity_tilt" and rows[0]["fixed"] == 1
@@ -296,8 +297,9 @@ def test_secondary_classes_and_combo_parts_get_credit(memory, candidate):
     # backfill cleared concentration as a side effect: class part 1, secondary weight
     assert got[("concentration", "backfill_fields", "secondary")] == \
         (pytest.approx(0.5 + 0.5 * gain, abs=1e-5), 0.5)
+    # sub-universe still fails, slack -0.40 -> -0.34: 0.06 of its 0.40 gap closed
     assert got[("sub_universe", "backfill_fields", "target")] == \
-        (pytest.approx(0.25 + 0.5 * gain, abs=1e-5), 1.0)
+        (pytest.approx(0.5 * 0.06 / 0.40 + 0.5 * gain, abs=1e-5), 1.0)
     # each part of the accepted combination is credited with a third of the weight
     assert got[("sub_universe", "liquidity_tilt", "part")] == (1.0, pytest.approx(1 / 3))
     assert got[("concentration", "rank_transform", "part")] == (1.0, pytest.approx(1 / 6))
@@ -340,3 +342,72 @@ def test_combination_skips_parts_that_do_not_apply(memory, candidate):
     tilted = candidate(expression="rank(close) * rank(cap)")
     out = agent.repair(tilted, d)                                  # no part applies
     assert out.child is None and any("part liquidity_tilt" in n for n in out.notes)
+
+
+def test_gap_closed_scales_with_the_share_of_the_gap():
+    from alpha_research.lever_stats import gap_closed
+    assert gap_closed(-0.38, -0.08) == pytest.approx(0.30 / 0.38, abs=1e-6)
+    assert gap_closed(-0.40, -0.39) == pytest.approx(0.025)
+    assert gap_closed(-0.40, 0.10) == 1.0          # passed: capped
+    assert gap_closed(-0.40, -0.50) == 0.0         # worse: floored
+    assert gap_closed(0.2, 0.3) == 0.5             # class was not failing: old flat credit
+    assert gap_closed(None, -0.1) == 0.0
+
+
+def test_gain_match_ranks_a_big_gainer_first_for_a_small_need():
+    from alpha_research.lever_stats import needs
+    stats = LeverStats()
+    # "big": never fixed sharpe but gained about +0.35 four times; "small": +0.02 four times
+    stats.records[("sharpe", "big")] = LeverRecord(n=4, reward=1.2, events=4, improved=4,
+                                                   gains=[0.35, 0.3, 0.4, 0.33])
+    stats.records[("sharpe", "small")] = LeverRecord(n=4, reward=1.6, events=4, improved=4,
+                                                     gains=[0.02, 0.01, 0.03, 0.02])
+    pb = Playbook({"sharpe": [Lever("small"), Lever("big")]})
+    cfg = RepairLearningConfig()
+    plain = rank_levers(pb, "sharpe", {"sharpe"}, stats, cfg)
+    assert [lv.name for lv, _ in plain] == ["small", "big"]        # by mean reward alone
+    matched = rank_levers(pb, "sharpe", {"sharpe"}, stats, cfg, need={"sharpe": 0.10})
+    assert [lv.name for lv, _ in matched] == ["big", "small"]      # big covers a 0.10 need
+    # too little evidence: the match is not used
+    assert stats.estimate("sharpe", "big", need=0.1, min_gain_evidence=5) == \
+        stats.mean("sharpe", "big")
+    assert {r["lever"]: r["median_gain"] for r in stats.table()}["big"] == pytest.approx(0.34)
+    assert needs(None, None, ["sharpe"]) == {}
+
+
+def _decision(sharpe, fitness, extra=()):
+    gates = [GateResult("sharpe", sharpe >= 1.58, sharpe, 1.58, ""),
+             GateResult("fitness", fitness >= 1.0, fitness, 1.0, ""), *extra]
+    return DecisionRecord("x", "repair", "fitness" if sharpe >= 1.58 else "sharpe",
+                          gate_results=gates)
+
+
+def test_wave_size_follows_closeness_value_and_blocked_checks():
+    from alpha_research.lever_stats import wave_size
+    cfg = RepairLearningConfig.from_dict({
+        "wave_tiers": [{"max_distance": 0.25, "fixes": 4}, {"max_distance": 0.75, "fixes": 2},
+                       {"max_distance": None, "fixes": 1}],
+        "value_sharpe_share": 0.8, "low_value_fixes": 1, "blocked_fixes": 1})
+    pb = Playbook.load(ROOT / "config" / "repair_playbook.yaml")
+    res = lambda s, **kw: ResultRecord("x", "complete", sharpe=s, **kw)
+    # close: fitness 0.92 of 1.0 -> distance 0.08
+    assert wave_size(_decision(2.35, 0.92), res(2.35), cfg, pb)[0] == 4
+    # middle: fitness 0.5 -> 0.5
+    assert wave_size(_decision(2.0, 0.5), res(2.0), cfg, pb)[0] == 2
+    # far: Sharpe 1.0 and fitness 0.3 -> 0.37 + 0.7; also low value (1.0 < 0.8 x 1.58)
+    n, why = wave_size(_decision(1.0, 0.3), res(1.0), cfg, pb)
+    assert n == 1
+    # low value but close by distance alone: Sharpe 1.2 (< 1.26) fails by 0.24
+    n, why = wave_size(_decision(1.2, 1.1), res(1.2), cfg, pb)
+    assert n == 1 and "little edge" in why
+    # ... unless BRAIN's risk-neutralized Sharpe shows the edge (factor exposure hides it)
+    rich = res(1.2, alt_stats={"risk_neutralized": {"sharpe": 1.9}})
+    assert wave_size(_decision(1.2, 1.1), rich, cfg, pb)[0] == 4
+    # blocked: a BRAIN check no lever fixes (class other)
+    asi = GateResult("brain:LOW_ASI_JPN_SHARPE", False, 0.81, 1.0, "")
+    n, why = wave_size(_decision(2.35, 0.92, [asi]), res(2.35), cfg, pb)
+    assert n == 1 and "no lever fixes" in why
+    # no tiers configured: fixes_per_wave for everyone
+    assert wave_size(_decision(1.0, 0.3), res(1.0), RepairLearningConfig(), pb)[0] == 4
+    with pytest.raises(ConfigError, match="wave_tiers"):
+        RepairLearningConfig.from_dict({"wave_tiers": [{"max_distance": 0.5, "fixes": 4}]})

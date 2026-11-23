@@ -158,3 +158,47 @@ def test_model_lever_bad_replies(memory, candidate, reply, match):
 def test_playbook_without_entry(memory, playbook, candidate):
     out = RepairAgent(playbook, SPEC, memory).repair(candidate(), decision("c1", "weak_year"))
     assert out.child is None and "no playbook entry" in out.notes[0]
+
+
+WAVE_PB = Playbook({"sharpe": [
+    Lever("increase_decay", {"to": 8}), Lever("lengthen_ts_window", {"factor": 2}),
+    Lever("rank_transform", {}), Lever("orthogonalize_against_pool", {}),
+    Lever("tighten_truncation", {"to": 0.05}), Lever("model_repair", {})]})
+
+
+def test_repair_wave_spreads_kinds_and_spends_one_model_call(memory, candidate):
+    from alpha_research.repair_agent import lever_kind
+    assert lever_kind("neutralize_statistical") == "neutralization"
+    assert lever_kind("combo:a+b") == "combination" and lever_kind("model_repair") == "model_repair"
+    llm = ScriptedLLMClient([json.dumps({"expression": "rank(-ts_delta(close, 10))"}),
+                             json.dumps({"expression": "rank(-ts_delta(close, 20))"})])
+    agent = RepairAgent(WAVE_PB, SPEC, memory, llm=llm)
+    parent = candidate(candidate_id="p1", decay=4, truncation=0.08,
+                       expression="-ts_delta(close, 5)")
+    memory.put_candidate(parent)
+    out = agent.repair_wave(parent, decision("p1", "sharpe"), size=4)
+    # one lever per kind first (smoothing, shape, model), then a second smoothing one; the
+    # second model lever is skipped: one model call per wave
+    assert [c.lever for c in out.children] == [
+        "increase_decay", "rank_transform", "orthogonalize_against_pool", "lengthen_ts_window"]
+    assert [c.candidate_id for c in out.children] == ["p1_r1a", "p1_r1b", "p1_r1c", "p1_r1d"]
+    assert all(c.parent_id == "p1" and c.generation == 1 for c in out.children)
+    assert len(llm.calls) == 1
+    # the next wave on the same parent skips what its first wave tried
+    for c in out.children:
+        memory.put_candidate(c)
+    again = agent.repair_wave(parent, decision("p1", "sharpe"), size=4)
+    assert [c.lever for c in again.children] == ["tighten_truncation", "model_repair"]
+    assert again.children[0].candidate_id == "p1_r1e" and len(llm.calls) == 2
+
+
+def test_repair_wave_puts_priority_levers_first_and_respects_the_budget(memory, candidate):
+    from alpha_research.lever_stats import RepairLearningConfig
+    agent = RepairAgent(WAVE_PB, SPEC, memory,
+                        learning=RepairLearningConfig(max_trials_per_root=2))
+    parent = candidate(candidate_id="p2", decay=4, truncation=0.08,
+                       expression="rank(-ts_delta(close, 5))")
+    memory.put_candidate(parent)
+    out = agent.repair_wave(parent, decision("p2", "sharpe"), size=4,
+                            priority=["tighten_truncation"])
+    assert [c.lever for c in out.children] == ["tighten_truncation", "increase_decay"]

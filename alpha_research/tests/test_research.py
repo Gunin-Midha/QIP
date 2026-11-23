@@ -27,8 +27,12 @@ MAIN_AGENTS = load_agents_config(ROOT / "config" / "agents.yaml")
 ONE_MODEL = ModelsConfig(default="claude-test", generator=("claude-test",), critic=("gemini-test",),
                          shadow_critics=False, prefilter="claude-test", debate="claude-test",
                          repair="claude-test", strategy="claude-test")
-# no refill passes: these tests count what one allocation does (refill has its own tests)
-AGENTS = dataclasses.replace(MAIN_AGENTS, models=ONE_MODEL, refill_passes=0)
+# no refill passes: these tests count what one allocation does (refill has its own tests);
+# every repair gets a full wave: these tests check the loop, not the wave-size tuning
+AGENTS = dataclasses.replace(MAIN_AGENTS, models=ONE_MODEL, refill_passes=0,
+                             repair=dataclasses.replace(MAIN_AGENTS.repair, wave_tiers=(),
+                                                        value_sharpe_share=None,
+                                                        fill_freed_slots=False))
 ARM = ("pv1", "USA", "gen-v8", "claude-test", 1)
 SETTINGS = {"region": "USA", "universe": "TOP3000", "delay": 1, "decay": 4,
             "neutralization": "SUBINDUSTRY", "truncation": 0.08,
@@ -134,7 +138,7 @@ def test_closed_loop_end_to_end(memory, config, playbook):
     children = [c for c in brain.submitted if c.lever == "increase_decay"]
     assert children, "a repair child should have been simulated"
     child = children[0]
-    assert child.decay == 8 and child.parent_id and child.candidate_id.endswith("_r1")
+    assert child.decay == 8 and child.parent_id and child.candidate_id.endswith("_r1a")
     assert memory.decisions_for(child.candidate_id)[-1].decision == "accept"
     assert memory.lineage_levers(child.candidate_id) == ["increase_decay"]
     # strategy evolution added an arm with a new prompt version and its guidance
@@ -429,10 +433,17 @@ def test_main_agents_config_loads():
     assert a.sparse.categories == ("news", "sentiment", "socialmedia") and a.sparse.lookback == 20
     # free models only (owner, 2026-11-03); GPT and Nemotron (OpenRouter, generator only)
     # added 2026-11-04, no Mistral (Llama and DeepSeek wait for a free host that answers);
-    # shadow critics off to save the quotas
+    # shadow critics off to save the quotas; Ernie (Baidu, OpenRouter) added 2026-11-23
     assert {provider_of(g) for g in a.models.generator} == \
-        {"google", "qwen", provider_of("groq:gpt-oss-120b"), "nvidia"}
-    assert not any(m.endswith(":free") for m in a.models.critic)
+        {"google", "qwen", provider_of("groq:gpt-oss-120b"), "nvidia", "baidu"}
+    # owner 2026-11-23: OpenRouter's Nemotron Lightning reviews too (critics spread by
+    # load), and every critic call is paced to its free-tier limit
+    assert a.models.critic_pick == "balanced"
+    # owner 2026-11-23: far, low-edge and blocked alphas get no repair at all
+    assert a.repair.wave_tiers[-1] == (None, 0)
+    assert a.repair.low_value_fixes == 0 and a.repair.blocked_fixes == 0
+    assert set(a.models.critic) <= set(a.models.pace)
+    assert a.models.repair != a.models.default
     assert "mistral" not in {provider_of(m) for m in a.models.all_models()}
     assert not a.models.shadow_critics
     # Gemini (20 calls/day) is no agent's default and only the last-resort critic
@@ -503,7 +514,7 @@ def test_plan_errors(tmp_path, arms, match):
 def test_cli_research_end_to_end(tmp_path, monkeypatch, capsys):
     import yaml
     brain = StubBrain()
-    monkeypatch.setattr(cli, "make_session", lambda cfg, on_biometric=None: None)
+    monkeypatch.setattr(cli, "make_session", lambda cfg, on_biometric=None, ask_credentials=None: None)
     monkeypatch.setattr(cli, "RealBrainClient", lambda session, cfg, capture_dir=None: brain)
     monkeypatch.setattr("alpha_research.pipeline.time.sleep", lambda s: None, raising=False)
     agents = yaml.safe_load((ROOT / "config" / "agents.yaml").read_text())
@@ -556,11 +567,12 @@ def test_lost_repair_is_resumed_and_simulated_first(memory, config, playbook, ca
     _orphan_repair(memory, candidate)
     brain = StubBrain()
     report = make_run(memory, config, playbook, brain=brain).run(1)
-    assert [r["child"] for r in report["resumed_repairs"]] == ["old_001_r1"]
+    wave = report["resumed_repairs"][0]["children"]
+    assert wave[0] == "old_001_r1a" and len(wave) <= 4     # a wave of different fixes
     first = brain.submitted[0]
-    assert (first.candidate_id, first.lever, first.decay) == ("old_001_r1", "increase_decay", 8)
+    assert (first.candidate_id, first.lever, first.decay) == ("old_001_r1a", "increase_decay", 8)
     assert report["rounds"][0]["arms"][0]["repairs_first"] is True
-    assert memory.decisions_for("old_001_r1")[-1].decision == "accept"
+    assert memory.decisions_for("old_001_r1a")[-1].decision == "accept"
     # the accepted child is evidence: increase_decay fixed a turnover failure
     row = next(r for r in report["lever_stats"] if r["lever"] == "increase_decay")
     assert (row["failure_class"], row["events"], row["fixed"]) == ("turnover", 1, 1)
@@ -581,8 +593,8 @@ def test_open_repair_survives_a_prompt_version_bump(memory, config, playbook, ca
     run = make_run(memory, config, playbook)
     assert run.warm_started == 1
     report = run.run(1)
-    assert [r["child"] for r in report["resumed_repairs"]] == ["v3_001_r1"]
-    assert memory.decisions_for("v3_001_r1")
+    assert report["resumed_repairs"][0]["children"][0] == "v3_001_r1a"
+    assert memory.decisions_for("v3_001_r1a")
 
 
 def test_result_brain_finished_after_a_timeout_is_recovered(memory, config, playbook, candidate):
@@ -599,6 +611,36 @@ def test_result_brain_finished_after_a_timeout_is_recovered(memory, config, play
     assert memory.decisions_for("late_001")[-1].decision == "accept"
     assert "late_001" not in [x.candidate_id for x in brain.submitted]   # no new simulation
     assert memory.unfinished_submissions() == []
+
+
+def test_recovery_stops_on_a_lost_login_and_skips_other_errors(memory, config, playbook,
+                                                              candidate):
+    # 2026-11-23: an expired BRAIN session during recovery crashed the run (NameError)
+    from alpha_research.brain_client import BrainLoginRequired
+    from alpha_research.schemas import DecisionRecord, ResultRecord
+    c = candidate(candidate_id="late_002", expression="rank(ts_mean(close, 6))",
+                  prompt_version="gen-v8", model="claude-test")
+    memory.put_candidate(c)
+    memory.put_result(ResultRecord("late_002", "timeout", brain_sim_id="sim_x"))
+    memory.put_decision(DecisionRecord("late_002", "reject", "incomplete"))
+
+    class Failing(StubBrain):
+        def __init__(self, exc):
+            super().__init__()
+            self.exc = exc
+
+        def poll(self, sim_id):
+            raise self.exc
+
+    with pytest.raises(BrainLoginRequired):
+        make_run(memory, config, playbook, brain=Failing(BrainLoginRequired("log in"))).run(1)
+    lines = []
+    run = make_run(memory, config, playbook, brain=Failing(ValueError("odd reply")))
+    run.out = None
+    run._emit = lines.append
+    run._recover_submissions()
+    assert any("recovering late_002 failed: odd reply" in x for x in lines)
+    assert run.recovered == []
 
 
 def test_resume_can_be_switched_off(memory, config, playbook, candidate):
@@ -622,3 +664,51 @@ def test_resume_takes_the_closest_repairs_first_up_to_max_resume(memory, config,
     agents = dataclasses.replace(AGENTS, repair=dataclasses.replace(AGENTS.repair, max_resume=1))
     report = make_run(memory, config, playbook, agents=agents).run(1)
     assert [r["parent"] for r in report["resumed_repairs"]] == ["near"]
+
+
+def test_models_max_output_parsed_and_checked():
+    import yaml
+    raw = yaml.safe_load((ROOT / "config" / "agents.yaml").read_text())
+    caps = agents_config_from_dict(raw).models.max_output
+    assert all(isinstance(v, int) and v >= 256 for v in caps.values())
+    raw["models"]["max_output"] = None              # optional: no caps
+    assert agents_config_from_dict(raw).models.max_output == {}
+    for bad in ({"m": 100}, {"m": "big"}, ["m"], {"m": True}):
+        raw["models"]["max_output"] = bad
+        with pytest.raises(ConfigError, match="models.max_output"):
+            agents_config_from_dict(raw)
+
+
+
+def test_balanced_critic_pick_spreads_reviews_but_never_to_the_same_maker(memory, config,
+                                                                         playbook):
+    models = dataclasses.replace(ONE_MODEL, critic=("gemini-test", "groq:qwen/q", "claude-z"),
+                                 critic_pick="balanced")
+    run = make_run(memory, config, playbook,
+                   agents=dataclasses.replace(AGENTS, models=models))
+    arm = ("pv1", "USA", "gen-v8", "claude-test", 1)
+    assert run._critics_for(arm)[0] == "gemini-test"           # nobody used yet: list order
+    run.counter.by_model["gemini-test"] = 3
+    assert run._critics_for(arm)[0] == "groq:qwen/q"           # the least used
+    run.counter.by_model["groq:qwen/q"] = 5
+    assert run._critics_for(arm)[0] == "gemini-test"           # claude-z: same maker, never
+    run.counter.down["gemini-test"] = "quota"
+    assert run._critics_for(arm)[0] == "groq:qwen/q"
+    first = dataclasses.replace(models, critic_pick="first")
+    run2 = make_run(memory, config, playbook, agents=dataclasses.replace(AGENTS, models=first))
+    run2.counter.by_model["gemini-test"] = 9
+    assert run2._critics_for(arm)[0] == "gemini-test"
+
+
+def test_models_pace_is_checked():
+    import yaml
+    raw = yaml.safe_load((ROOT / "config" / "agents.yaml").read_text())
+    for bad in ({"m": {"tokens_per_minute": 0}}, {"m": {"per_hour": 5}}, {"m": 5},
+                {"m": {}}):
+        raw["models"]["pace"] = bad
+        with pytest.raises(ConfigError, match="models.pace"):
+            agents_config_from_dict(raw)
+    raw["models"]["pace"] = None
+    raw["models"]["critic_pick"] = "random"
+    with pytest.raises(ConfigError, match="critic_pick"):
+        agents_config_from_dict(raw)
