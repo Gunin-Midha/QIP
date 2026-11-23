@@ -655,6 +655,9 @@ class RealBrainClient:
                  capture_dir: str | Path | None = None):
         self.session = session
         self.config = config
+        # called with the simulation id once BRAIN has finished it, before its results and
+        # checks are fetched (that can take minutes); the simulator sets it for progress lines
+        self.on_ready: Callable[[str], None] | None = None
         self.capture_dir = Path(capture_dir) if capture_dir else None
 
     def _capture(self, sim_id: str, name: str, body) -> None:
@@ -691,6 +694,8 @@ class RealBrainClient:
             return raw
 
         alpha_id = sim["alpha"]
+        if self.on_ready is not None:
+            self.on_ready(brain_sim_id)
         notes: list[str] = []
         base = f"/alphas/{alpha_id}"
         alpha = self._fetch(brain_sim_id, "alpha", base, notes)

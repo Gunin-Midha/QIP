@@ -100,6 +100,9 @@ class SimulatorConfig:
     # simulations kept running on BRAIN at once (Simulator.run_many; one thread that polls
     # each in turn). OQ-3: the account's real limit is unknown.
     max_concurrent: int = 1
+    # a status line (each running alpha's BRAIN progress) at most this often while
+    # simulations run; None = no status lines
+    progress_every_seconds: float | None = 60.0
 
 
 # failure classes whose repair can be limited to near misses, and the gate each one reads
@@ -303,6 +306,9 @@ def config_from_dict(raw: Any, source: str = "<dict>") -> Config:
         max_retries=_int(s, "simulator", "max_retries", lo=0, nullable=False),
         max_concurrent=_int(s, "simulator", "max_concurrent", lo=1, nullable=False)
         if "max_concurrent" in s else 1,
+        progress_every_seconds=(_num(s, "simulator", "progress_every_seconds", lo=1.0,
+                                     nullable=True)
+                                if "progress_every_seconds" in s else 60.0),
     )
 
     # optional section: configs written before it existed keep working (no near-miss limit)

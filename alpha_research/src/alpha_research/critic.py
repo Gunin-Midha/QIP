@@ -13,7 +13,11 @@ Critic
      winsorize or a group_* operator), or a window is longer than 512 days, or the
      neutralization is NONE (the alpha keeps a market bet; run 2's cash-flow alpha looked
      strong only because of it), or a fresh alpha starts from a factor neutralization (its
-     reason is in the rationale). Advisory issues never block: they inform the reviews.
+     reason is in the rationale), or a fresh alpha reads only price/volume data (base
+     fields and datasets of a ``critic.price_volume_categories`` category): such signals
+     are the most common production alphas, so they tend to fail PROD_CORRELATION (EUR
+     reversal, 2026-11-15: 0.70-0.76 in every reshaping; 0.645 once blended 1:1 with
+     analyst revisions). Advisory issues never block: they inform the reviews.
 2. Model review (``critic.use_model``): one call per batch sees each candidate, its
    hypothesis and rationale, and the rule issues, and answers simulate, revise or drop,
    with issues and optionally a revised expression and, with revise, a neutralization
@@ -223,6 +227,39 @@ def backfilled(expression: str, names: Collection[str], lookback: int) -> str:
     return render(out)
 
 
+PRICE_ONLY_ISSUE = ("reads only price/volume data: such signals are the most common "
+                    "production alphas and tend to fail PROD_CORRELATION; a part from another "
+                    "dataset (analyst, fundamental, model) at about equal weight lowers it")
+
+
+def price_volume_only(expression: str, spec: FastExprSpec, price_fields: Collection[str]) -> bool:
+    """Every datafield the expression reads is a base field (close, returns, cap, ...) or
+    in ``price_fields`` (fields of price/volume datasets)."""
+    try:
+        stmts = parse(expression)
+    except FastExprError:
+        return False
+    variables = {st.name for st in stmts if isinstance(st, Assign)}
+    used: set = set()
+
+    def walk(n):
+        if isinstance(n, Name):
+            used.add(n.name)
+        for a in getattr(n, "args", ()):
+            walk(a)
+        for _, v in getattr(n, "kwargs", ()):
+            walk(v)
+        for attr in ("operand", "left", "right", "value"):
+            child = getattr(n, attr, None)
+            if child is not None and not isinstance(child, str):
+                walk(child)
+
+    for st in stmts:
+        walk(st)
+    fields = used - variables - set(spec.groups) - set(spec.constants)
+    return bool(fields) and fields <= set(spec.base_fields) | set(price_fields)
+
+
 def rule_issues(expression: str) -> list[Issue]:
     try:
         stmts = parse(expression)
@@ -269,8 +306,11 @@ class Critic:
                  datafields: Collection[str] | None = None,
                  markets: Mapping[tuple, Mapping] | None = None,
                  limits: ComplexityLimits | None = None, max_output: int = 4096,
-                 context: str = "", sparse: Mapping | None = None, sparse_lookback: int = 20):
+                 context: str = "", sparse: Mapping | None = None, sparse_lookback: int = 20,
+                 price_fields: Mapping | None = None):
         self.spec = spec
+        # {(region, delay) or None: fields of price/volume datasets}; empty = advisory off
+        self.price_fields = price_fields or {}
         # {(region, delay) or None: sparse field ids} (SparseFieldRule.fields per market;
         # None = the catalog for markets without their own); empty = rule off
         self.sparse = sparse or {}
@@ -316,6 +356,10 @@ class Critic:
         reviews: dict[str, Review] = {}
         for c in candidates:
             issues = rule_issues(c.expression) + setting_issues(c)
+            if c.lever is None and self.price_fields:
+                pv = self.price_fields.get((c.region, c.delay), self.price_fields.get(None, set()))
+                if price_volume_only(c.expression, self.spec, pv):
+                    issues.append(Issue("advisory", PRICE_ONLY_ISSUE))
             blocking = any(i.severity == "blocking" for i in issues)
             review = Review(c.candidate_id, "drop" if blocking else "simulate",
                             [i.text for i in issues], blocking=blocking)

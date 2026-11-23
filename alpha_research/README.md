@@ -429,14 +429,17 @@ needs raw datafield matrices that BRAIN's API does not provide (see open questio
 
 ## Repair levers that learn
 
-The playbook lists levers per failure class. 13 are mechanical rewrites (no model):
+The playbook lists levers per failure class. 14 are mechanical rewrites (no model):
 `increase_decay`, `tighten_truncation`, `lengthen_ts_window`, `wrap_in_smoothing`, `hump`,
 `rank_transform`, `volatility_scale`, `flip_sign` (negative Sharpe only),
 `set_neutralization` (to a finer group), `backfill_fields` (`ts_backfill` on every catalog
-field), `liquidity_tilt` (`expr * rank(adv20)`), `winsorize` and `change_universe`. The
-model levers are `orthogonalize_against_pool`, `restrict_to_liquid_fields` and, last in
-every class, `model_repair`, where the model proposes its own fix and may change decay or
-neutralization.
+field), `liquidity_tilt` (`expr * rank(adv20)`), `size_tilt` (`expr * (0.25 + rank(cap))`,
+first for sub-universe), `winsorize` and `change_universe`. The
+model levers are `orthogonalize_against_pool`, `restrict_to_liquid_fields`,
+`blend_other_dataset` (first for production correlation: the model writes a partner signal
+from fields of other datasets in the market, listed for it; the code blends it 1:1 with the
+alpha) and, last in every class, `model_repair`, where the model proposes its own fix and
+may change decay or neutralization. A lineage with an accepted alpha gets no more repairs.
 
 Sharpe and fitness failures now go to repair too, but only near misses:
 `repair.near_miss_share` in `config/thresholds.yaml` (Sharpe |value| >= 0.6 x threshold,
@@ -650,11 +653,26 @@ screenshot values (aggregate plus yearly rows for 2019 to 2023).
   limit BRAIN answers 429 and the client waits for a slot. Raise the value once a run
   shows no 429 waits. Raised to 8 the same day (8 submitted within 6 s, no 429). A
   `BRAIN: <id> finished (k of N)` line prints as each simulation finishes; the decision
-  lines follow in order once the whole batch is done.
-- **Lessons by dataset category** (`generator.category_lessons`, gen-v7): advice from our
+  lines follow in order once the whole batch is done. While alphas run, a status line every
+  `simulator.progress_every_seconds` (60) shows each one's time on BRAIN and BRAIN's
+  progress, and a `done on BRAIN, fetching` line marks the minutes spent fetching results.
+- **Power Pool candidates** (`power_pool.py`, recorded only): a result whose regular-alpha
+  misses BRAIN marks only WARNING, with every ruled check passing and POWER_POOL_CORRELATION
+  not failed, gets a `power_pool_candidate` reason and a console line; `cli power-pool`
+  lists them from memory with a description to submit by hand. No decision changes.
+- **Lesson Writer** (`lessons.py`, agents.yaml `lessons`): after every research run and
+  every `cli run` batch, evidence from all of memory (what each change did to each BRAIN
+  number, production correlation by the data an alpha reads, failures per region and data
+  category, hand variants' described changes) becomes lessons, by rules or condensed by the
+  strategy model. They are stored append-only in memory and the next run's Generator and
+  Repair Agent read the latest ones for their market. `cli lessons` shows them;
+  `cli lessons --write [--model M]` writes new ones now. Advice only (OQ-22).
+- **Lessons by dataset category** (`generator.category_lessons`, gen-v8): advice from our
   own results shown to the Generator by the BRAIN category of its arm's dataset (`all`
-  goes to every arm). Repair lever `speed_up` (decay and smoothing windows down) is the
-  first `recent_sharpe` lever.
+  goes to every arm; `analyst` and, since 2026-11-15, `pv`). Repair lever `speed_up`
+  (decay and smoothing windows down) is the first `recent_sharpe` lever. The Critic adds an
+  advisory to a fresh alpha that reads only price/volume data
+  (`critic.price_volume_categories`), which tends to fail production correlation.
 - **OQ-4 Drawdown and concentration limits.** Policy choice.
 - **OQ-5 Leg balance and top-PnL-removal thresholds.** Policy choice.
 - **OQ-6 Weak-year floor and yearly Sharpe spread.** Policy choice.

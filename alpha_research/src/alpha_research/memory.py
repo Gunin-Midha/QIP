@@ -1,8 +1,8 @@
 """Append-only SQLite memory store (spec section 11.1).
 
 Rules:
-* candidates, results, decisions, variants and critic_reviews are append-only. This class
-  exposes no method that updates or deletes those rows.
+* candidates, results, decisions, variants, critic_reviews and lessons are append-only. This
+  class exposes no method that updates or deletes those rows.
 * ``os_is`` may be upserted (explicitly allowed by the spec) via ``record_os_is``.
 * Every write runs inside a transaction.
 
@@ -77,6 +77,17 @@ CREATE TABLE IF NOT EXISTS critic_reviews (
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS lessons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id TEXT NOT NULL,
+    audience TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    text TEXT NOT NULL,
+    source TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_lessons_batch ON lessons(batch_id);
 CREATE INDEX IF NOT EXISTS ix_critic_reviews_candidate ON critic_reviews(candidate_id);
 CREATE INDEX IF NOT EXISTS ix_candidates_hash ON candidates(expression_hash);
 CREATE INDEX IF NOT EXISTS ix_candidates_family ON candidates(family);
@@ -195,6 +206,20 @@ class MemoryStore:
                  json.dumps(payload or {}), _now()),
             )
         return cur.lastrowid
+
+    def put_lessons(self, batch_id: str, lessons: list[dict], source: str,
+                    evidence: dict | None = None) -> int:
+        """One Lesson Writer write (lessons.py): each lesson {audience, scope, text}, all
+        under ``batch_id``. The evidence is stored once, on the write's first row (the
+        others hold "{}"): it is about 20 KB, and every write recomputes it from memory."""
+        ev, now = json.dumps(evidence or {}, sort_keys=True, default=str), _now()
+        with self.conn:
+            self.conn.executemany(
+                "INSERT INTO lessons (batch_id, audience, scope, text, source, evidence_json, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(batch_id, x["audience"], x["scope"], x["text"], source,
+                  ev if i == 0 else "{}", now) for i, x in enumerate(lessons)])
+        return len(lessons)
 
     def record_os_is(self, alpha_id: str, family: str | None, is_sharpe: float | None,
                      os_sharpe: float | None) -> None:
@@ -345,6 +370,14 @@ class MemoryStore:
             info["simulations"] += 1
             info["last"] = max(info["last"] or "", r["last"])
         return out
+
+    def latest_lessons(self) -> list[dict]:
+        """The lessons of the latest Lesson Writer write, in written order. Read-only."""
+        rows = self.conn.execute(
+            "SELECT batch_id, audience, scope, text, source, created_at FROM lessons "
+            "WHERE batch_id = (SELECT batch_id FROM lessons ORDER BY id DESC LIMIT 1) "
+            "ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
 
     def critic_reviews(self) -> list[dict]:
         """Every critic verdict, oldest first. Read-only."""

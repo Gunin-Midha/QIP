@@ -243,14 +243,16 @@ def test_cli_repair_and_levers(tmp_path, candidate, capsys):
     kids = [e.candidate for e in load_candidate_file(out)]
     # p1's liquidity_tilt child is already in memory, so that experiment is skipped; rank and
     # backfill do not apply to rank(-ts_delta(close, 5)); ids never collide with memory
-    assert [k.lever for k in kids] == ["change_universe"] and kids[0].parent_id == "p1"
-    assert kids[0].candidate_id == "p1_r1d"   # p1_r1a, b, c are in memory
-    # within budget p1's lineage is closed: its last two repairs did not get closer
+    assert [k.lever for k in kids] == ["size_tilt", "change_universe"]
+    assert {k.parent_id for k in kids} == {"p1"}
+    assert [k.candidate_id for k in kids] == ["p1_r1d", "p1_r1e"]   # p1_r1a, b, c are in memory
+    # within budget p1's lineage is closed: p1_r1a was accepted (the patience rule, its last
+    # two repairs not getting closer, is tested in test_pipeline_guards)
     capsys.readouterr()
     assert cli.main(["repair", "--candidate-id", "p1", "--out", str(out),
                      "--playbook", str(ROOT / "config" / "repair_playbook.yaml"),
                      "--fastexpr", str(ROOT / "config" / "fastexpr.yaml"), *common]) == 6
-    assert "stopped improving" in capsys.readouterr().out
+    assert "already has an accepted alpha (p1_r1a)" in capsys.readouterr().out
     assert cli.main(["repair", "--candidate-id", "nope", "--out", str(out),
                      "--playbook", str(ROOT / "config" / "repair_playbook.yaml"),
                      "--fastexpr", str(ROOT / "config" / "fastexpr.yaml"), *common]) == 2

@@ -1,12 +1,13 @@
 # Levers per failure class (one per repair). repair_agent.py applies them. Mechanical
 # rewrites (no model): increase_decay, tighten_truncation, lengthen_ts_window,
 # wrap_in_smoothing, hump, rank_transform, volatility_scale, flip_sign, set_neutralization,
-# backfill_fields, liquidity_tilt, winsorize, change_universe, and one lever per
+# backfill_fields, liquidity_tilt, size_tilt, winsorize, change_universe, and one lever per
 # neutralization off the group scale: neutralize_statistical, neutralize_crowding,
 # neutralize_reversion_and_momentum, neutralize_fast, neutralize_slow,
 # neutralize_slow_and_fast, neutralize_country (each applies only where the alpha's region
-# allows it). Any other lever is handed to the model and its answer must pass the Fast
-# Expression validator.
+# allows it). blend_other_dataset asks the model for a partner signal from another dataset
+# and builds the blend itself (repair_agent.build_blend). Any other lever is handed to the
+# model and its answer must pass the Fast Expression validator.
 #
 # Consultant level (2026-11-11, builder's priors, OQ-18): the factor neutralizations are
 # listed after the group levers they compete with, so the learner tries them and keeps them
@@ -91,16 +92,20 @@ self_correlation:
   - lever: model_repair
     step: {}
 sub_universe:                       # the alpha must also work on the larger, liquid names
-  - lever: liquidity_tilt
-    step: {field: adv20}
+  - lever: size_tilt                # x (0.25 + rank(cap)), uncentred. EUR reversal rescues
+    step: {field: cap, offset: 0.25}  # (2026-11-15): sub-universe / full Sharpe 0.43 -> 0.54
+                                    # (BRAIN's cutoff ~0.52 x own Sharpe) and the recent years
+                                    # held; fitness falls with the tilt (1.24 at 0.5, 1.01 at 0.25)
   - lever: backfill_fields
     step: {lookback: 63}
   - lever: rank_transform
     step: {}
-  - lever: change_universe
-    step: {to: TOP1000}
+  - lever: liquidity_tilt           # an adv20 tilt cost fitness (0.83-1.06) and the recent
+    step: {field: adv20}            # years (2-year Sharpe 1.43 vs 2.55 with cap) in EUR
   - lever: restrict_to_liquid_fields
     step: {}
+  - lever: change_universe          # the smaller universe alone cut EUR's Sharpe 2.80 -> 1.03
+    step: {to: TOP1000}
   - lever: model_repair
     step: {}
 drawdown:
@@ -134,15 +139,31 @@ recent_sharpe:                      # BRAIN's LOW_2Y_SHARPE / IS_LADDER_SHARPE: 
   - lever: model_repair
     step: {}
 prod_correlation:                   # BRAIN's PROD_CORRELATION: too close to production alphas
-  - lever: neutralize_statistical   # (which we cannot see, so no pool to orthogonalize against)
+                                    # (which we cannot see, so no pool to orthogonalize against)
+  - lever: blend_other_dataset      # new information at equal weight. EUR reversal rescues
+    step:
+      weight: 1.0
+      exclude_categories: [pv, risk]  # the alpha's own kind of data; factor loadings
+      min_coverage: 0.5
+      min_alphas: 5
+      per_dataset: 8
+      max_fields: 48
+      # kinds of signal offered first to the model (word match on field id + description)
+      topics: >-
+        analyst estimate revision raised lowered upgrades downgrades recommendation buy sell
+        consensus surprise profitability margin return equity assets cash flow accruals
+        quality earnings yield valuation growth sentiment insider institutional ownership
+                                    # (2026-11-15): peer group, tilt, horizon and neutralization
+                                    # kept it at 0.70-0.76; a third analyst blend 0.720, half 0.645
+  - lever: differentiate_from_production
     step: {}
   - lever: neutralize_crowding
     step: {}
   - lever: neutralize_reversion_and_momentum
     step: {}
-  - lever: differentiate_from_production
+  - lever: neutralize_statistical
     step: {}
-  - lever: lengthen_ts_window       # a different horizon of the same idea
+  - lever: lengthen_ts_window       # a different horizon of the same idea; did not help in EUR
     step: {factor: 3}
   - lever: model_repair
     step: {}

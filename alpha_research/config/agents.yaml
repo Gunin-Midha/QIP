@@ -21,6 +21,26 @@ critic:
     categories: [news, sentiment, socialmedia]
     coverage_below: 0.5
     lookback: 20
+  # A fresh alpha that reads only base fields and fields of these dataset categories gets an
+  # advisory: price/volume-only signals are the most common production alphas (EUR reversal
+  # rescues 2026-11-15: PROD_CORRELATION 0.70-0.76 however reshaped, 0.645 once blended 1:1
+  # with analyst revisions). Builder default 2026-11-15. Empty list = advisory off.
+  price_volume_categories: [pv]
+
+# Lesson Writer (lessons.py): after every research run and every `cli run` batch, evidence
+# from all of memory (what each change did to each BRAIN check, production correlation by
+# the data an alpha reads, failures per region and data category) becomes lessons that the
+# next run's Generator and Repair Agent read. Rewritten from all of memory each time, so a
+# lesson later evidence contradicts is replaced. Advice only: no decision changes. The
+# research run uses the strategy model (one call, within --max-llm-calls) and falls back to
+# rule-written lessons; `cli run` writes rule lessons. Builder defaults 2026-11-15 (OQ-22).
+lessons:
+  after_every_batch: true
+  use_model: true
+  min_evidence: 3                  # alphas per group before it becomes a lesson
+  max_lessons: 12
+  max_prompt_chars: 12000          # evidence sent to the model (Groq's free plan: 8,000 tokens a minute)
+  catalog_plan: config/research_plan.v4.yaml   # catalogs for data categories outside a run
 
 debate:
   use_model: true                  # false = the critic's verdict stands

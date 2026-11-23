@@ -51,3 +51,4 @@ simulator:
   poll_interval_seconds: 5
   max_retries: 3
   max_concurrent: 1
+  progress_every_seconds: null   # decision lines only (test_pipeline_acceptance counts them)

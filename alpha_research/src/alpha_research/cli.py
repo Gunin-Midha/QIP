@@ -26,6 +26,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -47,6 +48,8 @@ from .pipeline import Pipeline, load_candidate_file
 from .repair import Playbook
 from .lever_stats import LeverStats, repair_events
 from .repair_agent import RepairAgent
+from . import power_pool
+from .lessons import LessonsOutcome, learn as learn_lessons, summary as lessons_summary
 from .research import (Budget, ResearchRun, load_agents_config, load_plan, load_seeds,
                        write_report)
 from . import prompts as agent_prompts
@@ -89,8 +92,81 @@ def _run(args) -> int:
         pipeline = Pipeline(config, playbook, client, memory, sleep=sleep,
                             clock=clock, out=sys.stdout)
         pipeline.run([e.candidate for e in entries])
+        if not args.no_lessons:
+            _write_lessons(memory, args, "batch" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"))
     finally:
         memory.close()
+    return EXIT_OK
+
+
+def _write_lessons(memory: MemoryStore, args, batch_id: str, llm=None) -> LessonsOutcome | None:
+    """Lesson Writer after a batch (lessons.py): rules, or the model when ``llm`` is given;
+    datafield catalogs from the agents config's lessons.catalog_plan."""
+    agents = load_agents_config(args.agents)
+    cfg = agents.lessons
+    if not cfg.after_every_batch and llm is None:
+        return None
+    markets: dict = {}
+    if cfg.catalog_plan:
+        try:
+            markets = _plan_catalogs(load_plan(cfg.catalog_plan))
+        except ConfigError as exc:
+            print(f"lessons: no datafield catalogs ({exc}); categories unknown", file=sys.stderr)
+    out = learn_lessons(memory.candidate_outcomes(), FastExprSpec.load(args.fastexpr),
+                        lambda region, delay: markets.get((region, delay), (None, {}))[1], cfg,
+                        llm=llm, max_output=agents.max_output)
+    if out.lessons:
+        memory.put_lessons(batch_id, out.lessons, out.source, out.evidence)
+    print(lessons_summary(out))
+    return out
+
+
+def _power_pool(args) -> int:
+    """Power Pool candidates in memory (power_pool.py), recomputed from every stored
+    result, with a description to submit them by hand. Recorded only."""
+    config = load_config(args.config)
+    submission = config.gates.submission_checks
+    memory = MemoryStore(args.data_dir)
+    try:
+        rows = [r for r in memory.candidate_outcomes()
+                if power_pool.candidate_reason(r["result"], r["decision"], submission)]
+    finally:
+        memory.close()
+    if args.region:
+        rows = [r for r in rows if r["candidate"].region == args.region]
+    if not rows:
+        print("no Power Pool candidates in memory")
+        return EXIT_OK
+    for r in rows:
+        c = r["candidate"]
+        print(power_pool.describe(c, r["result"], submission))
+        text = " ".join((c.hypothesis or "").split())
+        ok = "ok" if len(text) >= power_pool.DESCRIPTION_MIN else \
+            f"too short for BRAIN's {power_pool.DESCRIPTION_MIN}"
+        print(f"  description ({len(text)} characters, {ok}): {text or '(none)'}")
+        print(f"  expression: {c.expression}")
+    print(f"{len(rows)} candidate(s). BRAIN's Power Pool rules beyond these checks are not "
+          "known to the pipeline: check them in BRAIN before submitting.")
+    return EXIT_OK
+
+
+def _lessons(args) -> int:
+    """Show the latest lessons; with --write, write new ones from memory first."""
+    memory = MemoryStore(args.data_dir)
+    try:
+        if args.write:
+            llm = _llm_client(args) if args.model or args.llm == "scripted" else None
+            _write_lessons(memory, args, "manual" + datetime.now(timezone.utc).strftime(
+                "%Y%m%d%H%M%S"), llm=llm)
+        rows = memory.latest_lessons()
+    finally:
+        memory.close()
+    if not rows:
+        print("no lessons in memory yet")
+        return EXIT_OK
+    print(f"lessons of {rows[0]['batch_id']} ({rows[0]['source']}, {rows[0]['created_at'][:19]}):")
+    for r in rows:
+        print(f"- [{r['audience']} | {r['scope']}] {r['text']}")
     return EXIT_OK
 
 
@@ -540,7 +616,8 @@ def _prompts(args) -> int:
     context = agent_prompts.brain_context(config, args.regions)
     builders = {"prefilter": agent_prompts.prefilter_system, "critic": agent_prompts.critic_system,
                 "judge": agent_prompts.judge_system, "repair": agent_prompts.repair_system,
-                "strategy": agent_prompts.strategy_system}
+                "strategy": agent_prompts.strategy_system,
+                "lessons": agent_prompts.lessons_system}
     for name in builders if args.agent == "all" else [args.agent]:
         print(f"===== {name} ({agent_prompts.PROMPT_VERSIONS[name]})\n{builders[name](context)}\n")
     return EXIT_OK
@@ -564,6 +641,11 @@ def build_parser() -> argparse.ArgumentParser:
                      help="simulations on BRAIN at once (default: simulator.max_concurrent in "
                           "--config); over the account's limit BRAIN answers 429 and the "
                           "client waits for a slot")
+    run.add_argument("--agents", default="config/agents.yaml",
+                     help="lessons section: the Lesson Writer runs after the batch")
+    run.add_argument("--fastexpr", default="config/fastexpr.yaml")
+    run.add_argument("--no-lessons", action="store_true",
+                     help="do not write lessons from memory after this batch")
     run.set_defaults(func=_run)
 
     bandit = sub.add_parser("bandit", help="Phase 2 driver: allocation rounds over fixture arms")
@@ -662,8 +744,26 @@ def build_parser() -> argparse.ArgumentParser:
     md.add_argument("--agents", default="config/agents.yaml")
     md.set_defaults(func=_models)
 
+    pp = sub.add_parser("power-pool", help="Power Pool candidates in memory (recorded only)")
+    pp.add_argument("--data-dir", default=str(default_data_dir()))
+    pp.add_argument("--config", default="config/thresholds.yaml")
+    pp.add_argument("--region", default=None)
+    pp.set_defaults(func=_power_pool)
+
+    ls = sub.add_parser("lessons", help="the Lesson Writer's latest lessons (--write: new ones now)")
+    ls.add_argument("--data-dir", default=str(default_data_dir()))
+    ls.add_argument("--agents", default="config/agents.yaml")
+    ls.add_argument("--fastexpr", default="config/fastexpr.yaml")
+    ls.add_argument("--write", action="store_true", help="write lessons from memory first")
+    ls.add_argument("--model", default=None,
+                    help="with --write: let this model condense the evidence (else rules)")
+    ls.add_argument("--llm", choices=["real", "scripted"], default="real")
+    ls.add_argument("--llm-script", default=None, help="with --llm scripted: JSON list of replies")
+    ls.set_defaults(func=_lessons)
+
     pr = sub.add_parser("prompts", help="print the agents' system prompts with this config's thresholds")
-    pr.add_argument("--agent", choices=["all", "prefilter", "critic", "judge", "repair", "strategy"],
+    pr.add_argument("--agent", choices=["all", "prefilter", "critic", "judge", "repair", "strategy",
+                                         "lessons"],
                     default="all")
     pr.add_argument("--config", default="config/thresholds.yaml")
     pr.add_argument("--regions", nargs="*", default=["USA"],

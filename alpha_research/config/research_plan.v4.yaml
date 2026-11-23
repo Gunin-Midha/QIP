@@ -1,5 +1,11 @@
 # Research plan v4 (2026-11-14, DRAFT): plan v3 with hypotheses that name no fields.
 #
+# 2026-11-15 (owner): EUR's pv1 overnight-vs-intraday hypothesis was replaced (its idea is
+# now an accepted alpha, hand_20261115_eur_37_blend_half_analyst, so a repeat would fail
+# SELF_CORRELATION) by a price idea paired with another dataset, and EUR gained an analyst69
+# arm (net revision breadth, the part that took that alpha's production correlation from
+# 0.74 to 0.65). Every other arm is still plan v3's.
+#
 # Same arms, settings, seeds and catalogs as plan v3 (so the two can be compared). Only the
 # hypotheses changed: each describes the idea, the mechanism and the form to avoid, but no
 # datafield ids, so the Generator picks the fields from the arm's catalog listing. Why:
@@ -118,7 +124,7 @@ regions:
       - dataset: pv1
         delay: 1
         hypotheses:
-          - "Overnight versus intraday returns: European stocks with strong overnight gaps that fade during the day carry information-free pressure that reverses over the next days. Rank the 10-day sum of intraday minus overnight returns within country."
+          - "Low idiosyncratic volatility with improving fundamentals: stocks whose daily returns are calm relative to their industry outperform, but a pure price signal is the most common production alpha in Europe. Pair the volatility part with a fundamental or analyst part (improving profitability or estimate upgrades) at equal weight, each ranked within industry."
           - "Abnormal trading activity: a jump in share turnover relative to its own recent average marks attention-driven buying that reverses over 1-4 weeks (Gervais, Kaniel and Mingelgrin 2001 found the opposite for low-attention names, so test both signs). Rank within country and industry."
       - dataset: model38
         delay: 1
@@ -132,6 +138,12 @@ regions:
         hypotheses:
           - "Free cash flow yield: trailing free cash flow relative to market value predicts returns in Europe, where reported earnings differ by accounting standard. Backfill, rank within industry, and smooth."
           - "Free-cash-flow momentum: improving quarterly free cash flow per share, scaled by price, marks fundamentals that the price follows over the next quarter. Rank within country."
+      - dataset: analyst69
+        delay: 1
+        settings: {neutralization: SECTOR, decay: 2}
+        hypotheses:
+          - "Net estimate revision breadth on less-used items: the share of analysts raising minus lowering their 4-week forecasts, over the number of estimates, averaged over several items other than headline earnings and sales (cash flow, pre-tax profit, EBITDA, operating profit). Investors under-react to broad revisions. Average list-valued items, rank within sector, little smoothing."
+          - "Revision breadth confirmed by recommendations: net revision breadth on several forecast items plus the change in buy minus sell recommendations over the number of recommending analysts. Two kinds of analyst action agreeing are less noisy than either; rank within sector."
 
   ASI:
     enabled: true

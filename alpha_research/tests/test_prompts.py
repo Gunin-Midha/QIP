@@ -22,6 +22,7 @@ SYSTEMS = {
     "judge": (prompts.judge_system, ['"rulings"', '"ruling"', '"decisive_point"']),
     "repair": (prompts.repair_system, ['"expression"', '"explanation"']),
     "strategy": (prompts.strategy_system, ['"guidance"', '"hypotheses"', '"dataset"']),
+    "lessons": (prompts.lessons_system, ['"lessons"', '"audience"', '"scope"', '"text"']),
 }
 
 
@@ -103,7 +104,7 @@ def test_research_run_wires_prompts_and_context(memory, config, playbook):
     from test_research import RouterLLM, make_run
     llm = RouterLLM()
     report = make_run(memory, config, playbook, llm=llm).run(2)
-    assert report["prompt_versions"] == {"generator": "gen-v7", **prompts.PROMPT_VERSIONS}
+    assert report["prompt_versions"] == {"generator": "gen-v8", **prompts.PROMPT_VERSIONS}
     assert report["models"]["generator"] == ["claude-test"]
     agent_systems = [s for s in llm.all_systems if "Fast Expression language." not in s[:200]
                      and not s.startswith("You are a quantitative researcher")]
@@ -118,7 +119,7 @@ def test_cli_prompts_prints_rendered_prompts(capsys):
     sharpe_min = load_config(ROOT / "config" / "thresholds.yaml").gates.sharpe_min
     assert out.startswith("===== judge (judge-v4)") and f"Sharpe at least {sharpe_min:g}" in out
     assert cli.main(["prompts", "--config", str(ROOT / "config" / "thresholds.yaml")]) == 0
-    assert capsys.readouterr().out.count("=====") == 5
+    assert capsys.readouterr().out.count("=====") == 6
 
 
 def test_critic_and_judge_revise_fixable_defects_instead_of_dropping():

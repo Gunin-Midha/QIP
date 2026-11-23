@@ -76,14 +76,16 @@ from .critic import Critic, DebateJudge, ReviewOutcome, SparseFieldRule, review_
 from .compare import arm_models, model_comparison
 from .fastexpr import FastExprSpec, analyze, catalog, catalog_for
 from .generator import (AlphaGenerator, GenerationError, GenerationSettings, GeneratorConfig,
-                        Source)
+                        Source, dataset_category)
 from .llm import LLMClient, LLMUnavailable, ModelDown, provider_of
 from .memory import MemoryStore
 from .orchestrator import Orchestrator, balance_slots
+from . import power_pool
 from .pipeline import Pipeline
 from .prompts import PROMPT_VERSIONS, bar_text, brain_context
 from .prefilter import PreFilter, PrefilterConfig
 from .repair import Playbook
+from .lessons import LessonsConfig, for_agent, learn, summary
 from .lever_stats import LeverStats, RepairLearningConfig, distance, repair_events
 from .repair_agent import RepairAgent
 from .schemas import (GROUP_NEUTRALIZATIONS, NO_REGULAR_SIMULATION, REGION_SETTINGS,
@@ -223,6 +225,8 @@ class AgentsConfig:
     region_balance_since: str | None = None   # ISO date: count simulations per region from here
     repair: RepairLearningConfig = field(default_factory=RepairLearningConfig)
     sparse: SparseFieldRule | None = None     # critic.sparse_fields; None = rule off
+    price_categories: tuple[str, ...] = ()    # critic.price_volume_categories; () = advisory off
+    lessons: LessonsConfig = field(default_factory=lambda: LessonsConfig(after_every_batch=False))
 
     def used_models(self) -> list[str]:
         """Model ids this config will call (agents with the model switched off left out)."""
@@ -354,7 +358,16 @@ def agents_config_from_dict(raw) -> AgentsConfig:
                          else _pos_int(secs["director"], "director", "regions_per_run")),
         region_balance_since=_opt_date(secs["director"], "director", "region_balance_since"),
         sparse=_sparse_rule(secs["critic"]),
+        price_categories=_categories(secs["critic"], "price_volume_categories"),
+        lessons=LessonsConfig.from_dict(raw.get("lessons")),
     )
+
+
+def _categories(sec: dict, key: str) -> tuple[str, ...]:
+    raw = sec.get(key) or []
+    if not isinstance(raw, list) or not all(isinstance(c, str) and c for c in raw):
+        raise ConfigError(f"agents config: critic.{key} must be a list of category names")
+    return tuple(raw)
 
 
 def _sparse_rule(sec: dict) -> SparseFieldRule | None:
@@ -645,9 +658,11 @@ class ResearchRun:
         self.pipeline = Pipeline(config, playbook, client, memory, sleep=sleep, clock=clock,
                                  out=out)
         limits, mo = generator_config.limits, agents.max_output
+        # the Lesson Writer's latest lessons (lessons.py), read once at the start
+        self.lessons = memory.latest_lessons()
         # thresholds from config and the plan's regions, shown to every agent's model
         self.seen_limits = brain_limits(memory.candidate_outcomes())   # BRAIN's, per market
-        ctx = brain_context(config, sorted({p.settings.region for p in plans}),
+        self.ctx = ctx = brain_context(config, sorted({p.settings.region for p in plans}),
                             seen_limits=self.seen_limits)
         m = self.models
         pf_llm = self.fallback(m.prefilter) if agents.prefilter.use_model else None
@@ -660,10 +675,16 @@ class ResearchRun:
         sparse = ({None: rule.fields(self.field_meta),
                    **{k: rule.fields(meta) for k, (_, meta) in self.markets.items()}}
                   if rule else {})
+        cats = set(agents.price_categories)
+        price = ({k: {f for f, x in meta.items() if (x or {}).get("category") in cats}
+                  for k, meta in [(None, self.field_meta),
+                                  *((k, meta) for k, (_, meta) in self.markets.items())]}
+                 if cats else {})
         self.critics = {cm: Critic(spec, llm=self.llm(cm) if cm else None, datafields=typed,
                                    markets=mtyped, limits=limits, max_output=mo, context=ctx,
                                    sparse=sparse,
-                                   sparse_lookback=rule.lookback if rule else 20)
+                                   sparse_lookback=rule.lookback if rule else 20,
+                                   price_fields=price)
                         for cm in critic_models}
         self.judge = DebateJudge(llm=self.fallback(m.debate) if agents.debate_model else None,
                                  max_output=mo, context=ctx)
@@ -671,7 +692,13 @@ class ResearchRun:
                                     llm=self.fallback(m.repair) if agents.repair_model else None,
                                     datafields=typed, markets=mtyped, limits=limits,
                                     max_output=mo, context=ctx, learning=agents.repair,
-                                    seed=seed)
+                                    seed=seed,
+                                    field_meta={None: self.field_meta,
+                                                **{k: meta for k, (_, meta) in self.markets.items()}},
+                                    crowding=(generator_config.crowded_percentile,
+                                              generator_config.crowded_min_alphas),
+                                    generator_config=generator_config,
+                                    lessons=self.lessons)
         st_llm = self.fallback(m.strategy) if agents.strategy.every_rounds else None
         self.strategist = StrategyEvolution(agents.strategy, llm=st_llm, max_output=mo,
                                             context=ctx)
@@ -698,6 +725,7 @@ class ResearchRun:
         self.log: list[dict] = []
         self.stop_reason: str | None = None
         self.resumed: list[dict] = []
+        self.power_pool: list[dict] = []   # Power Pool candidates this run (recorded only)
         self.recovered: list[dict] = []
         self.warm_started = self._warm_start()
         self.region_sims, self.run_regions = self._pick_regions()
@@ -785,7 +813,7 @@ class ResearchRun:
 
     def _emit(self, text: str) -> None:
         if self.out is not None:
-            print(text, file=self.out)
+            print(text, file=self.out, flush=True)
 
     def _generator(self, key: tuple) -> AlphaGenerator:
         plan = self.arms[key]
@@ -805,6 +833,9 @@ class ResearchRun:
                f"{plan.settings.delay}, from its checks on our alphas): {bar}.") if bar else None
         parts = [p for p in (bar, notes, plan.guidance) if p]
         self.generators[key].guidance = "\n".join(parts) or None
+        meta = self.catalog_of(plan.settings.region, plan.settings.delay)[1]
+        self.generators[key].learned = for_agent(
+            self.lessons, "generator", plan.settings.region, dataset_category(plan.dataset, meta))
         return self.generators[key]
 
     # ------------------------------------------------------------------ run
@@ -940,6 +971,35 @@ class ResearchRun:
                 if (c := self.memory.get_candidate(a)) is not None]
 
     def run(self, rounds: int) -> dict:
+        self._run(rounds)
+        lessons = self._learn()
+        report = self.report()   # after the Lesson Writer, so its model call is counted
+        report["lessons"] = lessons
+        return report
+
+    def _learn(self) -> dict | None:
+        """Lesson Writer after the run (lessons.py): evidence from all of memory, lessons
+        written by the strategy model while the budget lasts, else by rules; stored for the
+        next run's agents."""
+        cfg = self.agents.lessons
+        if not cfg.after_every_batch:
+            return None
+        llm = self.fallback(self.models.strategy) if cfg.use_model else None
+        args = (self.memory.candidate_outcomes(), self.spec,
+                lambda region, delay: self.catalog_of(region, delay)[1], cfg)
+        try:
+            out = learn(*args, llm=llm, context=self.ctx,
+                        max_output=self.agents.max_output)
+        except LLMUnavailable as exc:   # budget used up: the rules still write
+            out = learn(*args)
+            out.notes.append(f"no model call left ({exc}); rule lessons")
+        if out.lessons:
+            self.memory.put_lessons(self.run_id, out.lessons, out.source, out.evidence)
+        self._emit(summary(out))
+        return {"written": len(out.lessons), "source": out.source, "notes": out.notes,
+                "lessons": out.lessons}
+
+    def _run(self, rounds: int) -> dict:
         self._prepare_seeds()
         self._recover_submissions()
         if self.agents.repair.resume_from_memory:
@@ -1197,6 +1257,13 @@ class ResearchRun:
         item = {"candidate_id": cand.candidate_id, "decision": outcome.decision,
                 "failure_class": outcome.failure_class}
         log["outcomes"].append(item)
+        rec = outcome.decision_record
+        if rec is not None and any(r.startswith(power_pool.PREFIX) for r in rec.reasons):
+            item["power_pool_candidate"] = True
+            self.power_pool.append({"candidate_id": cand.candidate_id,
+                                    "brain_alpha_id": power_pool.brain_alpha_id(outcome.result),
+                                    "region": cand.region, "sharpe": outcome.result.sharpe,
+                                    "fitness": outcome.result.fitness})
         seed = next((n for n in self.seed_notes if n.get("candidate_id") == cand.candidate_id),
                     None)
         if seed is not None:
@@ -1300,6 +1367,7 @@ class ResearchRun:
         return {
             "run_id": self.run_id,
             "stop_reason": self.stop_reason,
+            "power_pool_candidates": self.power_pool,
             "simulations_used": self.sims_used,
             "max_concurrent": self.max_concurrent,
             "model_calls": self.counter.calls,

@@ -1,7 +1,7 @@
 # Alpha Generator settings (Phase 3). Technical limits have values. Policy limits are
 # null (= not configured, the check is skipped) until the owner decides (OQ-11).
 generator:
-  prompt_version: gen-v7       # written to CandidateRecord.prompt_version; bump when prompts change
+  prompt_version: gen-v8       # written to CandidateRecord.prompt_version; bump when prompts change
   max_repair_rounds: 1         # times rejected expressions are sent back to the model for a fix
   max_paper_chars: 120000      # longer papers are cut to this many characters (null = no cut)
   max_hypotheses_per_paper: 5  # hypotheses extracted from one paper
@@ -21,14 +21,30 @@ generator:
 
   # Lessons from our own results, shown to the Generator by the BRAIN category of the arm's
   # dataset; "all" goes to every arm. Evidence: the DEU/GBR analyst7 rounds of 2026-11-14
-  # (REPORT.md). Advice in the prompt, never a rule; edit as evidence grows.
+  # and the EUR pv1 reversal rounds of 2026-11-15 (REPORT.md). Advice in the prompt, never a
+  # rule; edit as evidence grows.
   category_lessons:
     all: >-
       When you combine parts, keep their speeds alike or smooth the fast part first: each
       part enters as a rank, but a fast part (a 5-day price reversal, turnover near 50%)
       sets the blend's turnover and behaviour over a slow one (analyst revisions) and
       traded one strong year for a weak one. A part helps a blend only if it is strong in
-      the years the blend is weak without being weak in the others.
+      the years the blend is weak without being weak in the others. BRAIN rejects an alpha
+      too correlated with its production alphas, and reshaping the same signal (another
+      peer group, size tilt, horizon or neutralization) does not change that; new
+      information does. A part from another dataset at about equal weight lowered a
+      reversal's production correlation from 0.74 to 0.65, a third of the weight only to
+      0.72. Such a part need not pass alone: it must carry different information and be
+      sound in the large stocks.
+    pv: >-
+      Signals built only from price and volume (open, close, returns, volume, vwap) are the
+      most common production alphas, so they tend to fail BRAIN's production correlation
+      even when every other check passes. Pair the price idea with a part from another
+      dataset (analyst revisions, fundamentals, a model score) at about equal weight, each
+      part ranked the same way and a missing value set to the middle rank. Rank short-term
+      price signals within industry, which held their recent years better than ranking
+      within country. If the signal is weak in large stocks, multiply it by
+      (0.25 + rank(cap)) rather than tilting by traded value, which cost fitness.
     analyst: >-
       Revision breadth works best as a net share: (raised minus lowered estimates) divided
       by the number of estimates, averaged over several forecast items (sales, net income,
@@ -38,6 +54,11 @@ generator:
       up to 2.5. Revisions are priced fast: little or no smoothing (decay 1-2) and 1-week
       counts helped the most recent years more than longer windows. The single most used
       item (EBIT upgrades) added recent strength but correlates with production alphas.
+      Compare revisions within sector: industry and subindustry peers cut the Sharpe by a
+      third or more. Revision size (change in the mean forecast) and fast price parts
+      hurt. Where items come as lists (VECTOR fields), average them with vec_avg. Revision
+      breadth also makes a good part to blend with a price signal: alone it can be weak in
+      some years, but it adds information production price alphas do not have.
 
   # Field roles, matched (case-insensitive) at the START of BRAIN's description of a field.
   # id: identifiers, codes, names and raw text, which carry no ranking information. They are

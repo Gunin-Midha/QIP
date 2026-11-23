@@ -101,6 +101,8 @@ simulator:
   max_poll_seconds: 1200   # GLB simulations took over 600 s (run rs20261111162604)
   poll_interval_seconds: 5
   max_retries: 3
+  progress_every_seconds: 60      # status line while simulations run (each alpha's BRAIN
+                                  # progress); null = only a line as each one finishes
   max_concurrent: 8               # simulations on BRAIN at once (owner 2026-11-14: 8 ran together
                                   # with no 429). OQ-3: the account's real limit may be higher;
                                   # over it BRAIN answers 429 and the client waits for a slot

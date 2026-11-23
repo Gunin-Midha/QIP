@@ -180,3 +180,49 @@ def test_progress_lines_come_as_each_finishes_then_decisions_in_order(memory, ma
     out.truncate(0), out.seek(0)
     pipe.process_many([candidate(candidate_id="solo", expression="rank(-ts_delta(close, 9))")])
     assert not [ln for ln in out.getvalue().splitlines() if ln.startswith("  BRAIN: ")]
+
+
+class ProgressBrain(SlowBrain):
+    """SlowBrain whose running polls carry BRAIN's progress, with an on_ready hook like
+    RealBrainClient's (called before results are fetched)."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.on_ready = None
+
+    def poll(self, sim):
+        out = super().poll(sim)
+        if out["status"] == "running":
+            out["progress"] = 1 - self.left[sim] / self.polls
+        elif self.on_ready is not None:
+            self.on_ready(sim)
+        return out
+
+
+def test_status_lines_while_running_and_a_line_before_fetching(memory, make_config, candidate,
+                                                             playbook):
+    import io
+    brain = ProgressBrain(polls=10)
+    vc = VirtualClock()
+    config = make_config(simulator__max_concurrent=3, simulator__progress_every_seconds=30)
+    out = io.StringIO()
+    p = Pipeline(config, playbook, brain, memory, sleep=vc.sleep, clock=vc.clock, out=out)
+    p.process_many([candidate(candidate_id=f"rs20261115045859r01a{i}_001",
+                              expression=f"rank(-ts_delta(close, {i + 2}))") for i in range(3)])
+    lines = out.getvalue().splitlines()
+    status = [ln for ln in lines if " running, " in ln]
+    assert status and status[0].startswith("  BRAIN: 3 running, 0 of 3 finished: r01a0_001 0m30s 40%")
+    fetching = [ln for ln in lines if "done on BRAIN, fetching" in ln]
+    assert len(fetching) == 3 and fetching[0].startswith("  BRAIN: rs20261115045859r01a0_001 done")
+    assert lines.index(fetching[0]) < lines.index(next(ln for ln in lines if "finished (1 of 3)" in ln))
+    assert brain.on_ready is None            # the hook is removed after the batch
+
+
+def test_no_status_lines_when_switched_off(memory, make_config, candidate, playbook):
+    import io
+    vc, out = VirtualClock(), io.StringIO()
+    config = make_config(simulator__max_concurrent=3, simulator__progress_every_seconds=None)
+    p = Pipeline(config, playbook, SlowBrain(polls=10), memory, sleep=vc.sleep, clock=vc.clock,
+                 out=out)
+    p.process_many(cands(candidate, 2))
+    assert " running, " not in out.getvalue()

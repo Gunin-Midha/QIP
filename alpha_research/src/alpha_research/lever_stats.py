@@ -331,6 +331,13 @@ def family_budget(candidate: CandidateRecord, outcomes: list[dict],
     cands = {r["candidate"].candidate_id: r["candidate"] for r in outcomes}
     root = lineage_root(candidate.candidate_id, cands)
     members = lineage_members(outcomes, root)
+    # a lineage with an accepted member is done: any further variant is a near copy of it
+    # and fails SELF_CORRELATION (EUR reversal, 2026-11-15: two siblings at 0.01 from
+    # passing were left once one blend was accepted)
+    won = next((r["candidate"].candidate_id for r in members
+                if r.get("decision") is not None and r["decision"].decision == "accept"), None)
+    if won is not None:
+        return 0, f"lineage {root} already has an accepted alpha ({won})"
     tried = [r for r in members if r["candidate"].candidate_id != root and simulated(r)]
     if len(tried) >= config.max_trials_per_root:
         return 0, (f"lineage {root} used its repair budget: {len(tried)} of "

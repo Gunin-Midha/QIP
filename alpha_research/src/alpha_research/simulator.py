@@ -244,6 +244,7 @@ class _Job:
     sim_id: str | None = None        # None until submitted (or resubmitted)
     started: float | None = None
     retried_from: str | None = None  # first simulation id, once BRAIN's error was retried
+    progress: float | None = None    # BRAIN's progress while running (its poll reply)
 
 
 class Simulator:
@@ -261,14 +262,19 @@ class Simulator:
 
     def run_many(self, candidates: list[CandidateRecord],
                  max_concurrent: int | None = None,
-                 on_done: Callable[[ResultRecord, int, int], None] | None = None
-                 ) -> list[ResultRecord]:
+                 on_done: Callable[[ResultRecord, int, int], None] | None = None,
+                 on_status: Callable[[dict], None] | None = None,
+                 on_ready: Callable[[str], None] | None = None) -> list[ResultRecord]:
         """Results in the order of ``candidates``, each persisted as it finishes. At most
         ``max_concurrent`` (default ``simulator.max_concurrent``) run on BRAIN at a time; a
         resumed pending submission takes a slot too. Each simulation has its own
         ``max_poll_seconds`` from its own submission. ``on_done(result, finished, total)``
         is called as each submitted alpha finishes (progress; invalid ones are not
-        submitted and not counted)."""
+        submitted and not counted). ``on_status(snapshot)`` is called at most every
+        ``simulator.progress_every_seconds`` while alphas run: {"running": [(candidate id,
+        seconds since submission, BRAIN's progress or None)], "waiting", "finished",
+        "total"}. ``on_ready(candidate id)`` is called when BRAIN has finished an alpha and
+        its results are being fetched, for a client with an ``on_ready`` hook."""
         limit = max(1, max_concurrent or self.config.simulator.max_concurrent)
         results: list[ResultRecord | None] = [None] * len(candidates)
         waiting: deque[_Job] = deque()
@@ -286,7 +292,25 @@ class Simulator:
             waiting.append(_Job(i, candidate, sim_id))
 
         active: list[_Job] = []
-        total, finished = len(waiting), 0
+        total = len(waiting)
+        every = self.config.simulator.progress_every_seconds
+        last_status = self.clock()
+        hooked = on_ready is not None and hasattr(self.client, "on_ready")
+        if hooked:
+            def ready(sim_id: str) -> None:
+                job = next((j for j in active if j.sim_id == sim_id), None)
+                on_ready(job.candidate.candidate_id if job else sim_id)
+            self.client.on_ready = ready
+        try:
+            return self._loop(waiting, active, results, limit, total, on_done, on_status, every,
+                              last_status)
+        finally:
+            if hooked:
+                self.client.on_ready = None
+
+    def _loop(self, waiting, active, results, limit, total, on_done, on_status, every,
+              last_status) -> list[ResultRecord]:
+        finished = 0
 
         def done(job: _Job, result: ResultRecord) -> None:
             nonlocal finished
@@ -325,6 +349,12 @@ class Simulator:
                     waiting.appendleft(job)
                 else:
                     done(job, result)
+            if on_status is not None and every and active \
+                    and self.clock() - last_status >= every:
+                last_status = self.clock()
+                on_status({"running": [(j.candidate.candidate_id, self.clock() - j.started,
+                                        j.progress) for j in active],
+                           "waiting": len(waiting), "finished": finished, "total": total})
             if active and waits:
                 self.sleep(min(waits))
         return results  # type: ignore[return-value]
@@ -416,6 +446,9 @@ class Simulator:
                 notes=[f"timeout: no completion after {elapsed:.0f}s "
                        f"(max_poll_seconds={cfg.max_poll_seconds:g})"],
             ), False, 0.0
+        prog = raw.get("progress")
+        job.progress = float(prog) if isinstance(prog, (int, float)) and not isinstance(prog, bool) \
+            else job.progress
         wait = raw.get("retry_after")
         wait = float(wait) if isinstance(wait, (int, float)) and wait > 0 else cfg.poll_interval_seconds
         return None, False, wait

@@ -159,7 +159,7 @@ def test_ranker_lists_the_arms_dataset_first():
     assert listed.index("mdl_quality") < listed.index("news_sentiment")
 
 
-# ------------------------------------------------------------------ category lessons (gen-v7)
+# ------------------------------------------------------------------ category lessons (gen-v8)
 
 def test_lessons_by_dataset_category_reach_the_prompt():
     from alpha_research.generator import dataset_category, lessons_for
@@ -170,7 +170,8 @@ def test_lessons_by_dataset_category_reach_the_prompt():
     assert dataset_category("analyst7", meta) == "analyst"
     assert dataset_category("pv1", meta) == "pv" and dataset_category("nope", meta) is None
     assert lessons_for(GEN, "analyst") == [by["all"], by["analyst"]]
-    assert lessons_for(GEN, "pv") == [by["all"]]          # no pv lesson yet: only the general one
+    assert lessons_for(GEN, "pv") == [by["all"], by["pv"]]
+    assert lessons_for(GEN, "news") == [by["all"]]        # no news lesson yet: only the general one
     prompt = build_system_prompt(SPEC, ["est_up"], "upgrades", GEN, meta=meta,
                                  lessons=lessons_for(GEN, "analyst"))
     assert "What our own results showed for this kind of data" in prompt

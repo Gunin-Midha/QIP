@@ -25,12 +25,13 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, TextIO
 
-from . import diversity, evaluator, risk
+from . import diversity, evaluator, power_pool, risk
 from .auditor import Auditor
 from .brain_client import BrainClient
 from .config import Config
@@ -97,6 +98,16 @@ def load_candidate_file(path: str | Path) -> list[CandidateEntry]:
     return entries
 
 
+def _short(candidate_id: str) -> str:
+    """A research-run candidate id without its run id prefix (rs + 14 digits)."""
+    return re.sub(r"^rs\d{14}", "", candidate_id) or candidate_id
+
+
+def _clock(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m{s:02d}s"
+
+
 class Pipeline:
     def __init__(self, config: Config, playbook: Playbook, client: BrainClient,
                  memory: MemoryStore, sleep: Callable[[float], None] = time.sleep,
@@ -119,7 +130,22 @@ class Pipeline:
             what = f"complete: {stats}" if stats else "complete"
         else:
             what = r.status
-        print(f"  BRAIN: {r.candidate_id} finished ({finished} of {total}), {what}", file=self.out)
+        print(f"  BRAIN: {r.candidate_id} finished ({finished} of {total}), {what}", file=self.out,
+              flush=True)
+
+    def _status(self, snap: dict) -> None:
+        """While simulations run: each alpha's time on BRAIN and BRAIN's progress."""
+        def one(cid, secs, prog):
+            p = "" if prog is None else f" {prog * 100 if prog <= 1 else prog:.0f}%"
+            return f"{_short(cid)} {_clock(secs)}{p}"
+        parts = ", ".join(one(*x) for x in snap["running"])
+        tail = f", {snap['waiting']} waiting" if snap["waiting"] else ""
+        print(f"  BRAIN: {len(snap['running'])} running, {snap['finished']} of "
+              f"{snap['total']} finished{tail}: {parts}", file=self.out, flush=True)
+
+    def _fetching(self, candidate_id: str) -> None:
+        print(f"  BRAIN: {candidate_id} done on BRAIN, fetching its results and checks "
+              "(can take a few minutes)", file=self.out, flush=True)
 
     def _emit(self, outcome: Outcome) -> Outcome:
         if self.out is not None:
@@ -143,9 +169,12 @@ class Pipeline:
                 continue
             seen.add(h)
             to_run.append((i, candidate))
+        live = self.out is not None
         results = self.simulator.run_many(
             [c for _, c in to_run],
-            on_done=self._progress if self.out is not None and len(to_run) > 1 else None)
+            on_done=self._progress if live and len(to_run) > 1 else None,
+            on_status=self._status if live else None,
+            on_ready=self._fetching if live else None)
         for (i, candidate), result in zip(to_run, results):
             if result.status != "invalid":
                 self.auditor.register_variant(candidate.family, candidate.candidate_id)
@@ -182,12 +211,20 @@ class Pipeline:
             admitted_by_diversity, checked = self._diversity(result, decision)
             decision = self._informational(decision, checked) if brain_only else checked
 
+        submission = self.config.gates.submission_checks
+        tag = power_pool.candidate_reason(result, decision, submission)
+        if tag is not None:   # recorded only: the decision itself is unchanged
+            decision = dataclasses.replace(decision, reasons=decision.reasons + [tag])
         self.memory.put_decision(decision)
         if decision.decision == "accept":
             self.pool.admit(candidate, result, decision, admitted_by_diversity)
         self.loop.route(candidate, decision)
-        return self._emit(Outcome(candidate.candidate_id, decision.decision,
-                                  decision.failure_class, result, decision))
+        outcome = self._emit(Outcome(candidate.candidate_id, decision.decision,
+                                     decision.failure_class, result, decision))
+        if tag is not None and self.out is not None:
+            print("  " + power_pool.describe(candidate, result, submission), file=self.out,
+                  flush=True)
+        return outcome
 
     @staticmethod
     def _informational(decision: DecisionRecord, checked: DecisionRecord) -> DecisionRecord:

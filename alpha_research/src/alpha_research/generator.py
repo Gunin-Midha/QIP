@@ -776,6 +776,9 @@ class AlphaGenerator:
         self._now = now or (lambda: datetime.now(timezone.utc))
         self.guidance = guidance  # from Strategy Evolution; shown in the system prompt
         self.field_meta = field_meta or {}
+        # the Lesson Writer's lessons for this market and data (lessons.py), set by the
+        # research loop; shown after the configured category lessons
+        self.learned: list[str] = []
         # {field: our alphas on it that failed PROD_CORRELATION in this market}; the
         # research loop refreshes it from memory before each batch
         self.prod_failed: dict[str, int] = {}
@@ -851,7 +854,8 @@ class AlphaGenerator:
                                      prod_failed=self.prod_failed,
                                      dataset=self.settings.dataset,
                                      lessons=lessons_for(self.config, dataset_category(
-                                         self.settings.dataset, self.field_meta)))
+                                         self.settings.dataset, self.field_meta))
+                                     + list(self.learned))
         reply = self._ask_json(system, _generate_prompt(unit.hypothesis, unit.context, k), result)
         good, bad = self._check(self._items(reply), unit)
 

@@ -35,6 +35,8 @@ Method
                        weight and hurts the larger-cap sub-universe)
    liquidity_tilt      final expression -> expr * rank(step.field), tilting weight to
                        liquid names (sub-universe test)
+   size_tilt           final expression -> expr * (step.offset + rank(step.field)),
+                       uncentred (sub-universe test; field cap by default)
    winsorize           final expression -> winsorize(expr, std=step.std)
    change_universe     universe -> step.to if it is a smaller universe of the alpha's
                        region, else the region's next smaller one
@@ -52,7 +54,13 @@ Method
    with a note; the combination does not apply only when no part does. Combinations come
    from the playbook or are learned: one
    that fixed or improved a class before is offered for that class (lever_stats.py).
-4. Any other lever (orthogonalize_against_pool, restrict_to_liquid_fields, model_repair,
+4. ``blend_other_dataset`` (production correlation): the model writes only a partner
+   signal, from a shortlist of fields of other datasets in the alpha's market (not
+   price/volume or risk-model loadings, not crowded, not id/time fields; ordered by match to
+   step.topics); ``build_blend`` then returns
+   (rank(alpha) + step.weight * rank(partner), 0.5 where the partner is missing), with a
+   size/liquidity tilt kept outside. The partner must use a listed field.
+   Any other lever (orthogonalize_against_pool, restrict_to_liquid_fields, model_repair,
    or one added to the playbook later) goes to the model with the metrics, every class
    the alpha fails, the lever, the past repairs of this class that worked (from memory)
    and, for orthogonalization, the pool's expressions. Its expression passes through
@@ -78,7 +86,7 @@ from typing import Collection, Mapping
 from .evaluator import FACTOR_FIRST
 from .fastexpr import (Assign, Binary, Call, ComplexityLimits, FastExprError, FastExprSpec,
                        Name, Num, Unary, analyze, catalog, catalog_for, parse, render)
-from .generator import GenerationError, ask_json
+from .generator import GenerationError, ask_json, crowded_fields, dataset_category, field_role
 from .lever_stats import (LeverStats, RepairLearningConfig, combo_parts, failing_classes,
                           family_budget, rank_levers, repair_events, successful_examples)
 from .llm import LLMClient, ModelDown
@@ -369,6 +377,36 @@ def _liquidity_tilt(c, step, spec, result=None):
     return _with_final(c, Binary("*", final, tilt))
 
 
+def _tilted_by(node, fld: str) -> bool:
+    """``node`` contains rank(fld)."""
+    if isinstance(node, Call):
+        if node.name == "rank" and node.args == (Name(fld),):
+            return True
+        return any(_tilted_by(a, fld) for a in node.args)
+    if isinstance(node, Binary):
+        return _tilted_by(node.left, fld) or _tilted_by(node.right, fld)
+    if isinstance(node, Unary):
+        return _tilted_by(node.operand, fld)
+    return False
+
+
+def _size_tilt(c, step, spec, result=None):
+    """final -> final * (offset + rank(field)): weights rise from offset (smallest) to
+    offset + 1 (largest), uncentred. In the EUR reversal rescues (2026-11-15) the
+    sub-universe Sharpe / full Sharpe ratio went 0.43 (no tilt) -> 0.50 (offset 0.5) ->
+    0.54 (0.25), against BRAIN's cutoff of about 0.52; a traded-value tilt cost fitness and
+    the recent years, and centring the rank first lowered the ratio to 0.44."""
+    _need_op(spec, "rank")
+    fld, offset = step.get("field", "cap"), step.get("offset", 0.5)
+    if fld not in spec.base_fields:
+        raise LeverNotApplicable(f"{fld!r} is not a base field")
+    final = _final(c)[1]
+    if isinstance(final, Binary) and final.op == "*" and _tilted_by(final.right, fld):
+        raise LeverNotApplicable(f"expression is already tilted by rank({fld})")
+    tilt = Binary("+", _num(offset), Call("rank", (Name(fld),), ()))
+    return _with_final(c, Binary("*", final, tilt))
+
+
 def _winsorize(c, step, spec, result=None):
     _need_op(spec, "winsorize")
     final = _final(c)[1]
@@ -390,10 +428,164 @@ MECHANICAL = {
     "set_neutralization": _set_neutralization,
     "backfill_fields": _backfill_fields,
     "liquidity_tilt": _liquidity_tilt,
+    "size_tilt": _size_tilt,
     "winsorize": _winsorize,
     "change_universe": _change_universe,
     **{name: _neutralize_to(target) for name, target in NEUTRALIZE_LEVERS.items()},
 }
+
+
+# ---------------------------------------------------------------------------
+# blend_other_dataset: new information against PROD_CORRELATION
+# ---------------------------------------------------------------------------
+# In the EUR reversal rescues (2026-11-15) changing the peer group, tilt, horizon or
+# neutralization kept production correlation at 0.70-0.76; only blending in a signal from
+# another dataset lowered it, by 0.02 at a third of the weight and 0.09 at half (0.739 ->
+# 0.645, accepted). The model writes only the partner signal from a shortlist of fields of
+# other datasets in the alpha's market; the blend itself is built here, so its shape is
+# fixed: both parts ranked (within the alpha's group when it has one), a stock without a
+# partner value gets the neutral 0.5, and a size/liquidity tilt on the alpha stays outside.
+
+BLEND_LEVER = "blend_other_dataset"
+
+
+def _names(node, out: set) -> set:
+    if isinstance(node, Name):
+        out.add(node.name)
+    elif isinstance(node, Call):
+        for a in node.args:
+            _names(a, out)
+        for _, v in node.kwargs:
+            _names(v, out)
+    elif isinstance(node, Unary):
+        _names(node.operand, out)
+    elif isinstance(node, Binary):
+        _names(node.left, out)
+        _names(node.right, out)
+    elif isinstance(node, Assign):
+        _names(node.value, out)
+    return out
+
+
+def expression_fields(expression: str, spec: FastExprSpec) -> set[str]:
+    """Datafields an expression reads (variables, groups and constants left out)."""
+    stmts = parse(expression)
+    variables = {s.name for s in stmts if isinstance(s, Assign)}
+    used: set = set()
+    for s in stmts:
+        _names(s, used)
+    return used - variables - set(spec.groups) - set(spec.constants)
+
+
+_DATE_WORDS = ("date", "period", "time of day", "currency", "identifier")
+
+
+def partner_fields(meta: Mapping[str, dict], own_datasets: Collection[str], spec: FastExprSpec,
+                   *, crowded: Collection[str] = (), exclude_categories: Collection[str] = (),
+                   min_coverage: float | None = 0.5, min_alphas: int = 5, per_dataset: int = 8,
+                   max_fields: int = 48, topics: str = "", role=None) -> list[tuple[str, dict]]:
+    """Fields a blend partner may use: from another dataset than the alpha's, not in an
+    excluded category (price/volume, the alpha's own kind of information; risk-model
+    factor loadings, which production alphas and neutralizations already carry), not
+    crowded, not an id/time field (``role(field) != 'signal'``, or a description naming a
+    date, period, currency or identifier), with at least ``min_alphas`` BRAIN alphas and
+    coverage at least ``min_coverage`` when known. Ordered by how well the field id and
+    description match ``topics`` (kinds of signal that make good partners; the Generator's
+    IDF word match, ``generator._rank_datafields``), at most ``per_dataset`` per dataset."""
+    from .generator import _rank_datafields
+    own, crowded, excluded = set(own_datasets), set(crowded), set(exclude_categories)
+    eligible = []
+    for f, m in (meta or {}).items():
+        m = m or {}
+        ds, cov = m.get("dataset"), m.get("coverage")
+        desc = (m.get("description") or "").lower()
+        if (not ds or ds in own or m.get("category") in excluded or f in crowded
+                or f in spec.base_fields or m.get("type") not in ("MATRIX", "VECTOR")
+                or (m.get("alpha_count") or 0) < min_alphas
+                or any(w in desc for w in _DATE_WORDS)
+                or (role is not None and role(f) != "signal")
+                or (min_coverage is not None and isinstance(cov, (int, float))
+                    and cov < min_coverage)):
+            continue
+        eligible.append(f)
+    out, per = [], {}
+    for f in _rank_datafields(eligible, topics, len(eligible), meta):
+        ds = meta[f].get("dataset")
+        if per.get(ds, 0) < per_dataset:
+            per[ds] = per.get(ds, 0) + 1
+            out.append((f, meta[f]))
+        if len(out) >= max_fields:
+            break
+    return out
+
+
+def _rename(node, mapping: Mapping[str, str]):
+    if isinstance(node, Name):
+        return Name(mapping.get(node.name, node.name))
+    if isinstance(node, Call):
+        return Call(node.name, tuple(_rename(a, mapping) for a in node.args),
+                    tuple((k, _rename(v, mapping)) for k, v in node.kwargs))
+    if isinstance(node, Unary):
+        return Unary(node.op, _rename(node.operand, mapping))
+    if isinstance(node, Binary):
+        return Binary(node.op, _rename(node.left, mapping), _rename(node.right, mapping))
+    if isinstance(node, Assign):
+        return Assign(mapping.get(node.name, node.name), _rename(node.value, mapping))
+    return node
+
+
+def _is_rank(node) -> bool:
+    if isinstance(node, Unary) and node.op == "-":
+        node = node.operand
+    return isinstance(node, Call) and (node.name == "rank" or node.name == "group_rank")
+
+
+def build_blend(expression: str, partner: str, spec: FastExprSpec, weight: float = 1.0) -> str:
+    """``expression`` blended with ``partner``: (A + weight * B) [* tilt], where A is the
+    alpha's final value as a rank, B the partner ranked the same way (group_rank within the
+    alpha's group, else rank) with 0.5 where it has no value, and tilt a factor of the
+    alpha's final product built only from base fields (a size or liquidity tilt)."""
+    for op in ("rank", "if_else", "is_nan"):
+        _need_op(spec, op)
+    stmts, pstmts = parse(expression), parse(partner)
+    head, final = stmts[:-1], stmts[-1]
+    taken = {s.name for s in stmts if isinstance(s, Assign)}
+    inner, tilt = final, None
+    if isinstance(final, Binary) and final.op == "*":
+        right = _names(final.right, set())
+        if right and right <= set(spec.base_fields) and _tilted_by(final.right, next(iter(right))):
+            inner, tilt = final.left, final.right
+    group = None
+    core = inner.operand if isinstance(inner, Unary) else inner
+    if isinstance(core, Call) and core.name == "group_rank" and len(core.args) == 2 \
+            and isinstance(core.args[1], Name) and core.args[1].name in spec.groups:
+        group = core.args[1]
+    a = inner if _is_rank(inner) else Call("rank", (inner,), ())
+
+    def fresh(base: str) -> str:
+        name, i = base, 2
+        while name in taken or name in spec.reserved_names:
+            name, i = f"{base}{i}", i + 1
+        taken.add(name)
+        return name
+
+    pvars = [s.name for s in pstmts if isinstance(s, Assign)]
+    mapping = {v: fresh(f"partner_{v}") for v in pvars}
+    pstmts = tuple(_rename(s, mapping) for s in pstmts)
+    pfinal = pstmts[-1]
+    if group is not None:
+        _need_op(spec, "group_rank")
+        ranked = Call("group_rank", (pfinal, group), ())
+    else:
+        ranked = Call("rank", (pfinal,), ())
+    va, vb, vf = fresh("blend_a"), fresh("blend_b"), fresh("blend_bf")
+    filled = Call("if_else", (Call("is_nan", (Name(vb),), ()), Num("0.5"), Name(vb)), ())
+    part = Name(vf) if weight == 1 else Binary("*", _num(float(weight)), Name(vf))
+    out = Binary("+", Name(va), part)
+    if tilt is not None:
+        out = Binary("*", out, tilt)
+    return render(head + pstmts[:-1] + (Assign(va, a), Assign(vb, ranked), Assign(vf, filled),
+                                        out))
 
 
 # ---------------------------------------------------------------------------
@@ -426,8 +618,16 @@ class RepairAgent:
                  markets: Mapping[tuple, Mapping] | None = None,
                  limits: ComplexityLimits | None = None, max_output: int = 2048,
                  context: str = "", learning: RepairLearningConfig | None = None,
-                 seed: int | None = None):
+                 seed: int | None = None, field_meta: Mapping | None = None,
+                 crowding: tuple[float | None, int | None] = (None, None),
+                 generator_config=None, lessons: list[dict] | None = None):
         self.playbook = playbook
+        self.lessons = lessons or []   # the Lesson Writer's latest (MemoryStore.latest_lessons)
+        # {(region, delay) or None: catalog meta} (load_datafield_meta; None = markets
+        # without their own): datasets, categories and crowding for blend_other_dataset
+        self.field_meta = field_meta or {}
+        self.crowding = crowding     # generator.yaml crowding: (percentile, min_alphas)
+        self.generator_config = generator_config   # field roles (id/time fields left out)
         self.context = context  # prompts.brain_context(config)
         self.spec = spec
         self.memory = memory
@@ -588,13 +788,21 @@ class RepairAgent:
             return fn(c, lever.step, self.spec, result)
         if self.llm is None:
             raise LeverNotApplicable("needs the model, and no model is configured")
+        partners = None
+        if lever.name == BLEND_LEVER:
+            partners = self._partners(c, lever.step)
+            if not partners:
+                raise LeverNotApplicable("no partner field from another dataset in the "
+                                         f"{c.region} delay-{c.delay} catalog")
         out.notes.append(f"{lever.name}: {MODEL_LEVERS_NOTE}")
         pool = pool if lever.name == "orthogonalize_against_pool" else None
         examples = successful_examples(events, decision.failure_class,
                                        self.learning.examples_in_prompt, region=c.region)
         failing = sorted(failing_classes(decision, result) | {decision.failure_class})
         user = repair_user(c, lever, decision, _metrics(result), pool, self.spec.operators,
-                           failing=failing, examples=examples)
+                           failing=failing, examples=examples,
+                           partners=[_partner_line(f, m) for f, m in partners] if partners else None,
+                           lessons=self._lessons_for(c))
         try:
             reply, calls = ask_json(self.llm, repair_system(self.context), user,
                                     max_output=self.max_output)
@@ -610,6 +818,19 @@ class RepairAgent:
         a = analyze(expr.strip(), self.spec, datafields=self._fields(c), limits=self.limits)
         if not a.ok:
             raise LeverNotApplicable("model expression failed validation: " + "; ".join(a.errors))
+        if partners is not None:
+            # the reply is the partner signal alone; the blend is built here
+            allowed = {f for f, _ in partners}
+            if not expression_fields(expr.strip(), self.spec) & allowed:
+                raise LeverNotApplicable("partner signal uses none of the listed fields of "
+                                         "another dataset")
+            weight = lever.step.get("weight", 1.0)
+            try:
+                expr = build_blend(c.expression, expr.strip(), self.spec, weight=weight)
+            except FastExprError as exc:
+                raise LeverNotApplicable(f"cannot build the blend: {exc}") from exc
+            return dataclasses.replace(c, expression=expr,
+                                       model=getattr(self.llm, "model", c.model))
         changes = {"expression": expr.strip(), "model": getattr(self.llm, "model", c.model)}
         decay, neut = reply.get("decay"), reply.get("neutralization")
         if decay is not None:
@@ -642,3 +863,37 @@ class RepairAgent:
 
     def _fields(self, c: CandidateRecord):
         return catalog_for(self.markets, self.datafields, c.region, c.delay)
+
+    def _lessons_for(self, c: CandidateRecord) -> list[str]:
+        from .lessons import for_agent   # lessons.py imports this module
+        meta = self.field_meta.get((c.region, c.delay), self.field_meta.get(None)) or {}
+        return for_agent(self.lessons, "repair", c.region, dataset_category(c.dataset, meta))
+
+    def _partners(self, c: CandidateRecord, step: Mapping) -> list[tuple[str, dict]]:
+        """Shortlist of partner fields for blend_other_dataset in the alpha's market."""
+        meta = self.field_meta.get((c.region, c.delay), self.field_meta.get(None)) or {}
+        if not meta:
+            return []
+        try:
+            used = expression_fields(c.expression, self.spec)
+        except FastExprError:
+            return []
+        own = {c.dataset} | {(meta.get(f) or {}).get("dataset") for f in used
+                             if f not in self.spec.base_fields}
+        pct, low = self.crowding
+        crowded = crowded_fields(meta, pct, low, exclude=self.spec.base_fields)
+        cfg = self.generator_config
+        return partner_fields(meta, own - {None}, self.spec, crowded=crowded,
+                              exclude_categories=step.get("exclude_categories", ("pv", "risk")),
+                              min_coverage=step.get("min_coverage", 0.5),
+                              min_alphas=step.get("min_alphas", 5),
+                              per_dataset=step.get("per_dataset", 8),
+                              max_fields=step.get("max_fields", 48),
+                              topics=step.get("topics", ""),
+                              role=lambda f: field_role(f, meta, cfg))
+
+
+def _partner_line(f: str, m: dict) -> str:
+    desc = " ".join((m.get("description") or "").split())[:100]
+    return (f"{f} | dataset {m.get('dataset')} ({m.get('category')}) | {m.get('type')} | "
+            f"{m.get('alpha_count')} BRAIN alphas | {desc}")
