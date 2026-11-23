@@ -243,10 +243,12 @@ def test_cli_repair_and_levers(tmp_path, candidate, capsys):
     assert rc == 0
     kids = [e.candidate for e in load_candidate_file(out)]
     # p1's liquidity_tilt child is already in memory, so that experiment is skipped; rank and
-    # backfill do not apply to rank(-ts_delta(close, 5)); ids never collide with memory
-    assert [k.lever for k in kids] == ["size_tilt", "change_universe"]
+    # backfill do not apply to rank(-ts_delta(close, 5)), the units fix (a raw price change
+    # -> a return) does; ids never collide with memory
+    assert [k.lever for k in kids] == ["size_tilt", "relative_price_change",
+                                       "combo:relative_price_change+size_tilt"]
     assert {k.parent_id for k in kids} == {"p1"}
-    assert [k.candidate_id for k in kids] == ["p1_r1d", "p1_r1e"]   # p1_r1a, b, c are in memory
+    assert [k.candidate_id for k in kids] == ["p1_r1d", "p1_r1e", "p1_r1f"]   # a, b, c in memory
     # within budget p1's lineage is closed: p1_r1a was accepted (the patience rule, its last
     # two repairs not getting closer, is tested in test_pipeline_guards)
     capsys.readouterr()

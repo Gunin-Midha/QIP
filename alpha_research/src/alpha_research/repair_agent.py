@@ -44,6 +44,9 @@ Method
    neutralize_<name>   neutralization -> NAME (STATISTICAL, CROWDING,
                        REVERSION_AND_MOMENTUM, FAST, SLOW, SLOW_AND_FAST, COUNTRY),
                        when the region allows it and the alpha does not use it
+   relative_price_change  ts_delta(price, n) -> divide(ts_delta(price, n),
+                       ts_delay(price, n)) for price fields (step.fields): the n-day
+                       return, not a change in currency units
    ==================  ===========================================================
 
    Only the final statement is rewritten; ``name = ...;`` statements are kept.
@@ -121,6 +124,7 @@ LEVER_KINDS = {
     "increase_decay": "smoothing", "speed_up": "smoothing", "lengthen_ts_window": "smoothing",
     "wrap_in_smoothing": "smoothing", "hump": "smoothing",
     "rank_transform": "shape", "winsorize": "shape", "volatility_scale": "shape",
+    "relative_price_change": "shape",
     "tighten_truncation": "shape",
     "set_neutralization": "neutralization",
     "change_universe": "universe", "liquidity_tilt": "universe", "size_tilt": "universe",
@@ -389,6 +393,43 @@ def _backfill_fields(c, step, spec, result=None):
     return dataclasses.replace(c, expression=render(tuple(out)))
 
 
+def _relative(node, fields: set, changed: list):
+    if isinstance(node, Call):
+        if (node.name == "ts_delta" and len(node.args) == 2 and isinstance(node.args[0], Name)
+                and node.args[0].name in fields):
+            changed.append(node.args[0].name)
+            return Call("divide", (node, Call("ts_delay", node.args, ())), ())
+        if node.name == "divide":   # already a ratio: leave it as written
+            return node
+        return Call(node.name, tuple(_relative(a, fields, changed) for a in node.args),
+                    tuple((k, _relative(v, fields, changed)) for k, v in node.kwargs))
+    if isinstance(node, Unary):
+        return Unary(node.op, _relative(node.operand, fields, changed))
+    if isinstance(node, Binary):
+        return Binary(node.op, _relative(node.left, fields, changed),
+                      _relative(node.right, fields, changed))
+    return node
+
+
+def _relative_price_change(c, step, spec, result=None):
+    """ts_delta(price, n) -> divide(ts_delta(price, n), ts_delay(price, n)): the n-day
+    return instead of a change in currency units, so expensive stocks stop dominating
+    the cross-section (BRAIN's UNITS warning on a price change mixed with a unitless
+    field; IND alpha 2026-11-23)."""
+    _need_op(spec, "divide")
+    _need_op(spec, "ts_delay")
+    fields = set(step.get("fields") or ("close", "open", "high", "low", "vwap"))
+    stmts, changed, out = parse(c.expression), [], []
+    for st in stmts:
+        if isinstance(st, Assign):
+            out.append(Assign(st.name, _relative(st.value, fields, changed)))
+        else:
+            out.append(_relative(st, fields, changed))
+    if not changed:
+        raise LeverNotApplicable("no ts_delta of a price field in currency units")
+    return dataclasses.replace(c, expression=render(tuple(out)))
+
+
 def _liquidity_tilt(c, step, spec, result=None):
     _need_op(spec, "rank")
     fld = step.get("field", "adv20")
@@ -440,6 +481,7 @@ def _winsorize(c, step, spec, result=None):
 
 
 MECHANICAL = {
+    "relative_price_change": _relative_price_change,
     "increase_decay": _increase_decay,
     "speed_up": _speed_up,
     "tighten_truncation": _tighten_truncation,

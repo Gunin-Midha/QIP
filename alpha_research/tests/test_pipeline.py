@@ -131,3 +131,36 @@ def test_bandit_driver_floor_holds(capsys):
     floors = {int(r.split("|")[-2]) for r in rows}
     assert floors == {2}                    # floor(0.2 * 50 / 4 arms)
     assert "XYZ" not in out
+
+
+def test_robust_universe_checks_map_to_sub_universe():
+    from alpha_research.evaluator import check_class
+    for name in ("LOW_ROBUST_UNIVERSE_SHARPE", "LOW_ROBUST_UNIVERSE_SHARPE.WITH_RATIO",
+                 "LOW_ROBUST_UNIVERSE_RETURNS", "LOW_INVESTABILITY_CONSTRAINED_SHARPE"):
+        assert check_class("brain:" + name) == "sub_universe"
+    assert check_class("brain:LOW_ASI_JPN_SHARPE") == "other"    # no lever fits it yet
+
+
+def test_a_rejected_alpha_a_lever_can_now_fix_is_re_decided(memory, config, playbook, candidate):
+    # 2026-11-23: an IND alpha (Sharpe 3.14, fitness 2.20) was rejected as "other" for a
+    # robust-universe Sharpe of 0.95 / 1.0; with the mapping it becomes repair / sub_universe
+    from alpha_research.pipeline import Pipeline, newly_repairable
+    from alpha_research.schemas import DecisionRecord, GateResult, ResultRecord
+    c = candidate(candidate_id="ind_1")
+    r = ResultRecord("ind_1", "complete", sharpe=3.14, fitness=2.2, turnover=0.35,
+                     sub_universe_sharpe=1.25, sub_universe_cutoff=0.93,
+                     checks={"LOW_ROBUST_UNIVERSE_SHARPE": False, "LOW_SHARPE": True},
+                     check_values={"LOW_ROBUST_UNIVERSE_SHARPE": {"value": 0.95, "limit": 1.0}})
+    old = DecisionRecord("ind_1", "reject", "other", gate_results=[
+        GateResult("brain:LOW_ROBUST_UNIVERSE_SHARPE", False, 0.95, 1.0, "BRAIN check FAIL")],
+        reasons=["no playbook entry for other"])
+    memory.put_candidate(c)
+    memory.put_result(r)
+    memory.put_decision(old)
+    assert newly_repairable(old, r, playbook)
+    outs = Pipeline(config, playbook, None, memory).reevaluate_rejected()
+    assert [(o.candidate_id, o.decision, o.failure_class) for o in outs] == \
+        [("ind_1", "repair", "sub_universe")]
+    assert memory.decisions_for("ind_1")[-1].decision == "repair"
+    # decided once: a second pass finds nothing (its latest decision is no longer a reject)
+    assert Pipeline(config, playbook, None, memory).reevaluate_rejected() == []

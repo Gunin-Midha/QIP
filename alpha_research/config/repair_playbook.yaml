@@ -96,6 +96,11 @@ sub_universe:                       # the alpha must also work on the larger, li
     step: {field: cap, offset: 0.25}  # (2026-11-15): sub-universe / full Sharpe 0.43 -> 0.54
                                     # (BRAIN's cutoff ~0.52 x own Sharpe) and the recent years
                                     # held; fitness falls with the tilt (1.24 at 0.5, 1.01 at 0.25)
+  - lever: relative_price_change    # a price change in currency units (BRAIN's UNITS warning)
+    step: {fields: [close, open, high, low, vwap]}   # lets expensive stocks dominate; as an
+                                    # n-day return it weighs names alike (IND 2026-11-23)
+  - lever: combo:relative_price_change+size_tilt   # the sound signal, tilted to the bigger
+    step: {}                        # names the robust/sub-universe checks measure
   - lever: backfill_fields
     step: {lookback: 63}
   - lever: rank_transform

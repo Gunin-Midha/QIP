@@ -202,3 +202,25 @@ def test_repair_wave_puts_priority_levers_first_and_respects_the_budget(memory, 
     out = agent.repair_wave(parent, decision("p2", "sharpe"), size=4,
                             priority=["tighten_truncation"])
     assert [c.lever for c in out.children] == ["tighten_truncation", "increase_decay"]
+
+
+def test_relative_price_change_turns_price_deltas_into_returns(candidate):
+    c = candidate(expression="rank(normalize(mdl_x - ts_delta(close, 10)))")
+    out = apply("relative_price_change", c, fields=["close", "vwap"])
+    assert out.expression == ("rank(normalize(mdl_x - divide(ts_delta(close, 10), "
+                              "ts_delay(close, 10))))")
+    # already a ratio, or no price field: not applicable
+    with pytest.raises(LeverNotApplicable):
+        apply("relative_price_change", candidate(expression="rank(divide(ts_delta(close, 5), close))"),
+              fields=["close"])
+    with pytest.raises(LeverNotApplicable):
+        apply("relative_price_change", candidate(expression="rank(ts_delta(volume, 5))"),
+              fields=["close"])
+    from alpha_research.repair_agent import lever_kind
+    assert lever_kind("relative_price_change") == "shape"
+
+
+def test_sub_universe_playbook_has_the_units_fix_and_its_combo():
+    names = [lv.name for lv in Playbook.load(PLAYBOOK).entries["sub_universe"]]
+    assert "relative_price_change" in names
+    assert "combo:relative_price_change+size_tilt" in names

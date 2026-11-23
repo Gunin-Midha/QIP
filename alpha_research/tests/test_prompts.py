@@ -62,7 +62,11 @@ def test_user_messages_fence_candidates(candidate):
 
 
 def test_every_model_lever_in_the_playbook_has_instructions(playbook):
-    model_levers = {l.name for levers in playbook.entries.values() for l in levers} - set(MECHANICAL)
+    from alpha_research.lever_stats import combo_parts
+    names = {l.name for levers in playbook.entries.values() for l in levers}
+    # a combination of mechanical levers needs no model instructions
+    model_levers = {n for n in names - set(MECHANICAL)
+                    if not (combo_parts(n) and set(combo_parts(n)) <= set(MECHANICAL))}
     assert model_levers and model_levers <= set(prompts.LEVER_INSTRUCTIONS)
 
 

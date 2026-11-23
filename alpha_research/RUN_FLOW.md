@@ -118,7 +118,12 @@ Three steps before round 1, in this order:
    but may have finished on BRAIN (`memory.unfinished_submissions()`) is polled once. If
    it finished, it is decided like any other result and credited to its arm. This costs no
    simulation budget.
-3. **Resume open repairs** (`_resume_repairs`). An open repair in memory gets a new wave
+3. **Re-decide rejected alphas a lever can now fix** (`_reevaluate` →
+   `Pipeline.reevaluate_rejected`): an alpha rejected as `other` whose failed BRAIN check
+   now maps to a class with levers (2026-11-23: robust-universe and investability checks
+   → `sub_universe`) gets a new decision from its stored result, no simulation. Console:
+   `--- re-decided N rejected alpha(s) a lever can now fix: ...`; also `cli reevaluate`.
+4. **Resume open repairs** (`_resume_repairs`). An open repair in memory gets a new wave
    now: closest to accept first, at most `repair.max_resume` (3) waves, only for regions
    in this run. An original alpha in repair with no child starts from itself. Children of
    one parent with no child of their own were a wave that stopped before its next one: the

@@ -70,6 +70,14 @@ BRAIN_CHECK_TO_CLASS = {
     "IS_LADDER_SHARPE": "recent_sharpe",    # Sharpe over the last N in-sample years
     "PROD_CORRELATION": "prod_correlation",  # correlation with BRAIN's production alphas
     "POWER_POOL_CORRELATION": "prod_correlation",
+    # the alpha on bigger, more tradable names (non-USA regions; run 2026-11-23: an IND
+    # alpha at Sharpe 3.14 / fitness 2.20 was rejected for robust-universe Sharpe 0.95 of
+    # 1.0 because these mapped to "other", which has no levers). Same question as the
+    # sub-universe check, so the same levers (size and liquidity tilts, backfill, rank).
+    "LOW_ROBUST_UNIVERSE_SHARPE": "sub_universe",
+    "LOW_ROBUST_UNIVERSE_SHARPE.WITH_RATIO": "sub_universe",
+    "LOW_ROBUST_UNIVERSE_RETURNS": "sub_universe",
+    "LOW_INVESTABILITY_CONSTRAINED_SHARPE": "sub_universe",
 }
 BRAIN_GATE_PREFIX = "brain:"
 

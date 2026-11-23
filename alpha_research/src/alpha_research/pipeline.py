@@ -110,6 +110,18 @@ def _clock(seconds: float) -> str:
     return f"{m}m{s:02d}s"
 
 
+def newly_repairable(decision: DecisionRecord | None, result: ResultRecord | None,
+                     playbook: Playbook) -> bool:
+    """A complete alpha rejected as "other" whose failed gates now map, at least in part,
+    to a class the playbook has levers for (the check mapping grew since it was decided)."""
+    if decision is None or decision.decision != "reject" or decision.failure_class != "other":
+        return False
+    if result is None or result.status != "complete":
+        return False
+    classes = {evaluator.check_class(g.name) for g in decision.gate_results if g.passed is False}
+    return any(c != "other" and playbook.entries.get(c) for c in classes)
+
+
 class Pipeline:
     def __init__(self, config: Config, playbook: Playbook, client: BrainClient,
                  memory: MemoryStore, sleep: Callable[[float], None] = time.sleep,
@@ -268,6 +280,18 @@ class Pipeline:
             return True
         seen.add(h)
         return False
+
+    def reevaluate_rejected(self) -> list[Outcome]:
+        """Decide again, from their stored results, the rejected alphas a playbook lever
+        can now address (``newly_repairable``): a BRAIN check that mapped to "other" when
+        they were decided and maps to a class with levers now (2026-11-23: robust-universe
+        and investability checks -> sub_universe). Simulates nothing; the new decision is
+        appended (memory is append-only), so the next repair step sees it."""
+        out = []
+        for row in self.memory.candidate_outcomes():
+            if newly_repairable(row["decision"], row["result"], self.playbook):
+                out.append(self._evaluate(row["candidate"], row["result"]))
+        return out
 
     def recover(self, candidate: CandidateRecord, sim_id: str) -> Outcome | None:
         """Decide an earlier submission that BRAIN finished after our wait ended (its

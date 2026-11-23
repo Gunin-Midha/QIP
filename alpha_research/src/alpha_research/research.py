@@ -763,6 +763,7 @@ class ResearchRun:
         self.power_pool: list[dict] = []   # Power Pool candidates this run (recorded only)
         self.recovered: list[dict] = []
         self._resume_rows: list[tuple] = []
+        self.reevaluated: list[dict] = []
         # repair waves (owner 2026-11-23): fixes_per_wave children of one parent simulated
         # together; when all are decided the next wave starts from the best child if it got
         # closer to accept, else from the same parent with its next levers
@@ -1061,6 +1062,18 @@ class ResearchRun:
         else:
             self._emit(f"  repair of {parent}: {base}; stopped ({rep.notes[-1]})")
 
+    def _reevaluate(self) -> None:
+        """Rejected alphas a lever can now address get a new decision from their stored
+        result (``Pipeline.reevaluate_rejected``), before open repairs are resumed, so a
+        near miss turned into a repair is resumed like any other (in its region's run)."""
+        outs = self.pipeline.reevaluate_rejected()
+        self.reevaluated = [{"candidate_id": o.candidate_id, "decision": o.decision,
+                             "failure_class": o.failure_class} for o in outs]
+        if outs:
+            self._emit(f"--- re-decided {len(outs)} rejected alpha(s) a lever can now fix: "
+                       + ", ".join(f"{_short_id(o.candidate_id)} -> {o.decision} / "
+                                   f"{o.failure_class}" for o in outs))
+
     def _recover_submissions(self) -> None:
         """Results BRAIN finished after an earlier run stopped waiting (our timeout, or a
         crash): one poll each, and a finished one is decided like any other result and
@@ -1192,6 +1205,7 @@ class ResearchRun:
     def _run(self, rounds: int) -> dict:
         self._prepare_seeds()
         self._recover_submissions()
+        self._reevaluate()
         if self.agents.repair.resume_from_memory:
             try:
                 self._resume_repairs()
@@ -1663,6 +1677,7 @@ class ResearchRun:
             "simulations_by_region": dict(self.region_sims),   # since region_balance_since
             "arms": arms,
             "recovered_results": self.recovered,
+            "reevaluated": self.reevaluated,
             "resumed_repairs": self.resumed,
             "repair_waves": self.wave_log,
             "overfitting_flags": self.overfitting_flags,

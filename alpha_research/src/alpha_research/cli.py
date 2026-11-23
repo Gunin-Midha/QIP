@@ -549,6 +549,20 @@ def _compare(args) -> int:
     return EXIT_OK
 
 
+def _reevaluate(args) -> int:
+    """Re-decide, from stored results, rejected alphas a playbook lever can now address."""
+    config = load_config(args.config)
+    playbook = Playbook.load(args.playbook)
+    memory = MemoryStore(args.data_dir)
+    try:
+        outs = Pipeline(config, playbook, None, memory, out=sys.stdout).reevaluate_rejected()
+    finally:
+        memory.close()
+    print(f"re-decided {len(outs)} rejected alpha(s)" if outs else
+          "nothing to re-decide: no rejected alpha has a failure a lever can now fix")
+    return EXIT_OK
+
+
 def _repair(args) -> int:
     """Rescue alphas by hand: one child per applicable mechanical lever for each named
     candidate in memory, written as a candidate file for ``run --client real``."""
@@ -736,6 +750,13 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--data-dir", default=str(default_data_dir()))
     cp.add_argument("--out", default=None, help="also write the table to this JSON file")
     cp.set_defaults(func=_compare)
+
+    rv = sub.add_parser("reevaluate", help="re-decide rejected alphas a playbook lever can "
+                                           "now address, from their stored results (no BRAIN)")
+    rv.add_argument("--data-dir", default=str(default_data_dir()))
+    rv.add_argument("--config", default="config/thresholds.yaml")
+    rv.add_argument("--playbook", default="config/repair_playbook.yaml")
+    rv.set_defaults(func=_reevaluate)
 
     rp = sub.add_parser("repair", help="write repair variants of candidates in memory "
                                        "(one per applicable mechanical lever) for run --client real")
