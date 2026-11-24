@@ -17,6 +17,7 @@ never wait in real time.
 from __future__ import annotations
 
 import logging
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -331,6 +332,18 @@ class Simulator:
         try:
             return self._loop(waiting, active, results, limit, total, on_done, on_status, every,
                               last_status, on_result, topup)
+        except KeyboardInterrupt:
+            # Ctrl-C: BRAIN keeps running what we stop waiting for (2026-11-24: simulations
+            # left by stopped runs sat at 90% for days), so cancel them before stopping. A
+            # second Ctrl-C while cancelling stops at once.
+            left = [j for j in list(active) + list(waiting)
+                    if j.sim_id is not None and results[j.index] is None]
+            if left:
+                print(f"\nstopping: cancelling {len(left)} simulation(s) on BRAIN "
+                      "(Ctrl-C again to quit at once)", file=sys.stderr, flush=True)
+                for j in left:
+                    self.cancel(j.candidate, j.sim_id, "run stopped by hand (Ctrl-C)")
+            raise
         finally:
             if hooked:
                 self.client.on_ready = None
@@ -398,11 +411,15 @@ class Simulator:
                                    f"{job.retried_from}")
         return self._persist(self._finish(result))
 
-    def recover(self, candidate: CandidateRecord, sim_id: str) -> ResultRecord | None:
+    def recover(self, candidate: CandidateRecord, sim_id: str, *,
+                keep: Callable[[ResultRecord], bool] | None = None,
+                note: str | None = None) -> ResultRecord | None:
         """One poll of an earlier submission (one that timed out on our side, or a crash
         before its result): BRAIN keeps running a simulation after we stop waiting. Returns
         the persisted result when BRAIN has finished it, None while it is still running or
-        when BRAIN no longer knows the simulation."""
+        when BRAIN no longer knows the simulation. ``keep(result)`` False: nothing is stored
+        and None is returned (a recheck whose checks BRAIN has not finished yet); ``note``
+        replaces the first note."""
         try:
             raw = self._with_retry(lambda: self.client.poll(sim_id))
         except TRANSIENT_ERRORS:
@@ -412,8 +429,27 @@ class Simulator:
         result = normalize(raw, candidate.candidate_id, sim_id)
         if result.status == "failed" and any("simulation not found" in n for n in result.notes):
             return None
-        result.notes.insert(0, f"recovered: result fetched after our wait ended ({sim_id})")
+        if keep is not None and not keep(result):
+            return None
+        result.notes.insert(0, note or f"recovered: result fetched after our wait ended ({sim_id})")
         return self._persist(self._finish(result))
+
+    def cancel(self, candidate: CandidateRecord, sim_id: str, reason: str,
+               state: str | None = None) -> ResultRecord | None:
+        """Cancel a simulation on BRAIN (a client without ``cancel`` only records it) and
+        store a failed result for it, so recovery stops asking BRAIN about it. ``state`` is
+        what BRAIN last said (note only). None when BRAIN refused the cancel (the submission
+        stays unfinished, to try again later)."""
+        cancel = getattr(self.client, "cancel", None)
+        try:
+            outcome = cancel(sim_id) if cancel is not None else "not cancelled (no client support)"
+        except Exception as exc:   # one refused cancel never stops the others
+            log.warning("cancelling %s (%s) failed: %s", sim_id, candidate.candidate_id, exc)
+            return None
+        note = (f"cancelled on BRAIN ({outcome}): {reason}"
+                + (f"; BRAIN said {state}" if state else ""))
+        return self._persist(ResultRecord(candidate_id=candidate.candidate_id, status="failed",
+                                          brain_sim_id=sim_id, notes=[note]))
 
     # --------------------------------------------------------------- internals
 

@@ -18,6 +18,8 @@ Endpoints used (relative to API_ROOT; every request sends Accept: application/js
     OPTIONS /simulations                      allowed settings: actions.POST.settings.children
     POST    /simulations                      201, Location: .../simulations/<sim id>;
                                               400 {"settings": {field: [messages]}}; 429 limit
+    DELETE  /simulations/<sim id>             cancels a simulation (200, then GET answers 404;
+                                              checked on our account 2026-11-24)
     GET     /simulations/<sim id>             {"progress": p} while running (plus Retry-After),
                                               then {"status": COMPLETE|WARNING, "alpha"} or
                                               ERROR|FAIL|TIMEOUT with "message", or "detail(s)"
@@ -109,6 +111,8 @@ class BrainApiConfig:
     fetch_self_correlation: bool = True
     fetch_submission_check: bool = True      # GET /alphas/<id>/check: BRAIN's final checks
     check_max_wait_seconds: float = 600.0
+    # GET /alphas/<id>/correlations/self; None = recordset_max_wait_seconds
+    self_correlation_max_wait_seconds: float | None = None
     session_file: Path | None = None         # saved session cookie (outside the repo); None = off
     # BRAIN failure messages that are BRAIN's own trouble, not the alpha's: the simulator
     # submits such a candidate once more (run rs20261111174623)
@@ -130,7 +134,8 @@ def brain_config_from_dict(raw, source: str = "<dict>") -> BrainApiConfig:
                           "remove them from the brain config")
     kw = {}
     for key in ("request_timeout_seconds", "recordset_max_wait_seconds",
-                "rate_limit_max_wait_seconds", "check_max_wait_seconds"):
+                "rate_limit_max_wait_seconds", "check_max_wait_seconds",
+                "self_correlation_max_wait_seconds"):
         if key in raw:
             v = raw[key]
             if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
@@ -725,7 +730,8 @@ class RealBrainClient:
         daily = self._fetch(brain_sim_id, "daily_pnl", f"{base}/recordsets/daily-pnl", notes)
         pnl = (None if recordset_rows(daily)
                else self._fetch(brain_sim_id, "pnl", f"{base}/recordsets/pnl", notes))
-        corr = (self._fetch(brain_sim_id, "self_correlation", f"{base}/correlations/self", notes)
+        corr = (self._fetch(brain_sim_id, "self_correlation", f"{base}/correlations/self", notes,
+                            max_wait=self.config.self_correlation_max_wait_seconds)
                 if self.config.fetch_self_correlation else None)
         check = (self._fetch(brain_sim_id, "check", f"{base}/check", notes,
                              max_wait=self.config.check_max_wait_seconds)
@@ -734,6 +740,17 @@ class RealBrainClient:
         raw["notes"] = raw["notes"] + [f"brain_alpha_id: {alpha_id}"] + notes
         self._capture(brain_sim_id, "translated", raw)
         return raw
+
+    def cancel(self, brain_sim_id: str) -> str:
+        """Cancel a simulation on BRAIN (``DELETE /simulations/<id>``): "cancelled", or "gone"
+        when BRAIN no longer knows it (404). Anything else raises BrainApiError, so the
+        caller keeps the submission for a later try."""
+        resp = self.session.request("DELETE", f"/simulations/{brain_sim_id}")
+        if 200 <= resp.status < 300:
+            return "cancelled"
+        if resp.status == 404:
+            return "gone"
+        raise BrainApiError(f"cancel {brain_sim_id} returned {resp.status}: {resp.detail()}")
 
     def _fetch(self, sim_id: str, name: str, path: str, notes: list[str],
                max_wait: float | None = None):

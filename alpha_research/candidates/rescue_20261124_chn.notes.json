@@ -1,0 +1,10 @@
+{
+  "rs20261115045859r02a52_001": [
+    "backfill_fields: produced an invalid candidate",
+    "change_universe: not applicable (no known smaller universe than TOP2000U in CHN)",
+    "combo:relative_price_change+size_tilt: skipped part relative_price_change: no ts_delta of a price field in currency units",
+    "restrict_to_liquid_fields: skipped (model lever)",
+    "relative_price_change: not applicable (no ts_delta of a price field in currency units)",
+    "model_repair: skipped (model lever)"
+  ]
+}

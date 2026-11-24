@@ -712,3 +712,33 @@ def test_models_pace_is_checked():
     raw["models"]["critic_pick"] = "random"
     with pytest.raises(ConfigError, match="critic_pick"):
         agents_config_from_dict(raw)
+
+
+def test_run_start_cancels_a_submission_stuck_on_brain(memory, make_config, playbook, candidate):
+    # 2026-11-24: simulations our runs stopped waiting for sat at 90% on BRAIN for days
+    from alpha_research.schemas import DecisionRecord, ResultRecord
+    config = make_config(simulator__cancel_stuck_after_hours=0)
+    memory.put_candidate(candidate(candidate_id="stuck_001", expression="rank(ts_mean(close, 7))",
+                                   prompt_version="gen-v9", model="claude-test"))
+    memory.put_pending("stuck_001", "sim_stuck")
+    memory.put_result(ResultRecord("stuck_001", "timeout", brain_sim_id="sim_stuck"))
+    memory.put_decision(DecisionRecord("stuck_001", "reject", "incomplete"))
+
+    class Stuck(StubBrain):
+        cancelled: list = []
+
+        def poll(self, sim_id):
+            if sim_id == "sim_stuck":
+                return {"status": "running", "progress": 0.9}
+            return super().poll(sim_id)
+
+        def cancel(self, sim_id):
+            self.cancelled.append(sim_id)
+            return "cancelled"
+
+    brain = Stuck()
+    report = make_run(memory, config, playbook, brain=brain).run(1)
+    assert brain.cancelled == ["sim_stuck"]
+    assert [c["candidate_id"] for c in report["cancelled_stuck"]] == ["stuck_001"]
+    assert memory.results_for("stuck_001")[-1].notes[0].startswith("cancelled on BRAIN")
+    assert memory.unfinished_submissions() == []

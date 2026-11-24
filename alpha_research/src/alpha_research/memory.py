@@ -314,6 +314,13 @@ class MemoryStore:
                 out[r["candidate_id"]] = sim_id
         return [{"candidate_id": c, "brain_sim_id": s} for c, s in out.items()]
 
+    def submitted_at(self) -> dict[str, str]:
+        """{candidate_id: time of its first submission to BRAIN} (ISO, UTC). Read-only."""
+        rows = self.conn.execute(
+            "SELECT candidate_id, MIN(submitted_at) AS t FROM pending_submissions "
+            "GROUP BY candidate_id").fetchall()
+        return {r["candidate_id"]: r["t"] for r in rows}
+
     def pending_sim_id(self, candidate_id: str) -> str | None:
         for p in self.pending():
             if p["candidate_id"] == candidate_id:

@@ -44,7 +44,7 @@ from .generator import (AlphaGenerator, GenerationError, GenerationSettings, Sou
 from .llm import HOSTS, LLMUnavailable, ScriptedLLMClient, list_models, make_real_client
 from .memory import MemoryStore, default_data_dir
 from .orchestrator import run_rounds
-from .pipeline import Pipeline, load_candidate_file
+from .pipeline import Pipeline, awaiting_brain, load_candidate_file
 from .repair import Playbook
 from .lever_stats import LeverStats, repair_events
 from .repair_agent import RepairAgent
@@ -92,6 +92,13 @@ def _run(args) -> int:
         pipeline = Pipeline(config, playbook, client, memory, sleep=sleep,
                             clock=clock, out=sys.stdout)
         pipeline.run([e.candidate for e in entries])
+        ids = {e.candidate.candidate_id for e in entries}
+        waiting = [r["candidate"].candidate_id for r in memory.candidate_outcomes()
+                   if r["candidate"].candidate_id in ids
+                   and awaiting_brain(r["decision"], r["result"])]
+        if waiting:
+            print(f"{len(waiting)} alpha(s) pending until BRAIN finishes their checks "
+                  "(PROD_CORRELATION can take hours): run `cli recheck` later")
         if not args.no_lessons:
             _write_lessons(memory, args, "batch" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"))
     finally:
@@ -334,6 +341,63 @@ def _brain_auth(args) -> int:
     return EXIT_OK
 
 
+def _brain_cancel(args) -> int:
+    """Cancel our simulations stuck on BRAIN: submissions memory has no final result for
+    (our wait timed out, or the run was stopped) that are still unfinished after
+    --older-than-hours. Each is asked once first, so a finished one is decided instead.
+    A cancelled one is stored as failed (reject / incomplete) and never asked about again."""
+    config = load_config(args.config)
+    hours = (args.older_than_hours if args.older_than_hours is not None
+             else config.simulator.cancel_stuck_after_hours)
+    if hours is None:
+        print("error: give --older-than-hours (simulator.cancel_stuck_after_hours is off)",
+              file=sys.stderr)
+        return EXIT_CONFIG
+    memory = MemoryStore(args.data_dir)
+    try:
+        brain_config = load_brain_config(args.brain_config)
+        client = RealBrainClient(_brain_session(brain_config), brain_config)
+        pipe = Pipeline(config, Playbook.load(args.playbook), client, memory, out=sys.stdout)
+        rows = pipe.stuck_submissions(hours)
+        if not rows:
+            print(f"nothing to cancel: no submission unfinished for {hours:g} h or more")
+            return EXIT_OK
+        print(f"{len(rows)} submission(s) without a final result for {hours:g} h or more:")
+        for r in rows:
+            print(f"  {r['candidate_id']}  ({r['hours']:.0f} h, simulation {r['brain_sim_id']})")
+        if not args.yes:
+            if not sys.stdin.isatty():
+                print("error: not a terminal; pass --yes to cancel", file=sys.stderr)
+                return EXIT_CONFIG
+            if input("ask BRAIN about each and cancel the unfinished ones? [y/N] ").strip().lower() != "y":
+                print("nothing cancelled")
+                return EXIT_OK
+        done = cancelled = kept = 0
+        for r in rows:
+            c = memory.get_candidate(r["candidate_id"])
+            if c is None:
+                continue
+            try:
+                out = pipe.recover(c, r["brain_sim_id"])
+            except (BrainApiError, ConnectionError, TimeoutError):
+                out = None       # BRAIN answered with an error: cancel it like a stuck one
+            if out is not None:
+                done += 1
+                continue
+            if pipe.cancel_submission(c, r["brain_sim_id"],
+                                      f"cli brain cancel: unfinished {r['hours']:.0f} h "
+                                      "after submission") is None:
+                print(f"  {r['candidate_id']}: BRAIN refused the cancel; kept for later")
+                kept += 1
+            else:
+                cancelled += 1
+    finally:
+        memory.close()
+    print(f"cancelled {cancelled}, finished on BRAIN and decided {done}"
+          + (f", kept {kept}" if kept else ""))
+    return EXIT_OK
+
+
 def _brain_logout(args) -> int:
     config = load_brain_config(args.brain_config)
     if config.session_file is None:
@@ -563,6 +627,29 @@ def _reevaluate(args) -> int:
     return EXIT_OK
 
 
+def _recheck(args) -> int:
+    """Fetch BRAIN's result again for alphas decided pending because a BRAIN check had no
+    verdict yet (PROD_CORRELATION PENDING, SELF_CORRELATION ERROR), and decide them again.
+    Simulates nothing; the run start of `research` does the same."""
+    config = load_config(args.config)
+    playbook = Playbook.load(args.playbook)
+    memory = MemoryStore(args.data_dir)
+    try:
+        brain_config = load_brain_config(args.brain_config)
+        client = RealBrainClient(_brain_session(brain_config), brain_config)
+        outs, still = Pipeline(config, playbook, client, memory,
+                               out=sys.stdout).recheck_pending(
+            set(args.candidate_id) if args.candidate_id else None)
+    finally:
+        memory.close()
+    if not outs and not still:
+        print("nothing to recheck: no pending alpha is waiting on a BRAIN check")
+    else:
+        print(f"re-decided {len(outs)} alpha(s)"
+              + (f"; still waiting on BRAIN: {', '.join(still)}" if still else ""))
+    return EXIT_OK
+
+
 def _repair(args) -> int:
     """Rescue alphas by hand: one child per applicable mechanical lever for each named
     candidate in memory, written as a candidate file for ``run --client real``."""
@@ -758,6 +845,16 @@ def build_parser() -> argparse.ArgumentParser:
     rv.add_argument("--playbook", default="config/repair_playbook.yaml")
     rv.set_defaults(func=_reevaluate)
 
+    rc = sub.add_parser("recheck", help="fetch BRAIN's checks again for alphas pending on "
+                                        "a check BRAIN had not finished (e.g. PROD_CORRELATION)")
+    rc.add_argument("--candidate-id", action="append", default=None,
+                    help="only these candidates (repeat for several); default every one")
+    rc.add_argument("--data-dir", default=str(default_data_dir()))
+    rc.add_argument("--config", default="config/thresholds.yaml")
+    rc.add_argument("--playbook", default="config/repair_playbook.yaml")
+    rc.add_argument("--brain-config", default="config/brain.yaml")
+    rc.set_defaults(func=_recheck)
+
     rp = sub.add_parser("repair", help="write repair variants of candidates in memory "
                                        "(one per applicable mechanical lever) for run --client real")
     rp.add_argument("--candidate-id", action="append", required=True,
@@ -820,6 +917,15 @@ def build_parser() -> argparse.ArgumentParser:
     b_auth.set_defaults(func=_brain_auth)
     b_out = bsub.add_parser("logout", help="delete the saved BRAIN session")
     b_out.set_defaults(func=_brain_logout)
+    b_can = bsub.add_parser("cancel", help="cancel our simulations stuck on BRAIN (no final "
+                                           "result for --older-than-hours)")
+    b_can.add_argument("--older-than-hours", type=float, default=None,
+                       help="default: simulator.cancel_stuck_after_hours in --config")
+    b_can.add_argument("--yes", action="store_true", help="do not ask before cancelling")
+    b_can.add_argument("--data-dir", default=str(default_data_dir()))
+    b_can.add_argument("--config", default="config/thresholds.yaml")
+    b_can.add_argument("--playbook", default="config/repair_playbook.yaml")
+    b_can.set_defaults(func=_brain_cancel)
     b_opt = bsub.add_parser("options", help="list the simulation settings BRAIN allows")
     b_opt.add_argument("--out", default="captures/simulation_options.json")
     b_opt.set_defaults(func=_brain_options)
@@ -847,7 +953,7 @@ def build_parser() -> argparse.ArgumentParser:
     b_ds.add_argument("--delay", type=int, required=True)
     b_ds.add_argument("--out", required=True)
     b_ds.set_defaults(func=_brain_datasets)
-    for sp in (b_auth, b_out, b_opt, b_cap, b_ops, b_df, b_ds):
+    for sp in (b_auth, b_out, b_can, b_opt, b_cap, b_ops, b_df, b_ds):
         sp.add_argument("--brain-config", default="config/brain.yaml")
     return p
 

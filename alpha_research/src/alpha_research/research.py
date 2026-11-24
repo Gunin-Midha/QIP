@@ -762,8 +762,10 @@ class ResearchRun:
         self.resumed: list[dict] = []
         self.power_pool: list[dict] = []   # Power Pool candidates this run (recorded only)
         self.recovered: list[dict] = []
+        self.cancelled: list[dict] = []    # stuck BRAIN simulations cancelled at run start
         self._resume_rows: list[tuple] = []
         self.reevaluated: list[dict] = []
+        self.rechecked: list[dict] = []
         # repair waves (owner 2026-11-23): fixes_per_wave children of one parent simulated
         # together; when all are decided the next wave starts from the best child if it got
         # closer to accept, else from the same parent with its next levers
@@ -1074,6 +1076,35 @@ class ResearchRun:
                        + ", ".join(f"{_short_id(o.candidate_id)} -> {o.decision} / "
                                    f"{o.failure_class}" for o in outs))
 
+    def _recheck_pending(self) -> None:
+        """Alphas decided pending because BRAIN had not finished a check (PROD_CORRELATION
+        PENDING, SELF_CORRELATION ERROR) are fetched again and decided
+        (``Pipeline.recheck_pending``); a decided one credits its arm, as a pending decision
+        did not. No simulation budget. Before resumed repairs, so a PROD_CORRELATION
+        failure found here is repaired in this run (in its region's run)."""
+        try:
+            outs, still = self.pipeline.recheck_pending()
+        except BrainLoginRequired:
+            raise
+        except Exception as exc:  # a lookup that goes wrong never stops the run
+            self._emit(f"  rechecking pending alphas failed: {exc}")
+            return
+        models = arm_models(self.memory.candidate_outcomes(), self.memory.critic_reviews()) \
+            if outs else {}
+        for o in outs:
+            c = self.memory.get_candidate(o.candidate_id)
+            key = self._arm_of(c, models.get(o.candidate_id)) if c is not None else None
+            if key is not None and o.decision in DECIDED:
+                self.director.update(key, o.decision == "accept")
+            self.rechecked.append({"candidate_id": o.candidate_id, "decision": o.decision,
+                                   "failure_class": o.failure_class})
+        if outs or still:
+            got = ", ".join(f"{_short_id(o.candidate_id)} -> {o.decision} / {o.failure_class}"
+                            for o in outs) or "none"
+            self._emit(f"--- rechecked {len(outs) + len(still)} pending alpha(s) BRAIN had not "
+                       f"finished checking: {got}"
+                       + (f"; {len(still)} still waiting on BRAIN" if still else ""))
+
     def _recover_submissions(self) -> None:
         """Results BRAIN finished after an earlier run stopped waiting (our timeout, or a
         crash): one poll each, and a finished one is decided like any other result and
@@ -1084,6 +1115,9 @@ class ResearchRun:
         if not rows:
             return
         models = arm_models(self.memory.candidate_outcomes(), self.memory.critic_reviews())
+        after = self.pipeline.config.simulator.cancel_stuck_after_hours
+        stuck = ({r["candidate_id"]: r["hours"] for r in self.pipeline.stuck_submissions(after)}
+                 if after is not None else {})
         still = 0
         for p in rows:
             c = self.memory.get_candidate(p["candidate_id"])
@@ -1096,6 +1130,21 @@ class ResearchRun:
             except Exception as exc:  # a lookup that goes wrong never stops the run
                 self._emit(f"  recovering {c.candidate_id} failed: {exc}")
                 out = None
+            if out is None and c.candidate_id in stuck:
+                # still unfinished long after submission: BRAIN's stuck simulations sat at
+                # 90% for days (2026-11-24); cancel it so it holds no place on BRAIN
+                hours = stuck[c.candidate_id]
+                try:
+                    gone = self.pipeline.cancel_submission(
+                        c, p["brain_sim_id"], f"still unfinished {hours:.0f} h after submission "
+                                              f"(simulator.cancel_stuck_after_hours {after:g})")
+                except BrainLoginRequired:
+                    raise
+                if gone is not None:
+                    self.cancelled.append({"candidate_id": c.candidate_id,
+                                           "brain_sim_id": p["brain_sim_id"],
+                                           "hours": round(hours, 1)})
+                    continue
             if out is None:
                 still += 1
                 continue
@@ -1104,6 +1153,10 @@ class ResearchRun:
                 self.director.update(key, out.decision == "accept")
             self.recovered.append({"candidate_id": c.candidate_id, "decision": out.decision,
                                    "failure_class": out.failure_class})
+        if self.cancelled:
+            self._emit(f"--- cancelled {len(self.cancelled)} simulation(s) stuck on BRAIN: "
+                       + ", ".join(f"{_short_id(i['candidate_id'])} ({i['hours']:.0f} h)"
+                                   for i in self.cancelled))
         if self.recovered or still:
             got = ", ".join(f"{i['candidate_id']} {i['decision']}/{i['failure_class']}"
                             for i in self.recovered) or "none"
@@ -1205,6 +1258,7 @@ class ResearchRun:
     def _run(self, rounds: int) -> dict:
         self._prepare_seeds()
         self._recover_submissions()
+        self._recheck_pending()
         self._reevaluate()
         if self.agents.repair.resume_from_memory:
             try:
@@ -1677,7 +1731,9 @@ class ResearchRun:
             "simulations_by_region": dict(self.region_sims),   # since region_balance_since
             "arms": arms,
             "recovered_results": self.recovered,
+            "cancelled_stuck": self.cancelled,
             "reevaluated": self.reevaluated,
+            "rechecked_pending": self.rechecked,
             "resumed_repairs": self.resumed,
             "repair_waves": self.wave_log,
             "overfitting_flags": self.overfitting_flags,

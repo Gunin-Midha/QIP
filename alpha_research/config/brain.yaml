@@ -16,14 +16,19 @@ settings:
   visualization: false
 
 request_timeout_seconds: 60
-recordset_max_wait_seconds: 300     # waiting on Retry-After for PnL, yearly stats, correlations
+recordset_max_wait_seconds: 300     # waiting on Retry-After for PnL and yearly stats
+# Correlations and the final checks are computed by BRAIN on demand and often take hours
+# (PROD_CORRELATION, 2026-11-24): waiting long for them holds up every other finished alpha,
+# since results are fetched one at a time. Wait briefly; `cli recheck` (and every research
+# run start) fetches what was unfinished.
+self_correlation_max_wait_seconds: 60
 rate_limit_max_wait_seconds: 900    # total wait on 429 (too many concurrent simulations) per request
 fetch_self_correlation: true
 # GET /alphas/<id>/check after each simulation: BRAIN's final submission checks. At consultant
 # level the checks inside a fresh simulation are provisional (LOW_SHARPE WARNING there, FAIL
 # here; SELF_CORRELATION PENDING there, a value here), so these replace them.
 fetch_submission_check: true
-check_max_wait_seconds: 600
+check_max_wait_seconds: 60
 # BRAIN failure messages that are BRAIN's own trouble, not the alpha's: such a simulation is
 # submitted once more (run rs20261111174623 lost one to the first message).
 retry_error_messages:

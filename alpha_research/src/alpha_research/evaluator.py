@@ -31,6 +31,8 @@ Decision precedence (owner's choice: a definite failure beats "not evaluable"):
 
 from __future__ import annotations
 
+import re
+
 import dataclasses
 from typing import Iterable
 
@@ -167,6 +169,25 @@ def _brain_verdict(gate: GateResult, checks: dict) -> GateResult:
                       f"(gates.brain_checks_only)")
 
 
+# BRAIN check states that are not a verdict yet: PENDING while BRAIN computes the check
+# (PROD_CORRELATION can take hours), ERROR when computing it failed for now (SELF_CORRELATION
+# ERROR on CHN alphas 2026-11-24 turned PASS when fetched again). An alpha check in such a
+# state is an unknown gate, so an alpha that passes everything else is pending, not accepted
+# (2026-11-24: an alpha was accepted while its PROD_CORRELATION was ERROR).
+UNFINISHED_CHECK_STATES = ("PENDING", "ERROR")
+_NOT_COUNTED = re.compile(r"^brain_check_not_counted: ([A-Z0-9_.]+)='([A-Z_]+)'")
+
+
+def unfinished_checks(result: ResultRecord | None) -> dict[str, str]:
+    """{check: state} for BRAIN checks without a verdict yet (from the result's notes)."""
+    out = {}
+    for n in (result.notes if result is not None else []):
+        m = _NOT_COUNTED.match(n)
+        if m and m.group(2) in UNFINISHED_CHECK_STATES:
+            out[m.group(1)] = m.group(2)
+    return out
+
+
 def run_gates(result: ResultRecord, config: Config) -> list[GateResult]:
     g = gates_for(result, config)
     gates = [
@@ -215,6 +236,12 @@ def run_gates(result: ResultRecord, config: Config) -> list[GateResult]:
                 continue
             gates.append(GateResult(BRAIN_GATE_PREFIX + name, ok, value, threshold,
                                     "BRAIN check " + ("PASS" if ok else "FAIL")))
+        for name, state in sorted(unfinished_checks(result).items()):
+            if name in ignored or name in submission or name in (result.checks or {}):
+                continue
+            value, threshold = _brain_value(name, result)
+            gates.append(GateResult(BRAIN_GATE_PREFIX + name, None, value, threshold,
+                                    f"BRAIN check {state}: no verdict yet (cli recheck)"))
 
     # Soft checks: recorded here, decided by the risk manager.
     gates.append(GateResult("weight_concentration", None, result.weight_concentration, None,

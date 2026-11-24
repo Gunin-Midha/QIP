@@ -107,6 +107,12 @@ simulator:
   progress_every_seconds: null    # status line every N s while simulations run; null = only
                                   # a line as each one finishes (owner 2026-11-23: no
                                   # periodic status lines)
-  max_concurrent: 8               # simulations on BRAIN at once (owner 2026-11-14: 8 ran together
-                                  # with no 429). OQ-3: the account's real limit may be higher;
-                                  # over it BRAIN answers 429 and the client waits for a slot
+  max_concurrent: 4               # simulations on BRAIN at once (owner 2026-11-14: 8 ran together
+                                  # with no 429; 2026-11-24: 4, since BRAIN computed PROD_CORRELATION
+                                  # for only the first 2-4 of a batch of 8 within minutes, the
+                                  # rest took hours). OQ-3: over the account's limit BRAIN
+                                  # answers 429 and the client waits for a slot
+  cancel_stuck_after_hours: 6     # cancel a simulation still unfinished on BRAIN 6 h after its
+                                  # submission (run start / `cli brain cancel`; 2026-11-24: 7
+                                  # stuck at 90% for up to 10 days; late results recovered so
+                                  # far came within hours)

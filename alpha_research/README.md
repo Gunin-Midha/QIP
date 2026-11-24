@@ -481,7 +481,17 @@ python -m alpha_research.cli repair --data-dir data --candidate-id <id> [--candi
     --datafields captures/datafields_usa_top3000_d1.json --out candidates/rescue.json
 python -m alpha_research.cli run --client real --candidates candidates/rescue.json --config config/thresholds.yaml
 python -m alpha_research.cli levers --data-dir data     # what each lever has fixed so far
+python -m alpha_research.cli recheck                    # alphas pending on a BRAIN check (PROD_CORRELATION) without a verdict yet
+python -m alpha_research.cli brain cancel               # cancel our simulations stuck on BRAIN (asks first)
 ```
+
+BRAIN computes PROD_CORRELATION and self-correlation on demand, sometimes hours after a
+simulation ends. A run waits at most a minute per alpha for them; an alpha whose check has
+no verdict yet (PENDING or ERROR) is decided `pending`, never accepted, and `cli recheck`
+(also every research run start) fetches it again later. BRAIN keeps running a simulation
+we stop waiting for: Ctrl-C cancels the batch's running simulations, and a submission
+still unfinished `simulator.cancel_stuck_after_hours` (6) after it was sent is cancelled
+at the next research run start (`DELETE /simulations/<id>`).
 
 `cli repair` writes one child per applicable mechanical lever (every failing class, best
 ranked first; experiments already in memory are skipped), with `parent_id` and `lever`

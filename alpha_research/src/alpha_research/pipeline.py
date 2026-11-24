@@ -28,6 +28,7 @@ import logging
 import re
 import time
 from collections import deque
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, TextIO
@@ -121,6 +122,21 @@ def newly_repairable(decision: DecisionRecord | None, result: ResultRecord | Non
         return False
     classes = {evaluator.check_class(g.name) for g in decision.gate_results if g.passed is False}
     return any(c != "other" and playbook.entries.get(c) for c in classes)
+
+
+# unfinished BRAIN checks (PENDING / ERROR) live in the evaluator, which gates on them
+UNFINISHED_CHECK_STATES = evaluator.UNFINISHED_CHECK_STATES
+unfinished_checks = evaluator.unfinished_checks
+
+
+def awaiting_brain(decision: DecisionRecord | None, result: ResultRecord | None) -> bool:
+    """A complete alpha decided pending (or accepted, before 2026-11-24) while some BRAIN
+    check had no verdict yet: fetching its result again may decide it."""
+    # "accept" too: before 2026-11-24 an alpha could be accepted while a BRAIN check had no
+    # verdict (now such a check is an unknown gate, so it is pending)
+    return (decision is not None and decision.decision in ("pending", "accept")
+            and result is not None and result.status == "complete"
+            and bool(result.brain_sim_id) and bool(unfinished_checks(result)))
 
 
 class Pipeline:
@@ -294,6 +310,55 @@ class Pipeline:
             if newly_repairable(row["decision"], row["result"], self.playbook):
                 out.append(self._evaluate(row["candidate"], row["result"]))
         return out
+
+    def recheck_pending(self, only: set[str] | None = None) -> tuple[list[Outcome], list[str]]:
+        """Fetch BRAIN's result again (one poll of the finished simulation, which re-reads
+        ``/check``) for alphas decided pending because a BRAIN check had no verdict yet
+        (``awaiting_brain``), and decide them again. A new result and decision are stored
+        only when BRAIN's unfinished checks changed (memory is append-only). Simulates
+        nothing. Returns (outcomes, ids still waiting on BRAIN)."""
+        outs, still = [], []
+        for row in self.memory.candidate_outcomes():
+            c, d, r = row["candidate"], row["decision"], row["result"]
+            if (only is not None and c.candidate_id not in only) or not awaiting_brain(d, r):
+                continue
+            before = unfinished_checks(r)
+            new = self.simulator.recover(
+                c, r.brain_sim_id, keep=lambda res: res.status == "complete"
+                and unfinished_checks(res) != before,
+                note=f"rechecked: BRAIN checks fetched again ({', '.join(sorted(before))} "
+                     f"had no verdict before)")
+            if new is None:
+                if d.decision == "accept":
+                    # accepted while a check had no verdict (before that check became an
+                    # unknown gate): decided again from the stored result -> pending
+                    outs.append(self._evaluate(c, r))
+                still.append(c.candidate_id)
+                continue
+            outs.append(self._evaluate(c, new))
+        return outs, still
+
+    def stuck_submissions(self, after_hours: float, now: datetime | None = None) -> list[dict]:
+        """Unfinished submissions (``memory.unfinished_submissions``) submitted at least
+        ``after_hours`` ago: ``{"candidate_id", "brain_sim_id", "hours"}``, oldest first."""
+        now = now or datetime.now(timezone.utc)
+        times = self.memory.submitted_at()
+        out = []
+        for u in self.memory.unfinished_submissions():
+            t = times.get(u["candidate_id"])
+            if t is None:
+                continue
+            hours = (now - datetime.fromisoformat(t)).total_seconds() / 3600
+            if hours >= after_hours:
+                out.append({**u, "hours": hours})
+        return sorted(out, key=lambda r: -r["hours"])
+
+    def cancel_submission(self, candidate: CandidateRecord, sim_id: str,
+                          reason: str) -> Outcome | None:
+        """Cancel an unfinished simulation on BRAIN and decide the candidate (a failed
+        result: reject / incomplete). None when BRAIN refused the cancel."""
+        result = self.simulator.cancel(candidate, sim_id, reason)
+        return None if result is None else self._evaluate(candidate, result)
 
     def recover(self, candidate: CandidateRecord, sim_id: str) -> Outcome | None:
         """Decide an earlier submission that BRAIN finished after our wait ended (its

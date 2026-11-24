@@ -103,6 +103,11 @@ class SimulatorConfig:
     # a status line (each running alpha's BRAIN progress) at most this often while
     # simulations run; None = no status lines
     progress_every_seconds: float | None = 60.0
+    # a submission still unfinished on BRAIN this many hours after it was submitted is
+    # cancelled at the next run start or by `cli brain cancel` (2026-11-24: 7 simulations
+    # stuck at 90% for up to 10 days); None = never cancel. Recovery collects results that
+    # finish later than our wait (max_poll_seconds) before this.
+    cancel_stuck_after_hours: float | None = None
 
 
 # failure classes whose repair can be limited to near misses, and the gate each one reads
@@ -309,6 +314,9 @@ def config_from_dict(raw: Any, source: str = "<dict>") -> Config:
         progress_every_seconds=(_num(s, "simulator", "progress_every_seconds", lo=1.0,
                                      nullable=True)
                                 if "progress_every_seconds" in s else 60.0),
+        cancel_stuck_after_hours=(_num(s, "simulator", "cancel_stuck_after_hours", lo=0.0,
+                                       nullable=True)
+                                  if "cancel_stuck_after_hours" in s else None),
     )
 
     # optional section: configs written before it existed keep working (no near-miss limit)

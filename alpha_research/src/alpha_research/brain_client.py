@@ -41,6 +41,8 @@ class BrainClient(Protocol):
 
     def poll(self, brain_sim_id: str) -> dict: ...                  # raw response dict
 
+    # optional: cancel(brain_sim_id) -> "cancelled" | "gone" (real BRAIN: DELETE /simulations)
+
 
 class FixtureNotFoundError(LookupError):
     pass
@@ -71,6 +73,7 @@ class FixtureBrainClient:
         self.submit_errors = {k: list(v) for k, v in (submit_errors or {}).items()}
         self.submit_calls: list[str] = []
         self.poll_calls: list[str] = []
+        self.cancel_calls: list[str] = []
         self._cursor: dict[str, int] = {}
 
     def register(self, candidate_id: str, fixture_id: str) -> None:
@@ -100,6 +103,10 @@ class FixtureBrainClient:
         if "daily_pnl_file" in response:
             response["daily_pnl"] = self._load_pnl(response.pop("daily_pnl_file"))
         return response
+
+    def cancel(self, brain_sim_id: str) -> str:
+        self.cancel_calls.append(brain_sim_id)
+        return "cancelled"
 
     def _load_pnl(self, rel_path: str) -> dict:
         path = self.fixture_dir.parent / rel_path
