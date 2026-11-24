@@ -148,9 +148,15 @@ prod_correlation:                   # BRAIN's PROD_CORRELATION: too close to pro
   - lever: blend_other_dataset      # new information at equal weight. EUR reversal rescues
     step:
       weight: 1.0
+      # partner weight by the parent's PROD_CORRELATION value ([at most, weight]); 2026-11-25:
+      # parents at 0.73-0.74 passed with 1:1 (EUR, IND); a part at 0.93 needed 2:1 (CHN 0.698)
+      weight_by_prod: [[0.78, 1.0], [1.0, 2.0]]
       exclude_categories: [pv, risk]  # the alpha's own kind of data; factor loadings
-      min_coverage: 0.5
+      # 0.3 (was 0.5, 2026-11-25): the blend fills a missing partner with the middle rank,
+      # and the CHN partner that passed used analyst69 items at coverage 0.33-0.46
+      min_coverage: 0.3
       min_alphas: 5
+      prefer_low_usage: true          # less-used fields first (production alphas use the rest)
       per_dataset: 8
       max_fields: 48
       # kinds of signal offered first to the model (word match on field id + description)

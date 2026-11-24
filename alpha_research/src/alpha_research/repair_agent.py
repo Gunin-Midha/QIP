@@ -549,7 +549,8 @@ _DATE_WORDS = ("date", "period", "time of day", "currency", "identifier")
 def partner_fields(meta: Mapping[str, dict], own_datasets: Collection[str], spec: FastExprSpec,
                    *, crowded: Collection[str] = (), exclude_categories: Collection[str] = (),
                    min_coverage: float | None = 0.5, min_alphas: int = 5, per_dataset: int = 8,
-                   max_fields: int = 48, topics: str = "", role=None) -> list[tuple[str, dict]]:
+                   max_fields: int = 48, topics: str = "", role=None,
+                   prefer_low_usage: bool = False) -> list[tuple[str, dict]]:
     """Fields a blend partner may use: from another dataset than the alpha's, not in an
     excluded category (price/volume, the alpha's own kind of information; risk-model
     factor loadings, which production alphas and neutralizations already carry), not
@@ -557,7 +558,11 @@ def partner_fields(meta: Mapping[str, dict], own_datasets: Collection[str], spec
     date, period, currency or identifier), with at least ``min_alphas`` BRAIN alphas and
     coverage at least ``min_coverage`` when known. Ordered by how well the field id and
     description match ``topics`` (kinds of signal that make good partners; the Generator's
-    IDF word match, ``generator._rank_datafields``), at most ``per_dataset`` per dataset."""
+    IDF word match, ``generator._rank_datafields``), at most ``per_dataset`` per dataset.
+    With ``prefer_low_usage`` the fields used by at most the median number of BRAIN alphas
+    (among the eligible ones) come first, topic order kept within each half: production
+    alphas are built on the much-used fields (CHN 2026-11-24: a revision-breadth partner on
+    items with 5-19 alphas got under the limit, ARM scores with 146 did not)."""
     from .generator import _rank_datafields
     own, crowded, excluded = set(own_datasets), set(crowded), set(exclude_categories)
     eligible = []
@@ -574,8 +579,13 @@ def partner_fields(meta: Mapping[str, dict], own_datasets: Collection[str], spec
                     and cov < min_coverage)):
             continue
         eligible.append(f)
+    ranked = _rank_datafields(eligible, topics, len(eligible), meta)
+    if prefer_low_usage and ranked:
+        counts = sorted(meta[f].get("alpha_count") or 0 for f in ranked)
+        median = counts[(len(counts) - 1) // 2]
+        ranked = sorted(ranked, key=lambda f: (meta[f].get("alpha_count") or 0) > median)
     out, per = [], {}
-    for f in _rank_datafields(eligible, topics, len(eligible), meta):
+    for f in ranked:
         ds = meta[f].get("dataset")
         if per.get(ds, 0) < per_dataset:
             per[ds] = per.get(ds, 0) + 1
@@ -583,6 +593,22 @@ def partner_fields(meta: Mapping[str, dict], own_datasets: Collection[str], spec
         if len(out) >= max_fields:
             break
     return out
+
+
+def blend_weight(step: Mapping, result) -> float:
+    """The partner's weight in a blend: the first ``weight_by_prod`` entry
+    ``[max_prod_correlation, weight]`` whose bound is at least the parent's PROD_CORRELATION
+    value; ``step.weight`` (1.0) when that value is unknown or no entry matches. Evidence
+    (2026-11-15..24): parents at 0.73-0.74 passed with a 1:1 partner (EUR 0.645, IND 0.69);
+    a retail-flow part at 0.93 alone stayed at 0.79 with 1:1 and passed at 2:1 (CHN 0.698)."""
+    default = float(step.get("weight", 1.0))
+    value = ((getattr(result, "check_values", None) or {}).get("PROD_CORRELATION") or {}).get("value")
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return default
+    for bound, weight in step.get("weight_by_prod") or ():
+        if value <= bound:
+            return float(weight)
+    return default
 
 
 def _rename(node, mapping: Mapping[str, str]):
@@ -986,7 +1012,8 @@ class RepairAgent:
             if not expression_fields(expr.strip(), self.spec) & allowed:
                 raise LeverNotApplicable("partner signal uses none of the listed fields of "
                                          "another dataset")
-            weight = lever.step.get("weight", 1.0)
+            weight = blend_weight(lever.step, result)
+            out.notes.append(f"{lever.name}: partner weight {weight}")
             try:
                 expr = build_blend(c.expression, expr.strip(), self.spec, weight=weight)
             except FastExprError as exc:
@@ -1052,7 +1079,8 @@ class RepairAgent:
                               per_dataset=step.get("per_dataset", 8),
                               max_fields=step.get("max_fields", 48),
                               topics=step.get("topics", ""),
-                              role=lambda f: field_role(f, meta, cfg))
+                              role=lambda f: field_role(f, meta, cfg),
+                              prefer_low_usage=bool(step.get("prefer_low_usage", False)))
 
 
 def _partner_line(f: str, m: dict) -> str:

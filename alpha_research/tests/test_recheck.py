@@ -104,9 +104,12 @@ def test_alpha_accepted_with_an_unfinished_check_becomes_pending(config, playboo
     memory.put_candidate(candidate())
     memory.put_result(r)
     memory.put_decision(DecisionRecord("c1", "accept", "none"))
+    from alpha_research.pool import Pool
+    Pool(memory).admit(candidate(), r, DecisionRecord("c1", "accept", "none"), True)
     client = StubBrain([raw(0.2, {"LOW_SHARPE": True}, r.notes)])   # BRAIN: still no verdict
     outs, still = make(config, playbook, memory, client).recheck_pending()
     assert [o.decision for o in outs] == ["pending"] and still == ["c1"]
+    assert Pool(memory).alpha_ids() == []               # no longer accepted: retired (2026-11-25)
     assert len(memory.results_for("c1")) == 1           # nothing new from BRAIN stored
     # now pending: a later recheck only asks BRAIN, it does not re-decide again
     outs, still = make(config, playbook, memory, client).recheck_pending()

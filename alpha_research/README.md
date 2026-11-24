@@ -483,7 +483,16 @@ python -m alpha_research.cli run --client real --candidates candidates/rescue.js
 python -m alpha_research.cli levers --data-dir data     # what each lever has fixed so far
 python -m alpha_research.cli recheck                    # alphas pending on a BRAIN check (PROD_CORRELATION) without a verdict yet
 python -m alpha_research.cli brain cancel               # cancel our simulations stuck on BRAIN (asks first)
+python -m alpha_research.cli pool                       # alphas in our pool
+python -m alpha_research.cli pool --submitted <id>      # add one you submitted on BRAIN (candidate or BRAIN alpha id)
+python -m alpha_research.cli pool --remove <id> --reason "..."   # take one out
 ```
+
+The pool is the alphas submitted on BRAIN (`diversity.pool_admits: submitted`, owner
+2026-11-25): only `cli pool --submitted` adds one, and the pipeline never adds or removes
+any. Removal is an append-only `pool_events` row. With `pool_admits: accept` (test configs,
+older configs) the pipeline adds accepted alphas and retires an alpha re-decided away from
+accept; `cli pool --sync` then matches the latest decisions.
 
 BRAIN computes PROD_CORRELATION and self-correlation on demand, sometimes hours after a
 simulation ends. A run waits at most a minute per alpha for them; an alpha whose check has

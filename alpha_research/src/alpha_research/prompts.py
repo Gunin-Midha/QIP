@@ -27,7 +27,7 @@ PROMPT_VERSIONS = {
     "prefilter": "prefilter-v3",
     "critic": "critic-v6",
     "judge": "judge-v4",
-    "repair": "repair-v7",
+    "repair": "repair-v8",
     "strategy": "strategy-v4",
     "lessons": "lessons-v3",
 }
@@ -334,6 +334,11 @@ LEVER_INSTRUCTIONS = {
         "example its z-score over about three months). Slow fundamentals (margin levels or "
         "yearly changes) and news sentiment lowered the blend's Sharpe on BRAIN's robust and "
         "investable universes, so avoid them as partners unless nothing else is listed. "
+        "Fields are listed less-used first: prefer them, because production alphas are "
+        "built on the much-used ones; a partner on heavily used model scores (for example "
+        "analyst rating models) raised the correlation instead of lowering it (CHN). For "
+        "revision breadth, each raised-estimates field usually has a lowered counterpart "
+        "(…_up / …_dn) in the catalog that you may use with it. "
         "VECTOR fields must go inside a vec_* operator such as vec_avg. Do not set decay or "
         "neutralization."),
     "model_repair": (

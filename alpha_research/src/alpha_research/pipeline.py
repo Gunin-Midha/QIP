@@ -395,8 +395,17 @@ class Pipeline:
         if tag is not None:   # recorded only: the decision itself is unchanged
             decision = dataclasses.replace(decision, reasons=decision.reasons + [tag])
         self.memory.put_decision(decision)
-        if decision.decision == "accept":
-            self.pool.admit(candidate, result, decision, admitted_by_diversity)
+        if config.diversity.pool_admits == "submitted":
+            pass   # the owner adds submitted alphas by hand (cli pool --submitted)
+        elif decision.decision == "accept":
+            # under brain_checks_only our diversity check is recorded only, so an alpha
+            # BRAIN passed joins the pool (2026-11-25: one failed our pool check against a
+            # sibling accepted by mistake and was left out)
+            self.pool.admit(candidate, result, decision,
+                            True if brain_only else admitted_by_diversity)
+        else:   # re-decided (recheck, re-evaluation): no longer an accepted alpha
+            self.pool.retire(candidate.candidate_id,
+                             f"re-decided {decision.decision} / {decision.failure_class}")
         self.loop.route(candidate, decision)
         outcome = self._emit(Outcome(candidate.candidate_id, decision.decision,
                                      decision.failure_class, result, decision))

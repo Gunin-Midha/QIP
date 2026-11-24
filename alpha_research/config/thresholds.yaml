@@ -60,6 +60,9 @@ risk:
 diversity:
   max_pool_correlation: 0.70
   min_marginal_pool_sharpe_gain: null   # OQ-7
+  # owner 2026-11-25: only alphas submitted on BRAIN go in the pool, added by hand with
+  # `cli pool --submitted <id>`; the pipeline never adds or removes them ("accept": it does)
+  pool_admits: submitted
 
 # Overfitting auditor
 auditor:

@@ -68,6 +68,10 @@ class RiskConfig:
 class DiversityConfig:
     max_pool_correlation: float | None
     min_marginal_pool_sharpe_gain: float | None
+    # who puts an alpha in the pool: "accept" (the pipeline, on an accept) or "submitted"
+    # (only the owner, with `cli pool --submitted`, once it is submitted on BRAIN; owner
+    # 2026-11-25: the pool is what we hold on BRAIN, which its SELF_CORRELATION compares to)
+    pool_admits: str = "accept"
 
 
 @dataclass(frozen=True)
@@ -278,6 +282,7 @@ def config_from_dict(raw: Any, source: str = "<dict>") -> Config:
     diversity = DiversityConfig(
         max_pool_correlation=_num(dv, "diversity", "max_pool_correlation", lo=-1.0, hi=1.0),
         min_marginal_pool_sharpe_gain=_num(dv, "diversity", "min_marginal_pool_sharpe_gain"),
+        pool_admits=_pool_admits(dv),
     )
 
     a = _section(raw, "auditor")
@@ -352,6 +357,16 @@ def config_from_dict(raw: Any, source: str = "<dict>") -> Config:
 
     return Config(gates, risk, diversity, auditor, holdout, simulator, source=source,
                   repair=RepairPolicy(near_miss, rn_gap), regions=regions)
+
+
+POOL_ADMITS = ("accept", "submitted")
+
+
+def _pool_admits(dv: dict) -> str:
+    v = dv.get("pool_admits", "accept")   # optional: older configs keep "accept"
+    if v not in POOL_ADMITS:
+        raise ConfigError(f"diversity.pool_admits must be one of {POOL_ADMITS}, got {v!r}")
+    return v
 
 
 def load_config(path: str | Path) -> Config:

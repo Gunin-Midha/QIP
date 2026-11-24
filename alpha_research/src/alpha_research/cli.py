@@ -49,6 +49,7 @@ from .repair import Playbook
 from .lever_stats import LeverStats, repair_events
 from .repair_agent import RepairAgent
 from . import power_pool
+from .pool import Pool
 from .lessons import LessonsOutcome, learn as learn_lessons, summary as lessons_summary
 from .research import (Budget, ResearchRun, load_agents_config, load_plan, load_seeds,
                        write_report)
@@ -126,6 +127,65 @@ def _write_lessons(memory: MemoryStore, args, batch_id: str, llm=None) -> Lesson
         memory.put_lessons(batch_id, out.lessons, out.source, out.evidence)
     print(lessons_summary(out))
     return out
+
+
+def _pool(args) -> int:
+    """The pool's active alphas; ``--sync`` first makes it match memory's latest decisions
+    (retire alphas no longer accepted; under gates.brain_checks_only admit accepted ones
+    that are missing)."""
+    config = load_config(args.config)
+    memory = MemoryStore(args.data_dir)
+    try:
+        pool = Pool(memory)
+        for ref in args.submitted or ():
+            cid = _candidate_by_ref(memory, ref)
+            if cid is None:
+                print(f"not in memory: {ref}", file=sys.stderr)
+                return EXIT_CONFIG
+            try:
+                print(f"{pool.add_submitted(cid)}: {cid}")
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return EXIT_CONFIG
+        for ref in args.remove or ():
+            cid = _candidate_by_ref(memory, ref) or ref
+            ok = pool.retire(cid, args.reason or "removed by the owner")
+            print(f"removed: {cid}" if ok else f"not in the pool: {ref}")
+        if args.sync and config.diversity.pool_admits == "submitted":
+            print("diversity.pool_admits is 'submitted': the pool holds what you added with "
+                  "--submitted, nothing to sync")
+        elif args.sync:
+            changed = pool.sync(admit_accepted=config.gates.brain_checks_only)
+            for cid in changed["admitted"]:
+                print(f"admitted: {cid}")
+            for cid in changed["retired"]:
+                print(f"retired:  {cid} (latest decision is no longer accept)")
+            if not changed["admitted"] and not changed["retired"]:
+                print("pool already matches the latest decisions")
+        ids = pool.alpha_ids()
+        print(f"{len(ids)} alpha(s) in the pool:")
+        for cid in ids:
+            c, r = memory.get_candidate(cid), (memory.results_for(cid) or [None])[-1]
+            brain = next((n.split(":", 1)[1].strip() for n in (r.notes or [])
+                          if n.startswith("brain_alpha_id:")), "-") if r else "-"
+            stats = (f"Sharpe {r.sharpe}, fitness {r.fitness}" if r else "no result")
+            print(f"  {cid}  {c.region if c else '?'}  BRAIN {brain}  {stats}")
+    finally:
+        memory.close()
+    return EXIT_OK
+
+
+def _candidate_by_ref(memory: MemoryStore, ref: str) -> str | None:
+    """A candidate id, or the candidate whose result names BRAIN alpha ``ref`` (any case)."""
+    if memory.get_candidate(ref) is not None:
+        return ref
+    want = ref.lower()
+    for row in memory.candidate_outcomes():
+        r = row["result"]
+        for n in (r.notes or []) if r else ():
+            if n.startswith("brain_alpha_id:") and n.split(":", 1)[1].strip().lower() == want:
+                return row["candidate"].candidate_id
+    return None
 
 
 def _power_pool(args) -> int:
@@ -884,6 +944,19 @@ def build_parser() -> argparse.ArgumentParser:
                     help="send one tiny request to every model config/agents.yaml uses")
     md.add_argument("--agents", default="config/agents.yaml")
     md.set_defaults(func=_models)
+
+    pl = sub.add_parser("pool", help="alphas in our pool; --submitted ID adds one you "
+                                     "submitted on BRAIN, --remove ID takes one out")
+    pl.add_argument("--data-dir", default=str(default_data_dir()))
+    pl.add_argument("--config", default="config/thresholds.yaml")
+    pl.add_argument("--submitted", action="append", metavar="ID",
+                    help="candidate id or BRAIN alpha id you submitted (repeatable)")
+    pl.add_argument("--remove", action="append", metavar="ID",
+                    help="candidate id or BRAIN alpha id to take out (repeatable)")
+    pl.add_argument("--reason", default=None, help="recorded with --remove")
+    pl.add_argument("--sync", action="store_true",
+                    help="with pool_admits 'accept': match the latest decisions")
+    pl.set_defaults(func=_pool)
 
     pp = sub.add_parser("power-pool", help="Power Pool candidates in memory (recorded only)")
     pp.add_argument("--data-dir", default=str(default_data_dir()))

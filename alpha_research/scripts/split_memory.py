@@ -24,15 +24,17 @@ from pathlib import Path
 # table -> column holding its time (rows on or after --since are kept)
 TABLES = {"candidates": "created_at", "results": "created_at", "decisions": "created_at",
           "variants": "created_at", "critic_reviews": "created_at",
-          "pending_submissions": "submitted_at", "pool": "admitted_at", "os_is": "recorded_at"}
+          "pending_submissions": "submitted_at", "pool": "admitted_at", "os_is": "recorded_at",
+          "pool_events": "at"}   # pool_events: since 2026-11-25; older databases lack it
 
 
 def counts(db: Path, since: str | None = None) -> dict[str, int]:
     con = sqlite3.connect(db)
     try:
+        have = {n for (n,) in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         return {t: con.execute(f"SELECT COUNT(*) FROM {t}" + (f" WHERE {c} >= ?" if since else ""),
                                (since,) if since else ()).fetchone()[0]
-                for t, c in TABLES.items()}
+                for t, c in TABLES.items() if t in have}
     finally:
         con.close()
 
@@ -66,7 +68,10 @@ def main(argv=None) -> int:
                              "name NOT LIKE 'sqlite_%' ORDER BY type = 'index'").fetchall()
         for (sql,) in schema:
             con.execute(sql)
+        have = {n for (n,) in con.execute("SELECT name FROM old.sqlite_master WHERE type = 'table'")}
         for table, col in TABLES.items():
+            if table not in have:
+                continue
             con.execute(f"INSERT INTO main.{table} SELECT * FROM old.{table} "
                         f"WHERE {col} >= ? ORDER BY rowid", (args.since,))
         con.commit()
@@ -88,7 +93,7 @@ def main(argv=None) -> int:
     if got != keep:
         print(f"row counts differ from what was expected: {got} vs {keep}", file=sys.stderr)
         return 1
-    for t in TABLES:
+    for t in got:
         print(f"  {t:20s} kept {got[t]:4d} of {total[t]}")
     print(f"pool PnL files copied: {len(pnl)}; run reports copied: {len(reports)}")
     return 0
