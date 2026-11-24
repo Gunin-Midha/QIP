@@ -98,7 +98,7 @@ from .llm import LLMClient, ModelDown
 from .memory import MemoryStore
 from .prompts import repair_system, repair_user
 from .repair import Lever, Playbook
-from .research_loop import assign_lineage
+from .research_loop import assign_lineage, lineage_members, lineage_root
 from .schemas import (CandidateRecord, DecisionRecord, ResultRecord, SchemaError,
                       experiment_hash, neutralizations_for)
 
@@ -513,6 +513,36 @@ MECHANICAL = {
 # partner value gets the neutral 0.5, and a size/liquidity tilt on the alpha stays outside.
 
 BLEND_LEVER = "blend_other_dataset"
+PROD_CLASS = "prod_correlation"
+
+
+def tried_partners(candidate: CandidateRecord, outcomes: list[dict], spec: FastExprSpec,
+                   limit: int = 8) -> list[str]:
+    """Partners already blended into this alpha's lineage, with what BRAIN measured: one line
+    per blend (expressions holding build_blend's ``blend_bf``), its fields beyond the lineage
+    root's, then PROD_CORRELATION, Sharpe and fitness. Lets the model pick a different
+    partner when a lineage blends again (owner 2026-11-25: a production-correlation failure
+    always gets a model call)."""
+    cands = {r["candidate"].candidate_id: r["candidate"] for r in outcomes}
+    root = lineage_root(candidate.candidate_id, cands)
+    try:
+        base = expression_fields(cands[root].expression, spec) if root in cands else set()
+    except FastExprError:
+        base = set()
+    lines = []
+    for row in lineage_members(outcomes, root):
+        c, r = row["candidate"], row["result"]
+        if "blend_bf" not in c.expression or r is None or r.status != "complete":
+            continue
+        try:
+            fields = sorted(expression_fields(c.expression, spec) - base - set(spec.base_fields))
+        except FastExprError:
+            continue
+        prod = ((r.check_values or {}).get("PROD_CORRELATION") or {}).get("value")
+        lines.append(f"{', '.join(fields) or '(no new fields)'} -> production correlation "
+                     f"{prod if prod is not None else 'not measured'}, Sharpe {r.sharpe}, "
+                     f"fitness {r.fitness}")
+    return lines[-limit:]
 
 
 def _names(node, out: set) -> set:
@@ -767,7 +797,8 @@ class RepairAgent:
             return out
         ranked = self.ranked(candidate, decision, result, stats)
         out.notes.append("lever order: " + ", ".join(f"{lv.name} {sc:g}" for lv, sc in ranked))
-        tried = set(self.memory.lineage_levers(candidate.candidate_id))
+        tried = set(self.memory.lineage_levers(candidate.candidate_id)) - self._repeatable()
+        self._outcomes = outcomes
         for lever, _ in ranked:
             if lever.name in tried:
                 continue
@@ -811,7 +842,20 @@ class RepairAgent:
         tried = set(self.memory.lineage_levers(candidate.candidate_id))
         tried |= {r["candidate"].lever for r in outcomes
                   if r["candidate"].parent_id == candidate.candidate_id and r["candidate"].lever}
+        tried -= self._repeatable()
+        self._outcomes = outcomes
         options = self._wave_options(candidate, decision, result, stats, tried, priority)
+        # owner 2026-11-25: an alpha failing production correlation always gets a model call;
+        # that class's model levers take the wave's model slot first
+        prod = PROD_CLASS in (failing_classes(decision, result) | {decision.failure_class}) \
+            and bool(self.playbook.entries.get(PROD_CLASS))
+        if prod:
+            names = {lv.name for lv in self.playbook.entries[PROD_CLASS]}
+            first = [x for x in options if x[1].name in names and not _mechanical(x[1].name)]
+            options = first + [x for x in options if x not in first]
+            if self.llm is None:
+                out.notes.append("production correlation needs a model call; no model is "
+                                 "configured")
         out.notes.append("wave order: " + ", ".join(lv.name for _, lv in options))
         seen = {(candidate.expression, candidate.universe, candidate.decay,
                  candidate.neutralization, candidate.truncation)}
@@ -819,13 +863,13 @@ class RepairAgent:
         for d, lever in options:
             if len(out.children) >= size:
                 break
-            mechanical = lever.name in MECHANICAL or (
-                combo_parts(lever.name) and all(x in MECHANICAL for x in combo_parts(lever.name)))
-            if not mechanical:
+            if not _mechanical(lever.name):
                 if self.llm is None or model_tries >= self.learning.model_levers_per_wave:
                     continue
-                model_tries += 1
+            calls = out.llm_calls
             child = self._try(candidate, lever, d, result, pool_expressions, events, out)
+            if out.llm_calls > calls:   # the slot is spent only when the model was asked
+                model_tries += 1
             if child is None:
                 continue
             key = (child.expression, child.universe, child.decay, child.neutralization,
@@ -840,12 +884,21 @@ class RepairAgent:
             out.children.append(dataclasses.replace(
                 child, candidate_id=self._free_id(child.candidate_id, out.children)))
             out.notes.append(f"{lever.name}: applied")
+        if prod and model_tries == 0:
+            out.notes.append("no model call for production correlation: its model levers "
+                             "did not apply (see the notes above)")
         if out.children:
             out.child, out.lever = out.children[0], out.children[0].lever
         else:
             out.notes.append("repair exhausted: every lever for the failing classes was "
                              "tried or did not apply")
         return out
+
+    def _repeatable(self) -> set[str]:
+        """Levers whose playbook step says ``repeatable: true``: they may be applied again
+        along a lineage (each call writes something new, e.g. another blend partner)."""
+        return {lv.name for levers in self.playbook.entries.values() for lv in levers
+                if isinstance(lv.step, Mapping) and lv.step.get("repeatable")}
 
     def _wave_options(self, candidate, decision, result, stats, tried,
                       priority) -> list[tuple[DecisionRecord, Lever]]:
@@ -990,6 +1043,10 @@ class RepairAgent:
         user = repair_user(c, lever, decision, _metrics(result), pool, self.spec.operators,
                            failing=failing, examples=examples,
                            partners=[_partner_line(f, m) for f, m in partners] if partners else None,
+                           tried_partners=(tried_partners(
+                               c, getattr(self, "_outcomes", None)
+                               or self.memory.candidate_outcomes(), self.spec)
+                               if partners else None),
                            lessons=self._lessons_for(c))
         try:
             reply, calls = ask_json(self.llm, repair_system(self.context), user,
@@ -1081,6 +1138,11 @@ class RepairAgent:
                               topics=step.get("topics", ""),
                               role=lambda f: field_role(f, meta, cfg),
                               prefer_low_usage=bool(step.get("prefer_low_usage", False)))
+
+
+def _mechanical(name: str) -> bool:
+    parts = combo_parts(name)
+    return name in MECHANICAL or bool(parts and all(x in MECHANICAL for x in parts))
 
 
 def _partner_line(f: str, m: dict) -> str:

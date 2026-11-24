@@ -157,6 +157,9 @@ prod_correlation:                   # BRAIN's PROD_CORRELATION: too close to pro
       min_coverage: 0.3
       min_alphas: 5
       prefer_low_usage: true          # less-used fields first (production alphas use the rest)
+      # may blend again along a lineage, with a different partner (the model sees the
+      # partners tried and their production correlation); owner 2026-11-25
+      repeatable: true
       per_dataset: 8
       max_fields: 48
       # kinds of signal offered first to the model (word match on field id + description)

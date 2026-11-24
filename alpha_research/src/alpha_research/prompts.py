@@ -27,7 +27,7 @@ PROMPT_VERSIONS = {
     "prefilter": "prefilter-v3",
     "critic": "critic-v6",
     "judge": "judge-v4",
-    "repair": "repair-v8",
+    "repair": "repair-v9",
     "strategy": "strategy-v4",
     "lessons": "lessons-v3",
 }
@@ -391,7 +391,8 @@ CLASS_MEANING = {
 
 def repair_user(c, lever, decision, metrics: dict, pool: list[str] | None, operators, *,
                 failing: list[str] | None = None, examples: list[dict] | None = None,
-                partners: list[str] | None = None, lessons: list[str] | None = None) -> str:
+                partners: list[str] | None = None, lessons: list[str] | None = None,
+                tried_partners: list[str] | None = None) -> str:
     instructions = LEVER_INSTRUCTIONS.get(lever.name, GENERIC_LEVER)
     meaning = CLASS_MEANING.get(decision.failure_class)
     parts = [_candidate_block(c, extra={"BRAIN metrics": json.dumps(metrics) if metrics else "none"}),
@@ -412,6 +413,10 @@ def repair_user(c, lever, decision, metrics: dict, pool: list[str] | None, opera
     if partners:
         parts += ["<partner_fields> (id | dataset (category) | type | BRAIN alphas | description)",
                   *partners, "</partner_fields>"]
+    if tried_partners:
+        parts += ["<tried_partners> (partners already blended into this alpha's lineage and "
+                  "what BRAIN measured; choose different information, and more of what "
+                  "lowered the production correlation)", *tried_partners, "</tried_partners>"]
     parts.append(f"Operators you may use: {', '.join(sorted(operators))}")
     parts.append(f"Neutralizations allowed in {c.region}: {', '.join(neutralizations_for(c.region))}")
     return "\n".join(parts)
