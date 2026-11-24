@@ -676,7 +676,7 @@ screenshot values (aggregate plus yearly rows for 2019 to 2023).
   line prints as each simulation finishes (`   7m30s  r01a27_001_c1 (speed_up)  Sharpe
   0.91  fitness 0.41  turnover 20%   (3 of 5)`; ids without the run prefix, a repair child
   with its fix); the decision lines (`r01a27_001_c1 | repair / sharpe | Sharpe 0.91 | ...`)
-  follow as each alpha is decided, the moment its result is in (research runs; `cli run` still decides a batch in order once all are in), and a ready repair wave takes a freed slot at once. While alphas run, one status line every
+  follow as each alpha is decided, the moment its result is in (research runs and, since 2026-11-24, `cli run`, which also sends the next alpha of the file into a freed slot at once), and a ready repair wave takes a freed slot at once. While alphas run, one status line every
   `simulator.progress_every_seconds` (60) gives the batch's time, how many are done and the
   range of BRAIN's progress; a `simulated, fetching results and checks ...` note marks the
   minutes spent fetching, and a terminal overwrites it with the result line.

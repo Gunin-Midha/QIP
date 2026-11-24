@@ -27,7 +27,7 @@ PROMPT_VERSIONS = {
     "prefilter": "prefilter-v3",
     "critic": "critic-v6",
     "judge": "judge-v4",
-    "repair": "repair-v6",
+    "repair": "repair-v7",
     "strategy": "strategy-v4",
     "lessons": "lessons-v3",
 }
@@ -329,6 +329,11 @@ LEVER_INSTRUCTIONS = {
         "weight in the step, ranks both parts the same way and fills missing partner values "
         "with the neutral rank. Prefer a net or relative measure (for example raised minus "
         "lowered estimates over their count, averaged over several items) to a raw level. "
+        "Prefer analyst estimates that cover the large, liquid stocks well: net revision "
+        "breadth, or the trend of a consensus estimate against its own recent history (for "
+        "example its z-score over about three months). Slow fundamentals (margin levels or "
+        "yearly changes) and news sentiment lowered the blend's Sharpe on BRAIN's robust and "
+        "investable universes, so avoid them as partners unless nothing else is listed. "
         "VECTOR fields must go inside a vec_* operator such as vec_avg. Do not set decay or "
         "neutralization."),
     "model_repair": (

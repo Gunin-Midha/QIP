@@ -27,6 +27,7 @@ import json
 import logging
 import re
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, TextIO
@@ -255,6 +256,7 @@ class Pipeline:
                 out.append(c)
             if live and out:
                 self._levers.update({c.candidate_id: c.lever for c in out})
+                self._width = max([self._width] + [len(self._name(c.candidate_id)) for c in out])
             return out
 
         results = self.simulator.run_many(
@@ -388,7 +390,22 @@ class Pipeline:
         return admit, decision
 
     def run(self, candidates: list[CandidateRecord]) -> list[Outcome]:
-        """Every candidate, ``simulator.max_concurrent`` at a time."""
+        """Every candidate, at most ``simulator.max_concurrent`` on BRAIN at a time, each
+        decided the moment its result is in and a freed slot refilled at once (owner
+        2026-11-24: one stuck simulation held a whole ``cli run`` batch's decisions for 30
+        minutes). Outcomes in the order of ``candidates``. A new batch starts only when
+        none of the current one reached BRAIN (all duplicate or invalid: no result to
+        refill on)."""
         n = max(1, self.config.simulator.max_concurrent)
-        return [o for i in range(0, len(candidates), n)
-                for o in self.process_many(candidates[i:i + n])]
+        rest = deque(candidates)
+        got: dict[int, Outcome] = {}
+
+        def take(free: int) -> list[CandidateRecord]:
+            return [rest.popleft() for _ in range(min(free, len(rest)))]
+
+        def keep(candidate: CandidateRecord, outcome: Outcome) -> None:
+            got[id(candidate)] = outcome
+
+        while rest:
+            self.process_many(take(n), on_outcome=keep, more=take)
+        return [got[id(c)] for c in candidates]

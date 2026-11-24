@@ -1,0 +1,8 @@
+{
+  "rs20261123190057r01a118_001": [
+    "change_universe: not applicable (no known smaller universe than TOP500 in IND)",
+    "rank_transform: not applicable (expression is already a rank(...))",
+    "restrict_to_liquid_fields: skipped (model lever)",
+    "model_repair: skipped (model lever)"
+  ]
+}

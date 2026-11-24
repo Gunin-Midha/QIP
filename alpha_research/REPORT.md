@@ -836,3 +836,24 @@ Owner: the Repair Agent should try four different fixes at once and, with eight 
 - **Gain credit** (`lever_stats.gap_closed`, `LeverStats.estimate`). The class part of a repair's reward is the share of the gap closed (Sharpe 1.20 -> 1.50 against 1.58: 0.79) instead of a flat 0.5. Each (class, lever) keeps its past slack gains; for an alpha that misses a class by `need`, the estimate is (1 - 0.5) x posterior mean + 0.5 x P(gain >= need) once there are two gains.
 - **Budget relaxed** (owner): depth 3, 12 repair simulations per original alpha, patience 8 children (two waves); it is a cost limit now. Deflated Sharpe stays recorded on the decision and is printed as a flag (`overfitting_flags`).
 - Suggested run size: `--max-simulations 60 --max-llm-calls 60 --per-round 12`.
+
+### IND momentum/reversal rescue and `cli run` deciding as alphas finish (2026-11-24)
+
+**The rescue (owner's plan, 17 hand/lever variants).** IND `rs20261123190057r01a118_001` (model39 global price-momentum percentile minus the 10-day price change in rupees, SECTOR, TOP500; Sharpe 3.14, fitness 2.20) was rejected only for BRAIN's robust-universe Sharpe (0.95 of 1.0), then mapped to `other`. After `cli reevaluate` (-> repair / sub_universe), round 1 (`candidates/rescue_20261124_ind.json`): backfilling the model field (`r1c`) gave Sharpe 3.11, fitness 2.17, robust-universe 1.01, every year >= 1.7, and failed only PROD_CORRELATION 0.730; the units fix (n-day return instead of a rupee change) cost a third of the Sharpe (2.07), and size and liquidity tilts cost most of it (0.85, 1.08). Round 2 (`_r2.json`, `cli repair` levers): CROWDING neutralization (Sharpe 2.09, robust 0.59) and longer windows (1.56, robust 0.76) broke the robust universe; REVERSION_AND_MOMENTUM and STATISTICAL timed out on BRAIN (30 min; recovered at the next research start). Round 3 (`_r3.json`, 8 blends built with `repair_agent.build_blend`, lever `blend_other_dataset`): analyst partners lowered the production correlation and raised the robust universe, every other partner broke it:
+
+| partner (1:1 unless noted) | Sharpe | fitness | robust | PROD | decision |
+|---|---|---|---|---|---|
+| annual EPS consensus, 60-day z-score (analyst4) | **4.10** | **3.44** | **1.36** | **0.687** | **accept** (BRAIN `LLKQ7Kpe`) |
+| quarterly net-profit consensus, 60-day z-score | 3.48 | 2.65 | 1.20 | 0.684 | accept (`wporjRQ1`, in the pool) |
+| same at half weight | 3.43 | 2.52 | 1.16 | 0.712 | repair / prod_correlation |
+| net-profit trend + net-margin change (three-way) | 3.30 | 2.51 | 0.97 | - | repair / sub_universe |
+| net-margin change, half weight (fundamental17) | 3.20 | 2.37 | 0.86 | - | repair / sub_universe |
+| net-margin change | 2.98 | 2.31 | 0.73 | - | repair / sub_universe |
+| positive news sentiment, 5-day (news85) | 2.43 | 1.37 | 0.67 | - | repair / sub_universe |
+| net-margin level | 2.09 | 1.46 | 0.53 | - | repair / sub_universe |
+
+The two accepts correlate 0.80 (the EPS one was accepted but not pooled: our pool check is informational under `brain_checks_only`); only one can be submitted, and the EPS blend is better on every measure (risk-neutralized Sharpe 2.97, investability-constrained 2.52, worst year 2.1). Its production correlation (0.687) is close to BRAIN's 0.70, which BRAIN measures against the production pool at submission time. Deflated Sharpe over 22 lineage trials passes. The rupee-unit price leg stays (BRAIN UNITS warning, not counted).
+
+**Into the agents:** the blend lever's instruction (repair-v7) prefers analyst partners with good large-stock coverage (net revision breadth or a consensus-estimate trend against its own history) and steers away from slow fundamentals and news sentiment; generator category lessons (gen-v9): `all` adds the IND evidence and that half weight left the correlation at 0.71; `analyst` now separates revision size as a signal alone (hurt, DEU) from a consensus-trend blend part (worked, IND). The Lesson Writer's stored write after the batch measures `blend_other_dataset` on prod_correlation in IND: fixed 2 of 8, median production correlation -0.043.
+
+**`cli run` decides as alphas finish.** One variant stuck on BRAIN held a 5-alpha batch's decisions for 30 minutes. `Pipeline.run` now uses the streaming path of `process_many` (as research runs do since 2026-11-23): each alpha is decided the moment its result is in, and the next alpha in the file goes into a freed slot at once; outcomes are still returned in file order; a new batch starts only when none of the current one reached BRAIN (all duplicate or invalid). `tests/test_concurrency.py` (2 new tests). 815 tests pass.

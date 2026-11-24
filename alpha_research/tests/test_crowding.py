@@ -159,7 +159,7 @@ def test_ranker_lists_the_arms_dataset_first():
     assert listed.index("mdl_quality") < listed.index("news_sentiment")
 
 
-# ------------------------------------------------------------------ category lessons (gen-v8)
+# ------------------------------------------------------------------ category lessons (gen-v9)
 
 def test_lessons_by_dataset_category_reach_the_prompt():
     from alpha_research.generator import dataset_category, lessons_for

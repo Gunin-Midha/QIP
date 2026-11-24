@@ -271,3 +271,37 @@ def test_streaming_decides_each_alpha_as_it_finishes_and_fills_freed_slots(
     assert ("dup", "duplicate") in decided                # same experiment as c1: not run
     assert [o.candidate_id for o in outs] == ["c0", "c1", "c2"]
     assert brain.max_active <= 3
+
+
+def test_cli_run_path_decides_as_each_finishes_and_refills_slots(memory, make_config,
+                                                                 playbook, candidate):
+    # owner 2026-11-24: in `cli run` (Pipeline.run) one stuck simulation held the whole
+    # batch's decisions for 30 minutes; now each is decided when its result is in
+    import io
+    brain = SlowBrain(polls_by={"c0": 8, "c1": 1, "c2": 2, "c3": 1, "c4": 1})
+    vc, out = VirtualClock(), io.StringIO()
+    pipe = Pipeline(make_config(simulator__max_concurrent=3), playbook, brain, memory,
+                    sleep=vc.sleep, clock=vc.clock, out=out)
+    outs = pipe.run(cands(candidate, 5))
+    decided = [ln.split(" | ")[0] for ln in out.getvalue().splitlines() if " | " in ln]
+    assert decided[-1] == "c0" and sorted(decided) == [f"c{i}" for i in range(5)]
+    # c3 and c4 went to BRAIN in slots freed while c0 still ran, not after the batch
+    assert brain.submits == ["c0", "c1", "c2", "c3", "c4"] and brain.max_active == 3
+    assert vc.now == pytest.approx(70)                    # c0's 8 polls, nothing after it
+    assert [o.candidate_id for o in outs] == [f"c{i}" for i in range(5)]   # input order
+    assert all(memory.decisions_for(f"c{i}") for i in range(5))
+
+
+def test_cli_run_path_goes_on_when_a_whole_batch_never_reaches_brain(memory, make_config,
+                                                                     playbook, candidate):
+    # all of the first batch duplicates: no result to refill on, so a new batch starts
+    brain = SlowBrain(polls=1)
+    vc = VirtualClock()
+    pipe = Pipeline(make_config(simulator__max_concurrent=1), playbook, brain, memory,
+                    sleep=vc.sleep, clock=vc.clock)
+    a, b = cands(candidate, 2)
+    pipe.run([a])
+    twin = candidate(candidate_id="twin", expression=a.expression)
+    outs = pipe.run([twin, b])
+    assert [o.decision for o in outs][0] == "duplicate" and outs[1].candidate_id == "c1"
+    assert brain.submits == ["c0", "c1"]

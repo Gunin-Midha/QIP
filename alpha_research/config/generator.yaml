@@ -1,7 +1,7 @@
 # Alpha Generator settings (Phase 3). Technical limits have values. Policy limits are
 # null (= not configured, the check is skipped) until the owner decides (OQ-11).
 generator:
-  prompt_version: gen-v8       # written to CandidateRecord.prompt_version; bump when prompts change
+  prompt_version: gen-v9       # written to CandidateRecord.prompt_version; bump when prompts change
   max_repair_rounds: 1         # times rejected expressions are sent back to the model for a fix
   max_paper_chars: 120000      # longer papers are cut to this many characters (null = no cut)
   max_hypotheses_per_paper: 5  # hypotheses extracted from one paper
@@ -35,7 +35,12 @@ generator:
       information does. A part from another dataset at about equal weight lowered a
       reversal's production correlation from 0.74 to 0.65, a third of the weight only to
       0.72. Such a part need not pass alone: it must carry different information and be
-      sound in the large stocks.
+      sound in the large stocks. In IND a momentum-minus-reversal alpha (production
+      correlation 0.73) blended 1:1 with the three-month z-score of the consensus EPS or
+      net-profit estimate passed at 0.69, and its Sharpe on BRAIN's robust universe rose
+      (1.01 to 1.36); blended with net-margin levels or changes, or news sentiment, it fell
+      below the limit (0.53-0.97). Prefer analyst parts that cover the large stocks; at half
+      weight the same part left the correlation at 0.71.
     pv: >-
       Signals built only from price and volume (open, close, returns, volume, vwap) are the
       most common production alphas, so they tend to fail BRAIN's production correlation
@@ -55,8 +60,9 @@ generator:
       counts helped the most recent years more than longer windows. The single most used
       item (EBIT upgrades) added recent strength but correlates with production alphas.
       Compare revisions within sector: industry and subindustry peers cut the Sharpe by a
-      third or more. Revision size (change in the mean forecast) and fast price parts
-      hurt. Where items come as lists (VECTOR fields), average them with vec_avg. Revision
+      third or more. As a signal on its own, revision size (change in the mean forecast)
+      and fast price parts hurt; as a part blended with a price signal, the trend of the
+      consensus estimate (z-score over about three months) worked well (IND). Where items come as lists (VECTOR fields), average them with vec_avg. Revision
       breadth also makes a good part to blend with a price signal: alone it can be weak in
       some years, but it adds information production price alphas do not have.
 
