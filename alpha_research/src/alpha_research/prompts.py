@@ -27,8 +27,8 @@ PROMPT_VERSIONS = {
     "prefilter": "prefilter-v3",
     "critic": "critic-v6",
     "judge": "judge-v4",
-    "repair": "repair-v9",
-    "strategy": "strategy-v4",
+    "repair": "repair-v10",
+    "strategy": "strategy-v6",
     "lessons": "lessons-v3",
 }
 
@@ -338,7 +338,9 @@ LEVER_INSTRUCTIONS = {
         "built on the much-used ones; a partner on heavily used model scores (for example "
         "analyst rating models) raised the correlation instead of lowering it (CHN). For "
         "revision breadth, each raised-estimates field usually has a lowered counterpart "
-        "(…_up / …_dn) in the catalog that you may use with it. "
+        "(…_up / …_dn) in the catalog that you may use with it. Each line also gives the "
+        "dataset's BRAIN value score and alpha count when known: among partners that fit, "
+        "prefer a high-value, little-used dataset (fewer production alphas to match). "
         "VECTOR fields must go inside a vec_* operator such as vec_avg. Do not set decay or "
         "neutralization."),
     "model_repair": (
@@ -411,7 +413,8 @@ def repair_user(c, lever, decision, metrics: dict, pool: list[str] | None, opera
     if lessons:
         parts += ["<lessons>", *(f"- {t}" for t in lessons), "</lessons>"]
     if partners:
-        parts += ["<partner_fields> (id | dataset (category) | type | BRAIN alphas | description)",
+        parts += ["<partner_fields> (id | dataset (category, BRAIN value score, dataset's "
+                  "BRAIN alphas) | type | field's BRAIN alphas | description)",
                   *partners, "</partner_fields>"]
     if tried_partners:
         parts += ["<tried_partners> (partners already blended into this alpha's lineage and "
@@ -435,8 +438,9 @@ What to produce:
 1. "guidance": 3 to 6 short, concrete bullet points for the alpha writer. Each must follow from the evidence in the summary (cite the counts), for example which families pass, which failure dominates and how to design against it, which settings help. No generic advice that would apply to any team.
 2. "hypotheses": new ideas worth testing. Each must be testable as a daily cross-sectional signal, clearly different from what the summary shows has been tried, and stated in one sentence with the expected direction. If a dataset label in the summary suits it, give it as "dataset".
 Diversity comes first while accepts are few: a handful of accepts is not enough evidence to narrow the search.
-- At least half of the hypotheses must use a dataset from "least_tried" (give it as "dataset").
+- At least half of the hypotheses must use a dataset from "least_tried" (give it as "dataset"). It is ordered by our trials, then least crowded on BRAIN: "least_tried_facts" gives each one's BRAIN value score (high where production alphas are few) and BRAIN alpha count. Prefer high-value, little-used datasets: alphas built on them are less likely to fail BRAIN's production-correlation check, which has stopped several of our alphas that passed everything else.
 - At most one hypothesis may build on the idea of an accepted alpha; the rest must be genuinely different ideas.
+- "our_brain_submissions" (when given) is BRAIN's count of the alphas we have submitted, by region and data category. Prefer data categories with few or no submissions in the regions of this run, so our submitted alphas stay diverse.
 - Guidance may teach construction techniques from "what_fixes_worked" (for example how to handle sparse fields), but must not tell the writer to stick to the datasets, families or ideas that passed.
 3. "region_guidance" (optional): for a region in "regions" whose evidence differs from the rest (other failures dominate, a neutralization works there and not elsewhere), 1 to 3 bullets for that region only. Markets differ: never carry a lesson from one region to another without evidence from both. Leave a region out when it has too little evidence.
 

@@ -234,7 +234,17 @@ the simulator marks a result `invalid` if that period overlaps the holdout, so a
 BRAIN's default period cannot leak the holdout (OQ-12). BRAIN's `testPeriod` setting is
 not used. Fixed settings sent with every simulation (instrument type,
 pasteurization, unit and NaN handling, language) live in `config/brain.yaml`.
-Up to `simulator.max_concurrent` (3) simulations run on BRAIN at once (OQ-3). Alphas are never submitted for competition.
+Up to `simulator.max_concurrent` (4) simulations run on BRAIN at once (OQ-3).
+`cli research` needs `--max-simulations`; `--max-llm-calls` is optional (2026-11-25): without
+it the run ends when every generator model has hit its own (free-tier) limit, at the
+simulation budget, after `--rounds`, or after `director.stop_after_idle_rounds` rounds that
+sent nothing to BRAIN. Each arm given slots gets at least `director.min_batch` (3), so one
+Generator call writes several alphas. Alphas are never submitted for competition.
+BRAIN's daily simulation limit comes from the `X-Ratelimit-*` headers of each submit: a
+research run stops before a round once at most `brain.yaml` `quota_reserve` (50) are left,
+and at once on a 429 with none left; the report's `brain_quota` shows what remained. A login
+lasts at most 4 h, so `cli research` logs in again at its start when less than
+`relogin_within_seconds` (3 h) is left (the biometric check is asked then, not mid-run).
 
 ## Research loop: all agents connected
 
@@ -551,6 +561,10 @@ set, so the results of a hand rescue become evidence for the learner too.
   hypotheses on least-tried datasets and at most one building on an accepted alpha, and a
   hypothesis on a dataset no arm covers goes to every arm. The Critic flags neutralization
   NONE (advisory, never blocking).
+  Plan v5 (`config/research_plan.v5.yaml`, 2026-11-25) is plan v4 plus one arm per region on
+  its least crowded short-interest, insider or institution dataset (BRAIN value score high,
+  few BRAIN alphas). Dataset facts come from `datasets_<market>.json` next to each field
+  catalog and steer the Generator, Strategy Evolution and the blend partner (`value_share`).
 
 ## Model failover and repair fixes (2026-11-04, after run `rs20261104073248`)
 

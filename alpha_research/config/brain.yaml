@@ -40,3 +40,14 @@ retry_error_messages:
 # you (0600) and holds the session cookie only. null = never save. `cli brain logout`
 # deletes it.
 session_file: ~/.config/qip/brain_session.txt
+
+# BRAIN's daily simulation limit (docs "simulation limits": X-Ratelimit-Limit / -Remaining /
+# -Reset on POST /simulations; it resets at midnight US Eastern). A research run stops
+# before a round once at most this many are left, so a round never runs into the limit
+# (a run submits at most --per-round per round). A 429 with nothing left stops at once.
+quota_reserve: 50
+# BRAIN ends a login after at most 4 h (GET /authentication gives the time left; the docs cap a
+# login's expiry at 14400 s) and every new login asks for the biometric check. A research run
+# logs in again at its start when the login has less than this left, so the check is asked
+# while you are at the terminal, not hours into the run. null = never.
+relogin_within_seconds: 10800

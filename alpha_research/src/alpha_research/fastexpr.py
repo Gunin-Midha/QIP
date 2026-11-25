@@ -500,6 +500,8 @@ class _Walker:
         self.datafields = None if datafields is None else set(datafields)
         self.events = ({f for f, t in datafields.items() if t == EVENT_TYPE}
                        if isinstance(datafields, Mapping) else set())
+        self.typed = isinstance(datafields, Mapping) and bool(self.events)
+        self.types = dict(datafields) if isinstance(datafields, Mapping) else {}
         self.variables: set[str] = set()
         self.used: set[str] = set()      # variables a later statement reads
         self.errors: list[str] = []
@@ -566,6 +568,16 @@ class _Walker:
                 self.err(f"{node.name}: optional arguments must be written by name "
                          f"({named}); signature: {op.signature}")
         vec = node.name.startswith(VEC_PREFIX)
+        if vec and self.typed and node.args:
+            # BRAIN's API docs (troubleshooting): a matrix field in a vector operator is an
+            # "Invalid data field", a constant there "must be an event data"
+            a = node.args[0]
+            if isinstance(a, Num):
+                self.err(f"{node.name} needs an event (vector) field, not a constant")
+            elif isinstance(a, Name) and a.name not in self.variables and (
+                    a.name in self.spec.base_fields or self.types.get(a.name) == "MATRIX"):
+                self.err(f"{node.name}({a.name}): {a.name!r} is a matrix field (one value per "
+                         f"stock-day); vec_* operators take event (vector) fields only")
         for a in node.args:
             self.visit(a, vec)
         for _, v in node.kwargs:

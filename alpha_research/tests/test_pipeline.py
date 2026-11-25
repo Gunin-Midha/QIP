@@ -136,9 +136,10 @@ def test_bandit_driver_floor_holds(capsys):
 def test_robust_universe_checks_map_to_sub_universe():
     from alpha_research.evaluator import check_class
     for name in ("LOW_ROBUST_UNIVERSE_SHARPE", "LOW_ROBUST_UNIVERSE_SHARPE.WITH_RATIO",
-                 "LOW_ROBUST_UNIVERSE_RETURNS", "LOW_INVESTABILITY_CONSTRAINED_SHARPE"):
+                 "LOW_ROBUST_UNIVERSE_RETURNS", "LOW_INVESTABILITY_CONSTRAINED_SHARPE",
+                 "LOW_ASI_JPN_SHARPE"):   # ASI's Japanese stocks: owner 2026-11-25
         assert check_class("brain:" + name) == "sub_universe"
-    assert check_class("brain:LOW_ASI_JPN_SHARPE") == "other"    # no lever fits it yet
+    assert check_class("brain:SOME_NEW_CHECK") == "other"
 
 
 def test_a_rejected_alpha_a_lever_can_now_fix_is_re_decided(memory, config, playbook, candidate):

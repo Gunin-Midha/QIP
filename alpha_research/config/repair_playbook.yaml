@@ -31,6 +31,8 @@ sharpe:
     step: {to: SUBINDUSTRY}
   - lever: neutralize_statistical   # removes the common statistical factors
     step: {}
+  - lever: neutralize_slow_and_fast # BRAIN's risk-neutralized stats are this setting
+    step: {}                        # (BRAIN guide): first when the Sharpe is routed "factor first"
   - lever: neutralize_country       # GLB/EUR/ASI/AMR: removes country bets
     step: {}
   - lever: backfill_fields          # sparse fundamentals/options: more names carry a value
@@ -157,6 +159,10 @@ prod_correlation:                   # BRAIN's PROD_CORRELATION: too close to pro
       min_coverage: 0.3
       min_alphas: 5
       prefer_low_usage: true          # less-used fields first (production alphas use the rest)
+      # a quarter of the shortlist from the least crowded datasets (BRAIN value score high,
+      # few BRAIN alphas; BRAIN tip 2026-11-25). A share, not a reorder: ordering by value
+      # alone dropped analyst69 (value 1), the partner of the EUR accept
+      value_share: 0.25
       # may blend again along a lineage, with a different partner (the model sees the
       # partners tried and their production correlation); owner 2026-11-25
       repeatable: true
@@ -167,15 +173,31 @@ prod_correlation:                   # BRAIN's PROD_CORRELATION: too close to pro
         analyst estimate revision raised lowered upgrades downgrades recommendation buy sell
         consensus surprise profitability margin return equity assets cash flow accruals
         quality earnings yield valuation growth sentiment insider institutional ownership
+        short interest borrow holdings fund
                                     # (2026-11-15): peer group, tilt, horizon and neutralization
                                     # kept it at 0.70-0.76; a third analyst blend 0.720, half 0.645
   - lever: differentiate_from_production
     step: {}
+  # Mechanical levers next to the model's (2026-11-25, BRAIN's tips for production
+  # correlation: factor neutralization, small liquid universes). A wave takes one lever of
+  # each kind, so a 4-fix wave is blend + one neutralization + one universe + one horizon.
+  # Our memory (28 PROD values): STATISTICAL median 0.730 (3 of 8 under 0.7), INDUSTRY
+  # 0.837; the small universes IND TOP500 (0.700) and EUR TOP1200 (0.698) lowest.
+  - lever: neutralize_statistical
+    step: {}
+  - lever: change_universe          # next smaller (more liquid) universe of the region; only
+    step: {}                        # USA, EUR, JPN, ASI have one (CHN, IND, DEU, GBR, AMR: one
+                                    # universe each). BRAIN's sub-universe and robust-universe
+                                    # checks and our deflated-Sharpe flag watch for overfitting
+  - lever: neutralize_slow
+    step: {}
+  - lever: neutralize_fast
+    step: {}
+  - lever: neutralize_slow_and_fast
+    step: {}
   - lever: neutralize_crowding
     step: {}
   - lever: neutralize_reversion_and_momentum
-    step: {}
-  - lever: neutralize_statistical
     step: {}
   - lever: lengthen_ts_window       # a different horizon of the same idea; did not help in EUR
     step: {factor: 3}

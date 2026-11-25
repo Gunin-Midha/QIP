@@ -90,6 +90,35 @@ def test_plan_v4_is_plan_v3_with_hypotheses_that_name_no_fields():
             assert named_fields(set(meta), src.text, plain_here) == [], (p.dataset, src.text)
 
 
+def test_plan_v5_is_plan_v4_plus_one_less_used_data_arm_per_region():
+    from alpha_research.generator import load_datafield_meta, named_fields
+    from alpha_research.research import load_seeds
+    v4 = load_plan(ROOT / "config" / "research_plan.v4.yaml")
+    v5 = load_plan(ROOT / "config" / "research_plan.v5.yaml")
+    old = {(p.dataset, p.settings.region) for p in v4}
+    new = [p for p in v5 if (p.dataset, p.settings.region) not in old]
+    assert [(p.dataset, p.settings, p.catalog) for p in v5 if p not in new] == \
+        [(p.dataset, p.settings, p.catalog) for p in v4]
+    # one less-used-data arm per region, plus CHN's two from BRAIN's region guide
+    assert sorted(p.settings.region for p in new) == \
+        sorted([*{p.settings.region for p in v4}, "CHN", "CHN"])
+    assert {p.dataset for p in new} <= {"shortinterest2", "shortinterest3", "institutions6",
+                                        "fund_holdings_panel", "insiders1", "insider_agg_matrix",
+                                        "model31", "fundamental5"}
+    assert all(p.settings.delay == 1 and p.settings.decay >= 6 for p in new)
+    assert load_seeds(ROOT / "config" / "research_plan.v5.yaml") == \
+        load_seeds(ROOT / "config" / "research_plan.v4.yaml")
+    if not all(p.catalog.exists() for p in new):   # captures/ is git-ignored
+        pytest.skip("market catalogs not downloaded")
+    plain = set(SPEC.base_fields) | set(SPEC.groups)
+    for p in new:
+        meta = load_datafield_meta(p.catalog)
+        assert p.dataset in {m.get("dataset") for m in meta.values()}, p.settings.region
+        plain_here = plain | {f for f, m in meta.items() if m.get("type") == "GROUP"}
+        for src in p.sources:
+            assert named_fields(set(meta), src.text, plain_here) == [], (p.dataset, src.text)
+
+
 def test_settings_are_inherited_and_arm_settings_win(tmp_path):
     regions = {"USA": usa(arms=[{"dataset": "pv1", "delay": 0, "settings": {"decay": 2},
                                  "hypotheses": ["h"]},
@@ -177,13 +206,13 @@ def test_each_delay_is_its_own_arm_with_its_own_catalog(memory, config, playbook
                       llm_factory=lambda m, r=RouterLLM(): r, client=StubBrain(), config=config,
                       playbook=playbook, spec=SPEC, generator_config=GEN_CONFIG, memory=memory,
                       markets=markets, seed=0, sleep=vc.sleep, clock=vc.clock, run_id="rs1")
-    d1, d0 = ("pv1", "USA", "gen-v10", "claude-test", 1), ("pv1", "USA", "gen-v10", "claude-test", 0)
+    d1, d0 = ("pv1", "USA", "gen-v13", "claude-test", 1), ("pv1", "USA", "gen-v13", "claude-test", 0)
     assert set(run.arms) == {d1, d0}
     assert run._generator(d1).datafields == ["close", "vwap"]
     assert run._generator(d0).datafields == ["close", "volume"]
-    assert arm_label(d0) == "pv1/USA/D0/gen-v10/claude-test"
+    assert arm_label(d0) == "pv1/USA/D0/gen-v13/claude-test"
     report = run.run(1)
-    assert set(report["arms"]) == {"pv1/USA/D1/gen-v10/claude-test", "pv1/USA/D0/gen-v10/claude-test"}
+    assert set(report["arms"]) == {"pv1/USA/D1/gen-v13/claude-test", "pv1/USA/D0/gen-v13/claude-test"}
 
 
 class NewDatasetStrategy(RouterLLM):
@@ -207,13 +236,13 @@ def test_a_new_dataset_gets_arms_only_where_its_catalog_has_it(memory, config, p
                       run_id="rs1")
     run.run(2)
     new = [k for k in run.arms if k[0] == "other561"]
-    assert new == [("other561", "USA", "gen-v10+evo1", "claude-test", 0)]
+    assert new == [("other561", "USA", "gen-v13+evo1", "claude-test", 0)]
     assert run.arms[new[0]].settings.delay == 0
 
 
 def test_single_catalog_runs_keep_working(memory, config, playbook):
     run = make_run(memory, config, playbook)
-    assert list(run.arms) == [("pv1", "USA", "gen-v10", "claude-test", 1)]
+    assert list(run.arms) == [("pv1", "USA", "gen-v13", "claude-test", 1)]
 
 
 # ---------------------------------------------------------------- CLI
@@ -239,10 +268,10 @@ def test_cli_missing_plan_catalog_is_a_config_error(tmp_path):
 
 def test_console_arm_names_are_short():
     from alpha_research.research import arm_short
-    assert arm_short(("sentiment21", "EUR", "gen-v10", "groq:qwen/qwen3.8-27b", 1)) == \
+    assert arm_short(("sentiment21", "EUR", "gen-v13", "groq:qwen/qwen3.8-27b", 1)) == \
         "sentiment21 EUR D1 (qwen3.8-27b)"
-    assert arm_short(("pv1", "USA", "gen-v10+evo1", "gemini-3.6-flash", 0)) == \
+    assert arm_short(("pv1", "USA", "gen-v13+evo1", "gemini-3.6-flash", 0)) == \
         "pv1 USA D0 evo1 (gemini-3.6-flash)"
-    assert arm_short(("pv1", "USA", "gen-v10", "nvidia/nemotron-3-ultra-550b-a55b:free", 1)) == \
+    assert arm_short(("pv1", "USA", "gen-v13", "nvidia/nemotron-3-ultra-550b-a55b:free", 1)) == \
         "pv1 USA D1 (nemotron-3-ultra-550b-a55b)"
-    assert arm_short(("pv1", "USA", "gen-v10", "groq:gpt-oss-120b", 1)).endswith("(gpt-oss-120b)")
+    assert arm_short(("pv1", "USA", "gen-v13", "groq:gpt-oss-120b", 1)).endswith("(gpt-oss-120b)")

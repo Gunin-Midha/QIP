@@ -74,9 +74,13 @@ repair:
   # and blocked alphas get no fix at all (the decision stays "repair", nothing is queued).
   # On memory: 21 alphas get 4, 22 get 2, 53 get 0; both accepts' parents (distance 0.1
   # and 0.0) keep 4.
+  # Owner 2026-11-25 (run rs20261125111614: 8 repair decisions, all 0.66-3.7 away, none
+  # fixed): 0.4-0.6 away gets mechanical fixes only (no model call; simulations were not the
+  # limit), more than 0.6 away nothing.
   wave_tiers:
     - {max_distance: 0.15, fixes: 4}
     - {max_distance: 0.4, fixes: 2}
+    - {max_distance: 0.6, fixes: 2, mechanical_only: true}
     - {max_distance: null, fixes: 0}
   value_sharpe_share: 0.8          # best Sharpe (raw or risk-neutralized) below 0.8 x the bar:
   low_value_fixes: 0               # ... no fix (little real edge)
@@ -109,6 +113,14 @@ director:
   floor_share: 0.2                 # spec 13.1 default: share of each round reserved as floor slots
   max_arm_share: 0.4               # no arm gets more than this share of a round while others are below it
   refill_passes: 1                 # slots emptied by Pre-Filter/Critic drops go back to the Director this many extra times per round (slots of a model that went down always do)
+  # Owner 2026-11-25: run rs20261125111614 spent 60 model calls on 24 alphas, since 12 slots
+  # went to 12 arms and each arm's single alpha cost a Generator and a Critic call. An arm
+  # given slots now gets at least min_batch (one Generator call writes them all).
+  min_batch: 3
+  # With no model-call cap (--max-llm-calls is optional since 2026-11-25) a run ends when
+  # every generator model is down (its free limit), the simulation budget or the rounds; this
+  # many rounds in a row that send nothing to BRAIN end it too.
+  stop_after_idle_rounds: 2
   # Regions (consultant level, builder defaults 2026-11-11, OQ-18): each region in the plan
   # gets at least floor(region_floor_share x slots / n_regions) slots per round, and none
   # gets more than max_region_share of a round while another region is below it.

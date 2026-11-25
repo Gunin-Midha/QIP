@@ -91,7 +91,7 @@ from .fastexpr import (Assign, Binary, Call, ComplexityLimits, FastExprError, Fa
                        Name, Num, Unary, analyze, catalog, catalog_for, parse, render)
 from .generator import GenerationError, ask_json, crowded_fields, dataset_category, field_role
 from .lever_stats import (PINNED_LAST, LeverStats, RepairLearningConfig, combo_parts,
-                          failing_classes, wave_size,
+                          failing_classes, mechanical_only, wave_size,
                           family_budget, needs, rank_levers, repair_events,
                           successful_examples)
 from .llm import LLMClient, ModelDown
@@ -99,7 +99,8 @@ from .memory import MemoryStore
 from .prompts import repair_system, repair_user
 from .repair import Lever, Playbook
 from .research_loop import assign_lineage, lineage_members, lineage_root
-from .schemas import (CandidateRecord, DecisionRecord, ResultRecord, SchemaError,
+from .schemas import (SHORT_RESTRICTED_REGIONS, CandidateRecord, DecisionRecord, ResultRecord,
+                      SchemaError,
                       experiment_hash, neutralizations_for)
 
 MODEL_LEVERS_NOTE = "lever has no mechanical rewrite; the model was asked"
@@ -117,6 +118,10 @@ class RepairOutcome:
     llm_calls: int = 0
     children: list[CandidateRecord] = field(default_factory=list)   # a wave (repair_wave)
 
+
+# the neutralization behind BRAIN's risk-neutralized stats (BRAIN's guide: "Risk-handled
+# performance: simulates using SLOW_AND_FAST neutralization")
+RISK_HANDLED_LEVER = "neutralize_slow_and_fast"
 
 # what kind of change a lever makes: a wave tries one lever of each kind before a second of
 # any kind, so its fixes are different ideas, not near copies (model levers: their own kind)
@@ -285,6 +290,9 @@ def _flip_sign(c, step, spec, result=None):
         raise LeverNotApplicable("needs BRAIN's Sharpe to know the sign")
     if result.sharpe >= 0:
         raise LeverNotApplicable(f"Sharpe {result.sharpe} is not negative")
+    if c.region in SHORT_RESTRICTED_REGIONS:
+        raise LeverNotApplicable(f"short selling is restricted in {c.region}: the opposite "
+                                 f"alpha does not flip the performance")
     final = _final(c)[1]
     if isinstance(final, Unary) and final.op == "-":
         return _with_final(c, final.operand)
@@ -580,7 +588,8 @@ def partner_fields(meta: Mapping[str, dict], own_datasets: Collection[str], spec
                    *, crowded: Collection[str] = (), exclude_categories: Collection[str] = (),
                    min_coverage: float | None = 0.5, min_alphas: int = 5, per_dataset: int = 8,
                    max_fields: int = 48, topics: str = "", role=None,
-                   prefer_low_usage: bool = False) -> list[tuple[str, dict]]:
+                   prefer_low_usage: bool = False,
+                   value_share: float = 0.0) -> list[tuple[str, dict]]:
     """Fields a blend partner may use: from another dataset than the alpha's, not in an
     excluded category (price/volume, the alpha's own kind of information; risk-model
     factor loadings, which production alphas and neutralizations already carry), not
@@ -592,8 +601,13 @@ def partner_fields(meta: Mapping[str, dict], own_datasets: Collection[str], spec
     With ``prefer_low_usage`` the fields used by at most the median number of BRAIN alphas
     (among the eligible ones) come first, topic order kept within each half: production
     alphas are built on the much-used fields (CHN 2026-11-24: a revision-breadth partner on
-    items with 5-19 alphas got under the limit, ARM scores with 146 did not)."""
-    from .generator import _rank_datafields
+    items with 5-19 alphas got under the limit, ARM scores with 146 did not).
+    ``value_share`` of ``max_fields`` is kept for the least crowded datasets
+    (``generator.dataset_appeal``: BRAIN value score high, few BRAIN alphas on the dataset;
+    BRAIN's tip for production correlation, 2026-11-25), listed after the topic order's
+    fields. A share, not a reorder: value scores are coarse (1-2 for most EUR datasets) and
+    ordering by them alone dropped analyst69, the partner of the EUR accept (PROD 0.645)."""
+    from .generator import _rank_datafields, dataset_appeal, dataset_facts
     own, crowded, excluded = set(own_datasets), set(crowded), set(exclude_categories)
     eligible = []
     for f, m in (meta or {}).items():
@@ -614,14 +628,24 @@ def partner_fields(meta: Mapping[str, dict], own_datasets: Collection[str], spec
         counts = sorted(meta[f].get("alpha_count") or 0 for f in ranked)
         median = counts[(len(counts) - 1) // 2]
         ranked = sorted(ranked, key=lambda f: (meta[f].get("alpha_count") or 0) > median)
+    reserve = min(max_fields, round(max_fields * max(0.0, value_share)))
     out, per = [], {}
-    for f in ranked:
-        ds = meta[f].get("dataset")
-        if per.get(ds, 0) < per_dataset:
-            per[ds] = per.get(ds, 0) + 1
-            out.append((f, meta[f]))
-        if len(out) >= max_fields:
-            break
+
+    def take(order, limit):
+        for f in order:
+            if len(out) >= limit:
+                break
+            ds = meta[f].get("dataset")
+            if per.get(ds, 0) < per_dataset and (f, meta[f]) not in out:
+                per[ds] = per.get(ds, 0) + 1
+                out.append((f, meta[f]))
+
+    take(ranked, max_fields - reserve)
+    if reserve:
+        facts = dataset_facts(meta)
+        take(sorted(ranked, key=lambda f: dataset_appeal(facts.get(meta[f].get("dataset")))),
+             max_fields)
+    take(ranked, max_fields)   # fewer value fields than reserved: topic order fills the rest
     return out
 
 
@@ -778,6 +802,10 @@ class RepairAgent:
             # BRAIN's risk-neutralized Sharpe is far better than the raw one: remove the
             # factors first, and never flip the sign of a signal that only needs them gone
             factor = [x for x in ranked if x[0].name.startswith("neutralize_")]
+            # BRAIN's risk-neutralized ("risk-handled") stats are the alpha under
+            # SLOW_AND_FAST (BRAIN's simulation-limit guide): that lever's result is already
+            # shown, so it goes first; the others are its variants (and STATISTICAL apart)
+            factor.sort(key=lambda x: x[0].name != RISK_HANDLED_LEVER)
             rest = [x for x in ranked
                     if not x[0].name.startswith("neutralize_") and x[0].name != "flip_sign"]
             ranked = factor + rest
@@ -832,9 +860,11 @@ class RepairAgent:
         if left <= 0:
             out.notes.append(f"no repair: {why}")
             return out
+        mech_only = False
         if size is None:
             size, why = wave_size(decision, result, self.learning, self.playbook)
             out.notes.append(f"wave size {size}: {why}")
+            mech_only = mechanical_only(decision, result, self.learning)
         size = min(size, left)
         if size <= 0:
             out.notes.append("no repair: wave size 0")
@@ -847,8 +877,10 @@ class RepairAgent:
         options = self._wave_options(candidate, decision, result, stats, tried, priority)
         # owner 2026-11-25: an alpha failing production correlation always gets a model call;
         # that class's model levers take the wave's model slot first
+        # (an alpha in a mechanical-only tier gets no model call, production correlation
+        # included: owner 2026-11-25)
         prod = PROD_CLASS in (failing_classes(decision, result) | {decision.failure_class}) \
-            and bool(self.playbook.entries.get(PROD_CLASS))
+            and bool(self.playbook.entries.get(PROD_CLASS)) and not mech_only
         if prod:
             names = {lv.name for lv in self.playbook.entries[PROD_CLASS]}
             first = [x for x in options if x[1].name in names and not _mechanical(x[1].name)]
@@ -864,7 +896,8 @@ class RepairAgent:
             if len(out.children) >= size:
                 break
             if not _mechanical(lever.name):
-                if self.llm is None or model_tries >= self.learning.model_levers_per_wave:
+                if (mech_only or self.llm is None
+                        or model_tries >= self.learning.model_levers_per_wave):
                     continue
             calls = out.llm_calls
             child = self._try(candidate, lever, d, result, pool_expressions, events, out)
@@ -1137,7 +1170,8 @@ class RepairAgent:
                               max_fields=step.get("max_fields", 48),
                               topics=step.get("topics", ""),
                               role=lambda f: field_role(f, meta, cfg),
-                              prefer_low_usage=bool(step.get("prefer_low_usage", False)))
+                              prefer_low_usage=bool(step.get("prefer_low_usage", False)),
+                              value_share=float(step.get("value_share", 0.0) or 0.0))
 
 
 def _mechanical(name: str) -> bool:
@@ -1147,5 +1181,10 @@ def _mechanical(name: str) -> bool:
 
 def _partner_line(f: str, m: dict) -> str:
     desc = " ".join((m.get("description") or "").split())[:100]
-    return (f"{f} | dataset {m.get('dataset')} ({m.get('category')}) | {m.get('type')} | "
+    ds = f"dataset {m.get('dataset')} ({m.get('category')}"
+    if m.get("dataset_value_score") is not None:
+        ds += f", value {m['dataset_value_score']:g}"
+    if m.get("dataset_alpha_count") is not None:
+        ds += f", {int(m['dataset_alpha_count']):,} BRAIN alphas"
+    return (f"{f} | {ds}) | {m.get('type')} | "
             f"{m.get('alpha_count')} BRAIN alphas | {desc}")

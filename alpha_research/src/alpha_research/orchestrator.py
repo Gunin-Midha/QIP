@@ -131,6 +131,32 @@ class Orchestrator:
         return (s.successes + 1) / (s.successes + s.failures + 2)
 
 
+def consolidate(alloc: dict, min_batch: int | None) -> dict:
+    """Merge small allocations so every arm that gets slots gets at least ``min_batch``
+    (or all of them, when fewer): one Generator call writes an arm's whole batch, so twelve
+    arms with one slot each cost twelve Generator and twelve Critic calls for twelve alphas
+    (run rs20261125111614: 60 calls for 24 alphas). The arms kept are those the Director
+    gave the most (ties: its order); the others' slots go to the kept arms, fewest first.
+    The total is unchanged."""
+    if not min_batch or min_batch <= 1:
+        return dict(alloc)
+    total = sum(alloc.values())
+    if total <= 0:
+        return dict(alloc)
+    order = sorted((k for k, n in alloc.items() if n > 0),
+                   key=lambda k: -alloc[k])            # stable: Director's order on ties
+    keep = order[:max(1, total // min_batch)]
+    out = {k: 0 for k in alloc}
+    for k in keep:
+        out[k] = alloc[k]
+    spare = total - sum(out.values())
+    while spare > 0:
+        k = min(keep, key=lambda a: (out[a], keep.index(a)))
+        out[k] += 1
+        spare -= 1
+    return out
+
+
 def balance_slots(slots: int, counts: dict) -> dict:
     """Region rotation: each slot goes to the region with the fewest simulations so far
     (``counts`` plus the slots already given here), ties in ``counts`` order."""

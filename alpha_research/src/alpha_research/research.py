@@ -71,16 +71,16 @@ from typing import Callable, TextIO
 
 import yaml
 
-from .brain_client import BrainClient, BrainLoginRequired
+from .brain_client import BrainClient, BrainLoginRequired, SimulationQuotaExhausted
 from .config import Config, ConfigError
 from .critic import Critic, DebateJudge, ReviewOutcome, SparseFieldRule, review_and_debate
 from .compare import arm_models, model_comparison
 from .fastexpr import FastExprSpec, analyze, catalog, catalog_for
 from .generator import (AlphaGenerator, GenerationError, GenerationSettings, GeneratorConfig,
-                        Source, dataset_category)
+                        Source, dataset_appeal, dataset_category, dataset_facts)
 from .llm import LLMClient, LLMUnavailable, ModelDown, provider_of
 from .memory import MemoryStore
-from .orchestrator import Orchestrator, balance_slots
+from .orchestrator import Orchestrator, balance_slots, consolidate
 from . import power_pool
 from .pipeline import Pipeline
 from .prompts import PROMPT_VERSIONS, bar_text, brain_context
@@ -229,6 +229,8 @@ class AgentsConfig:
     models: ModelsConfig
     max_arm_share: float | None = None
     refill_passes: int = 0   # extra allocation passes per round for slots emptied by drops
+    min_batch: int | None = None   # an arm given slots gets at least this many (orchestrator.consolidate)
+    stop_after_idle_rounds: int | None = None   # stop after this many rounds in a row with no simulation
     region_floor_share: float | None = None   # each region's minimum share of a round
     max_region_share: float | None = None     # no region above this share while others are below
     regions_per_run: int | None = None        # rotation: work on this many regions per run
@@ -382,6 +384,11 @@ def agents_config_from_dict(raw) -> AgentsConfig:
         max_region_share=_opt_num(secs["director"], "director", "max_region_share", 0, 1),
         refill_passes=(_pos_int(secs["director"], "director", "refill_passes", lo=0)
                        if "refill_passes" in secs["director"] else 0),
+        min_batch=(None if secs["director"].get("min_batch") is None
+                   else _pos_int(secs["director"], "director", "min_batch")),
+        stop_after_idle_rounds=(None if secs["director"].get("stop_after_idle_rounds") is None
+                                else _pos_int(secs["director"], "director",
+                                              "stop_after_idle_rounds")),
         regions_per_run=(None if secs["director"].get("regions_per_run") is None
                          else _pos_int(secs["director"], "director", "regions_per_run")),
         region_balance_since=_opt_date(secs["director"], "director", "region_balance_since"),
@@ -688,6 +695,7 @@ class ResearchRun:
         self.seed_notes: list[dict] = []
         self.out = out
         self.run_id = run_id or "rs" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        self.client = client   # BRAIN (quota_stop / quota when it is the real client)
         self.pipeline = Pipeline(config, playbook, client, memory, sleep=sleep, clock=clock,
                                  out=out)
         limits, mo = generator_config.limits, agents.max_output
@@ -1256,6 +1264,10 @@ class ResearchRun:
                 "lessons": out.lessons}
 
     def _run(self, rounds: int) -> dict:
+        # BRAIN's count of our submissions by region and data category: context for
+        # Strategy Evolution (the real client only; None when BRAIN does not answer)
+        fetch = getattr(self.client, "submission_diversity", None)
+        self.submissions = fetch() if fetch is not None else None
         self._prepare_seeds()
         self._recover_submissions()
         self._recheck_pending()
@@ -1266,19 +1278,40 @@ class ResearchRun:
             except LLMUnavailable as exc:
                 self.stop_reason = str(exc)
                 return self.report()
+        idle = 0
         for r in range(1, rounds + 1):
             if self.sims_used >= self.budget.max_simulations:
                 self.stop_reason = "simulation budget used up"
+                break
+            before = self._committed()
+            quota_stop = getattr(self.client, "quota_stop", None)
+            if quota_stop is not None and (why := quota_stop()):
+                self.stop_reason = why
                 break
             try:
                 self._round(r)
             except LLMUnavailable as exc:  # budget used up, or the model failed
                 self.stop_reason = str(exc)
+            except SimulationQuotaExhausted as exc:
+                self.stop_reason = str(exc)
+                break
             try:   # alphas already screened still go to BRAIN, whatever stopped the round
                 self._flush()
             except LLMUnavailable as exc:
                 self.stop_reason = self.stop_reason or str(exc)
+            except SimulationQuotaExhausted as exc:
+                # BRAIN refused more simulations today: the ones already running stay on
+                # BRAIN and are recovered at the next run start
+                self.stop_reason = str(exc)
             if self.stop_reason:
+                break
+            # stall guard: rounds that spend model calls but send nothing to BRAIN (every
+            # alpha dropped or rejected before simulation) end the run, so a run without a
+            # model-call cap cannot burn the day's free quota on nothing
+            idle = idle + 1 if self._committed() == before else 0
+            limit = self.agents.stop_after_idle_rounds
+            if limit is not None and idle >= limit:
+                self.stop_reason = f"{idle} round(s) in a row sent no alpha to BRAIN"
                 break
             if self.strategist.due(r):
                 try:
@@ -1378,9 +1411,10 @@ class ResearchRun:
     def _allocate(self, slots: int, live: list[tuple]) -> dict:
         a = self.agents
         if self.run_regions is None:
-            return self.director.allocate(slots, a.floor_share, a.max_arm_share, only=live,
-                                          region_floor_share=a.region_floor_share,
-                                          max_region_share=a.max_region_share)
+            return consolidate(self.director.allocate(
+                slots, a.floor_share, a.max_arm_share, only=live,
+                region_floor_share=a.region_floor_share,
+                max_region_share=a.max_region_share), a.min_batch)
         # rotation: slots to the run's regions with the fewest simulations so far (memory
         # plus this run), then the Director picks arms within each region
         regions = [r for r in self.run_regions if any(k[1] == r for k in live)]
@@ -1388,8 +1422,9 @@ class ResearchRun:
         alloc = {k: 0 for k in self.director.arms}
         for r, n in per_region.items():
             if n:
-                got = self.director.allocate(n, a.floor_share, a.max_arm_share,
-                                             only=[k for k in live if k[1] == r])
+                got = consolidate(self.director.allocate(n, a.floor_share, a.max_arm_share,
+                                                         only=[k for k in live if k[1] == r]),
+                                  a.min_batch)
                 for k, m in got.items():
                     alloc[k] += m
         return alloc
@@ -1633,12 +1668,31 @@ class ResearchRun:
                 out[market] = {m["dataset"] for m in meta.values() if m.get("dataset")}
         return out
 
+    def _market_facts(self, markets) -> dict[tuple, dict[str, dict]]:
+        """{(region, delay): {dataset: facts}} (``generator.dataset_facts``)."""
+        return {mk: dataset_facts(self.catalog_of(*mk)[1]) for mk in markets}
+
+    @staticmethod
+    def _run_dataset_info(facts: dict[tuple, dict[str, dict]]) -> dict[str, dict]:
+        """One entry per dataset over the run's markets: its least crowded market's facts
+        (highest value score, then fewest BRAIN alphas)."""
+        out: dict[str, dict] = {}
+        for per in facts.values():
+            for ds, f in per.items():
+                if ds not in out or dataset_appeal(f) < dataset_appeal(out[ds]):
+                    out[ds] = f
+        return out
+
     def _evolve(self, r: int) -> None:
         market_ds = self._market_datasets()
         catalog_datasets = set().union(*market_ds.values())
         known = sorted({k[0] for k in self.arms} | catalog_datasets)
+        live = {(k[1], k[4]) for k in self.arms if self._in_run(k)}
+        facts = self._market_facts(live or market_ds)
         evo = self.strategist.evolve(self.memory.candidate_outcomes(),
-                                     self.generator_config.prompt_version, known_datasets=known)
+                                     self.generator_config.prompt_version, known_datasets=known,
+                                     dataset_info=self._run_dataset_info(facts),
+                                     submissions=getattr(self, "submissions", None))
         if evo is None:
             return
         added, replaced = [], []
@@ -1672,6 +1726,9 @@ class ResearchRun:
         markets = [(ds, region, delay, plan) for ds in new_ds
                    for (region, delay), plan in templates.items()
                    if ds in market_ds.get((region, delay), ())]
+        # least crowded (dataset, market) first, so the cap keeps those (BRAIN's tip for
+        # production correlation, 2026-11-25); the hypotheses' order breaks ties
+        markets.sort(key=lambda m: dataset_appeal(facts.get((m[1], m[2]), {}).get(m[0])))
         models = [m for m in self.models.generator if m not in self.counter.down]
         picks = [(*mk, models[(i + p) % len(models)]) for p in range(len(models))
                  for i, mk in enumerate(markets)] if models else []
@@ -1712,6 +1769,8 @@ class ResearchRun:
         return {
             "run_id": self.run_id,
             "stop_reason": self.stop_reason,
+            # BRAIN's daily simulation limit after the last submit (X-Ratelimit-* headers)
+            "brain_quota": dict(getattr(self.client, "quota", None) or {}),
             "power_pool_candidates": self.power_pool,
             "simulations_used": self.sims_used,
             "max_concurrent": self.max_concurrent,

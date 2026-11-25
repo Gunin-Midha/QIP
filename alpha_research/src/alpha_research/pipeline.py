@@ -41,7 +41,8 @@ from .memory import MemoryStore
 from .pool import Pool
 from .repair import Playbook
 from .research_loop import ResearchLoop, experiment_id
-from .schemas import CandidateRecord, DecisionRecord, GateResult, ResultRecord, SchemaError
+from .schemas import (SHORT_RESTRICTED_REGIONS, CandidateRecord, DecisionRecord, GateResult,
+                      ResultRecord, SchemaError)
 from .simulator import Simulator
 
 log = logging.getLogger(__name__)
@@ -380,7 +381,8 @@ class Pipeline:
             risk_reasons = risk_reasons + ["risk veto recorded, not applied (gates.brain_checks_only)"]
         decision = evaluator.decide(result, gates, self.playbook, risk_checks, veto, risk_reasons,
                                     config.repair.near_miss_share,
-                                    config.repair.risk_neutralized_gap)
+                                    config.repair.risk_neutralized_gap,
+                                    sign_mirrors=candidate.region not in SHORT_RESTRICTED_REGIONS)
 
         admitted_by_diversity = None
         if decision.decision == "accept":

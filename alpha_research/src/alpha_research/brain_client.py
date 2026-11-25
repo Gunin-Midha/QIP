@@ -53,6 +53,12 @@ class BrainLoginRequired(Exception):
     callers that keep going past one failed lookup still stop on this one."""
 
 
+class SimulationQuotaExhausted(Exception):
+    """BRAIN's daily simulation limit is reached (429 with X-Ratelimit-Remaining 0 on
+    POST /simulations). Waiting does not help until the limit resets (BRAIN: midnight US
+    Eastern), so a run stops; submissions already running are recovered next time."""
+
+
 class SubmissionRejected(Exception):
     """BRAIN refused the submission itself (bad settings or expression). The simulator
     records a failed result instead of retrying."""

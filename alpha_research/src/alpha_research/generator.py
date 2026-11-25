@@ -78,6 +78,7 @@ class GeneratorConfig:
     # lessons from our own results, shown to the Generator by the BRAIN category of its
     # arm's dataset ("analyst", "pv", ...); "all" goes to every arm
     category_lessons: tuple[tuple[str, str], ...] = ()
+    region_lessons: tuple[tuple[str, str], ...] = ()     # region -> text (BRAIN region guides)
 
 
 def _cfg_int(d: dict, key: str, *, nullable: bool = False, minimum: int = 0) -> int | None:
@@ -119,15 +120,16 @@ def load_generator_config(path: str | Path) -> GeneratorConfig:
         **_cfg_roles(g.get("field_roles")),
         **_cfg_crowding(g.get("crowding")),
         category_lessons=_cfg_lessons(g.get("category_lessons")),
+        region_lessons=_cfg_lessons(g.get("region_lessons"), "region_lessons"),
     )
 
 
-def _cfg_lessons(raw) -> tuple[tuple[str, str], ...]:
+def _cfg_lessons(raw, key: str = "category_lessons") -> tuple[tuple[str, str], ...]:
     if raw is None:
         return ()
     if not isinstance(raw, dict) or not all(isinstance(k, str) and isinstance(v, str) and v.strip()
                                             for k, v in raw.items()):
-        raise ConfigError("generator config: 'category_lessons' must map category names to text")
+        raise ConfigError(f"generator config: '{key}' must map names to text")
     return tuple((k, " ".join(v.split())) for k, v in raw.items())
 
 
@@ -140,10 +142,13 @@ def dataset_category(dataset: str | None, meta: dict) -> str | None:
     return cats.most_common(1)[0][0] if cats else None
 
 
-def lessons_for(config: "GeneratorConfig", category: str | None) -> list[str]:
-    """The configured lessons for every arm, then for this dataset category."""
-    by = dict(config.category_lessons)
-    return [t for t in (by.get("all"), by.get(category) if category else None) if t]
+def lessons_for(config: "GeneratorConfig", category: str | None,
+                region: str | None = None) -> list[str]:
+    """The configured lessons for every arm, then for this region, then for this dataset
+    category."""
+    by, regions = dict(config.category_lessons), dict(config.region_lessons)
+    return [t for t in (by.get("all"), regions.get(region) if region else None,
+                        by.get(category) if category else None) if t]
 
 
 def _cfg_crowding(raw) -> dict:
@@ -261,14 +266,83 @@ def load_datafield_meta(path: str | Path) -> dict[str, dict]:
     if isinstance(data, dict):
         data = data.get("datafields", data.get("results", []))
     meta = {}
+    datasets = load_dataset_meta(dataset_catalog_for(path))
     for x in data:
         if isinstance(x, dict) and isinstance(x.get("id"), str):
             ds, cat = x.get("dataset"), x.get("category")
+            ds = ds.get("id") if isinstance(ds, dict) else ds
+            facts = datasets.get(ds) or {}
             meta[x["id"]] = {"coverage": x.get("coverage"), "alpha_count": x.get("alphaCount"),
-                             "dataset": ds.get("id") if isinstance(ds, dict) else ds,
+                             "dataset": ds,
                              "category": cat.get("id") if isinstance(cat, dict) else cat,
-                             "type": x.get("type"), "description": x.get("description")}
+                             "type": x.get("type"), "description": x.get("description"),
+                             "dataset_value_score": facts.get("value_score"),
+                             "dataset_alpha_count": facts.get("alpha_count")}
     return meta
+
+
+def dataset_catalog_for(path: str | Path) -> Path:
+    """The dataset list saved next to a field catalog: ``datafields_<market>.json`` ->
+    ``datasets_<market>.json`` (``scripts/brain_discovery.py``, ``cli brain datasets``)."""
+    p = Path(path)
+    return p.with_name("datasets_" + p.name[len("datafields_"):]) \
+        if p.name.startswith("datafields_") else p.with_name("datasets_" + p.name)
+
+
+def load_dataset_meta(path: str | Path) -> dict[str, dict]:
+    """Per-dataset facts from BRAIN's dataset list: value_score (BRAIN's ``valueScore``;
+    high where few alphas exist, e.g. USA option8 1 with ~228k alphas, DEU macro27 5 with
+    177), alpha_count and user_count (BRAIN alphas / users on the dataset), category.
+    Empty when the file is missing or holds no dataset objects."""
+    p = Path(path)
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {}
+    if isinstance(data, dict):
+        data = data.get("datasets", data.get("results", []))
+    out = {}
+    for x in data if isinstance(data, list) else []:
+        if isinstance(x, dict) and isinstance(x.get("id"), str):
+            cat = x.get("category")
+            out[x["id"]] = {"value_score": _number(x.get("valueScore")),
+                            "alpha_count": _number(x.get("alphaCount")),
+                            "user_count": _number(x.get("userCount")),
+                            "category": cat.get("id") if isinstance(cat, dict) else cat}
+    return out
+
+
+def _number(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def dataset_facts(meta: dict) -> dict[str, dict]:
+    """{dataset: {category, value_score, alpha_count, fields}} from field meta (the dataset
+    facts ``load_datafield_meta`` copied onto each field)."""
+    out: dict[str, dict] = {}
+    for m in (meta or {}).values():
+        ds = (m or {}).get("dataset")
+        if not ds:
+            continue
+        d = out.setdefault(ds, {"category": m.get("category"), "value_score": None,
+                                "alpha_count": None, "fields": 0})
+        d["fields"] += 1
+        if m.get("dataset_value_score") is not None:
+            d["value_score"] = m["dataset_value_score"]
+        if m.get("dataset_alpha_count") is not None:
+            d["alpha_count"] = m["dataset_alpha_count"]
+    return out
+
+
+def dataset_appeal(facts: dict | None) -> tuple:
+    """Sort key, least crowded first: BRAIN's value score high, then few BRAIN alphas on the
+    dataset (unknown values last). BRAIN's tip for production correlation (2026-11-25): build
+    on less-used data with high value scores, where production alphas are few."""
+    facts = facts or {}
+    vs, n = facts.get("value_score"), facts.get("alpha_count")
+    return (-vs if vs is not None else float("inf"), n if n is not None else float("inf"))
 
 
 # ---------------------------------------------------------------------------
@@ -417,7 +491,13 @@ def _rank_datafields(catalog: Collection[str], text: str, limit: int,
         n = (meta.get(name) or {}).get("alpha_count")
         return float(n) if isinstance(n, (int, float)) else float("inf")
 
-    return sorted(catalog, key=lambda n: (n in crowded, foreign(n), -score(n), crowd(n), n))[:limit]
+    facts = dataset_facts(meta)
+
+    def appeal(name: str) -> tuple:
+        return dataset_appeal(facts.get((meta.get(name) or {}).get("dataset")))
+
+    return sorted(catalog, key=lambda n: (n in crowded, foreign(n), -score(n), appeal(n),
+                                          crowd(n), n))[:limit]
 
 
 NOT_SIGNALS = {"SYMBOL", "UNIVERSE"}   # identifiers and universe flags: never sampled
@@ -459,7 +539,9 @@ def select_datafields(catalog: Collection[str], text: str, limit: int,
     """(relevant, exploration) fields for the prompt. Fields the task names come first;
     then ``_rank_datafields``; the exploration part (``explore_share`` of ``limit``) is
     drawn from the rest of the catalog one dataset at a time in turn, so every dataset can
-    show up, in an order fixed by the text (the same task always sees the same fields).
+    show up; less crowded datasets (``dataset_appeal``) go first, and those with a BRAIN value
+    score above the catalog's median give two fields per turn. Fields within a dataset (and
+    the dataset order without facts) are fixed by the text (the same task sees the same fields).
     Identifier/text fields (``field_role`` 'id') are left out unless the task names them;
     ``crowded`` fields rank last and are never drawn for exploration. ``plain`` (base
     fields and groups) never count as named."""
@@ -483,11 +565,20 @@ def select_datafields(catalog: Collection[str], text: str, limit: int,
         rng.shuffle(fields)
     order = sorted(by_ds)
     rng.shuffle(order)
+    # less crowded datasets first and twice per pass (BRAIN value score above the median of
+    # the catalog's known scores); order by text when the catalog has no dataset facts
+    facts = dataset_facts(meta)
+    order.sort(key=lambda ds: dataset_appeal(facts.get(ds)))
+    scores = sorted(f["value_score"] for f in facts.values() if f["value_score"] is not None)
+    median = scores[(len(scores) - 1) // 2] if scores else None
+    takes = {ds: 2 if median is not None and ((facts.get(ds) or {}).get("value_score") or 0) > median
+             else 1 for ds in order}
     explore: list[str] = []
     while len(explore) < n_explore and any(by_ds.values()):
         for ds in order:
-            if by_ds[ds] and len(explore) < n_explore:
-                explore.append(by_ds[ds].pop())
+            for _ in range(takes[ds]):
+                if by_ds[ds] and len(explore) < n_explore:
+                    explore.append(by_ds[ds].pop())
     return relevant, explore
 
 
@@ -507,6 +598,32 @@ def _annotate(name: str, meta: dict, config: "GeneratorConfig | None" = None,
     if (prod_failed or {}).get(name):
         bits.append(f"{prod_failed[name]} of ours failed production correlation")
     return f"{name} [{', '.join(bits)}]" if bits else name
+
+
+def _datasets_line(fields: Collection[str], meta: dict) -> str | None:
+    """The listed fields' datasets with BRAIN's value score and alpha count, least crowded
+    first; None when the catalog has no dataset facts."""
+    facts = dataset_facts(meta)
+    listed = {(meta.get(f) or {}).get("dataset") for f in fields} - {None}
+    known = [d for d in listed if (facts.get(d) or {}).get("value_score") is not None
+             or (facts.get(d) or {}).get("alpha_count") is not None]
+    if not known:
+        return None
+    known.sort(key=lambda d: (dataset_appeal(facts[d]), d))
+
+    def show(d: str) -> str:
+        f = facts[d]
+        bits = [f.get("category") or "?"]
+        if f.get("value_score") is not None:
+            bits.append(f"value {f['value_score']:g}")
+        if f.get("alpha_count") is not None:
+            bits.append(f"{int(f['alpha_count']):,} BRAIN alphas")
+        return f"{d} ({', '.join(bits)})"
+
+    return ("Datasets of the listed fields, least crowded first (value = BRAIN's value score, "
+            "high where production alphas are few; an idea built mainly on a high-value, "
+            "little-used dataset is less likely to fail BRAIN's production-correlation "
+            "check): " + "; ".join(show(d) for d in known) + ".")
 
 
 def build_system_prompt(spec: FastExprSpec, datafields: Collection[str] | None,
@@ -598,6 +715,9 @@ def build_system_prompt(spec: FastExprSpec, datafields: Collection[str] | None,
                          "signal); alphas = how many BRAIN alphas already use the field (a "
                          "heavily used field is crowded and less likely to be new). Hints, "
                          "not limits: every listed field may be used.")
+        ds_line = _datasets_line({*named, *shown, *explore}, meta)
+        if ds_line:
+            lines.append(ds_line)
         if crowded & {*named, *shown, *explore}:
             lines.append("crowded = among the most used fields of its dataset, or one our own "
                          "alphas built on failed BRAIN's production-correlation check (the "
@@ -854,7 +974,8 @@ class AlphaGenerator:
                                      prod_failed=self.prod_failed,
                                      dataset=self.settings.dataset,
                                      lessons=lessons_for(self.config, dataset_category(
-                                         self.settings.dataset, self.field_meta))
+                                         self.settings.dataset, self.field_meta),
+                                         self.settings.region)
                                      + list(self.learned))
         reply = self._ask_json(system, _generate_prompt(unit.hypothesis, unit.context, k), result)
         good, bad = self._check(self._items(reply), unit)

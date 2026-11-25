@@ -80,6 +80,10 @@ BRAIN_CHECK_TO_CLASS = {
     "LOW_ROBUST_UNIVERSE_SHARPE.WITH_RATIO": "sub_universe",
     "LOW_ROBUST_UNIVERSE_RETURNS": "sub_universe",
     "LOW_INVESTABILITY_CONSTRAINED_SHARPE": "sub_universe",
+    # ASI: the alpha must also hold on the region's Japanese stocks (value = their Sharpe,
+    # limit 1.0). A sub-universe question too; as class "other" it had no levers and blocked
+    # every repair of the best ASI lead in run rs20261125111614 (owner 2026-11-25)
+    "LOW_ASI_JPN_SHARPE": "sub_universe",
 }
 BRAIN_GATE_PREFIX = "brain:"
 
@@ -271,10 +275,14 @@ def risk_neutralized_sharpe(result: ResultRecord | None) -> float | None:
 
 
 def near_miss(failed: list[GateResult], failure_class: str,
-              shares: dict | None, result: ResultRecord | None = None) -> tuple[bool, str | None]:
+              shares: dict | None, result: ResultRecord | None = None, *,
+              sign_mirrors: bool = True) -> tuple[bool, str | None]:
     """(repairable, reason). A class without a configured share is always repairable. For
     Sharpe the larger of |raw| and |risk-neutralized| counts: a signal hidden under BRAIN's
-    risk factors is a near miss that a factor neutralization can uncover."""
+    risk factors is a near miss that a factor neutralization can uncover. Without
+    ``sign_mirrors`` (``schemas.SHORT_RESTRICTED_REGIONS``: the opposite alpha does not flip
+    the performance) values count with their sign, so a negative one is no near miss."""
+    size = abs if sign_mirrors else (lambda v: v)
     share = (shares or {}).get(failure_class)
     if share is None:
         return True, None
@@ -283,16 +291,18 @@ def near_miss(failed: list[GateResult], failure_class: str,
         if check_class(g.name) != failure_class or g.value is None or g.threshold is None:
             continue
         need = share * abs(g.threshold)
-        best = max(abs(g.value), abs(rn)) if rn is not None else abs(g.value)
+        best = max(size(g.value), size(rn)) if rn is not None else size(g.value)
         if best < need:
             shown = f"{g.value}" + (f" (risk-neutralized {rn})" if rn is not None else "")
+            how = "|value|" if sign_mirrors else "value (a flip does not mirror here)"
             return False, (f"{g.name} {shown} is too far from {g.threshold} to repair "
-                           f"(|value| < {share} x threshold = {need:.4g})")
+                           f"({how} < {share} x threshold = {need:.4g})")
     return True, None
 
 
 def sharpe_route(failed: list[GateResult], result: ResultRecord, shares: dict | None,
-                 gap: float | None, primary: str = "sharpe") -> str | None:
+                 gap: float | None, primary: str = "sharpe", *,
+                 sign_mirrors: bool = True) -> str | None:
     """Send a failed Sharpe to the Sharpe levers ahead of a higher-priority class when the
     sign or BRAIN's risk factors are the bigger problem: a raw Sharpe that is negative and
     a near miss by size (``SIGN_FIRST``: flip it before tuning turnover), or a
@@ -304,15 +314,15 @@ def sharpe_route(failed: list[GateResult], result: ResultRecord, shares: dict | 
     the usual priority stands (a self-correlation failure stays first)."""
     g = next((g for g in failed if check_class(g.name) == "sharpe" and g.value is not None
               and g.threshold is not None), None)
-    if g is None or not near_miss([g], "sharpe", shares, result)[0]:
+    if g is None or not near_miss([g], "sharpe", shares, result, sign_mirrors=sign_mirrors)[0]:
         return None
     rn = risk_neutralized_sharpe(result)
     if gap is not None and rn is not None and rn - g.value >= gap:
-        raw_near = near_miss([g], "sharpe", shares)[0]
+        raw_near = near_miss([g], "sharpe", shares, sign_mirrors=sign_mirrors)[0]
         if primary == "sharpe" or not raw_near:
             return f"{FACTOR_FIRST}: risk-neutralized Sharpe {rn} vs raw {g.value}"
         return None
-    if g.value < 0 and (rn is None or rn <= g.value + (gap or 0.0)):
+    if sign_mirrors and g.value < 0 and (rn is None or rn <= g.value + (gap or 0.0)):
         return f"{SIGN_FIRST}: Sharpe {g.value} is negative"
     return None
 
@@ -321,7 +331,8 @@ def decide(result: ResultRecord, gates: list[GateResult], playbook: Playbook,
            risk_checks: list[GateResult] | None = None, risk_veto: bool = False,
            risk_reasons: list[str] | None = None,
            near_miss_share: dict | None = None,
-           risk_neutralized_gap: float | None = None) -> DecisionRecord:
+           risk_neutralized_gap: float | None = None, *,
+           sign_mirrors: bool = True) -> DecisionRecord:
     risk_checks = list(risk_checks or [])
     risk_reasons = list(risk_reasons or [])
     all_checks = list(gates) + risk_checks
@@ -344,7 +355,7 @@ def decide(result: ResultRecord, gates: list[GateResult], playbook: Playbook,
         failure_class = classify(failed)
         reasons = [f"{g.name} failed: value {g.value} vs {g.threshold}" for g in failed]
         route = sharpe_route(failed, result, near_miss_share, risk_neutralized_gap,
-                             failure_class)
+                             failure_class, sign_mirrors=sign_mirrors)
         if route and playbook.has_entry("sharpe"):
             if failure_class != "sharpe":
                 reasons.append(f"sent to sharpe levers ahead of {failure_class}")
@@ -352,7 +363,8 @@ def decide(result: ResultRecord, gates: list[GateResult], playbook: Playbook,
             reasons.append(route)
         if not playbook.has_entry(failure_class):
             return record("reject", failure_class, reasons + [f"no playbook entry for {failure_class}"])
-        ok, why = near_miss(failed, failure_class, near_miss_share, result)
+        ok, why = near_miss(failed, failure_class, near_miss_share, result,
+                            sign_mirrors=sign_mirrors)
         if not ok:
             return record("reject", failure_class, reasons + [why])
         return record("repair", failure_class, reasons + [f"playbook has {failure_class} levers"])

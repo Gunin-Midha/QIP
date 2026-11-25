@@ -73,7 +73,7 @@ from typing import Callable, Protocol
 
 import yaml
 
-from .brain_client import BrainLoginRequired, SubmissionRejected
+from .brain_client import BrainLoginRequired, SimulationQuotaExhausted, SubmissionRejected
 from .config import ConfigError
 from .schemas import CandidateRecord
 
@@ -87,7 +87,9 @@ DATAFIELD_PAGE_SIZE = 50
 DATAFIELD_OFFSET_CAP = 10_000      # BRAIN returns nothing past this offset (live, 2026-11-10)
 
 _DONE_STATUSES = {"COMPLETE", "WARNING"}
-_FAILED_STATUSES = {"ERROR", "FAIL", "TIMEOUT"}
+_FAILED_STATUSES = {"ERROR", "FAIL", "TIMEOUT", "CANCELLED"}
+# BRAIN's API docs: WAITING and SIMULATING are still running, with or without Retry-After
+_RUNNING_STATUSES = {"WAITING", "SIMULATING"}
 
 
 class BrainApiError(RuntimeError):
@@ -117,6 +119,12 @@ class BrainApiConfig:
     # BRAIN failure messages that are BRAIN's own trouble, not the alpha's: the simulator
     # submits such a candidate once more (run rs20261111174623)
     retry_error_messages: tuple[str, ...] = ("There was an error while running the simulation",)
+    # stop a research run before a round when BRAIN's daily simulation limit has at most
+    # this many left (X-Ratelimit-Remaining on POST /simulations); None = never
+    quota_reserve: int | None = None
+    # log in again at the start of a long command when the session ends sooner than this
+    # (BRAIN caps a login at 4 h); None = never
+    relogin_within_seconds: float | None = None
 
 
 _CANDIDATE_SETTINGS = {"region", "universe", "delay", "decay", "neutralization", "truncation"}
@@ -135,12 +143,17 @@ def brain_config_from_dict(raw, source: str = "<dict>") -> BrainApiConfig:
     kw = {}
     for key in ("request_timeout_seconds", "recordset_max_wait_seconds",
                 "rate_limit_max_wait_seconds", "check_max_wait_seconds",
-                "self_correlation_max_wait_seconds"):
-        if key in raw:
+                "self_correlation_max_wait_seconds", "relogin_within_seconds"):
+        if key in raw and not (key == "relogin_within_seconds" and raw[key] is None):
             v = raw[key]
             if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
                 raise ConfigError(f"{source}: {key} must be a positive number, got {v!r}")
             kw[key] = float(v)
+    if raw.get("quota_reserve") is not None:
+        v = raw["quota_reserve"]
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            raise ConfigError(f"{source}: quota_reserve must be a non-negative integer, got {v!r}")
+        kw["quota_reserve"] = v
     for key in ("fetch_self_correlation", "fetch_submission_check"):
         if key in raw:
             if not isinstance(raw[key], bool):
@@ -153,7 +166,8 @@ def brain_config_from_dict(raw, source: str = "<dict>") -> BrainApiConfig:
         if not isinstance(msgs, list) or not all(isinstance(m, str) and m for m in msgs):
             raise ConfigError(f"{source}: retry_error_messages must be a list of strings")
         kw["retry_error_messages"] = tuple(msgs)
-    unknown = set(raw) - {"settings", "session_file", *kw}
+    unknown = set(raw) - {"settings", "session_file", "quota_reserve",
+                          "relogin_within_seconds", *kw}
     if unknown:
         raise ConfigError(f"{source}: unknown keys {sorted(unknown)}")
     return BrainApiConfig(settings=dict(settings), **kw)
@@ -392,6 +406,10 @@ class BrainSession:
                 self.authenticate()
                 continue
             if resp.status == 429:
+                quota = simulation_quota(resp.headers)
+                if quota.get("remaining") == 0:
+                    raise SimulationQuotaExhausted(quota_text(quota, "BRAIN's daily simulation "
+                                                                     "limit is used up"))
                 wait = resp.retry_after() or min(60.0, 5.0 * 2 ** attempt)
                 attempt += 1
                 if waited + wait > self.rate_limit_max_wait:
@@ -402,6 +420,27 @@ class BrainSession:
             if resp.status >= 500:
                 raise ConnectionError(f"{method} {path} returned {resp.status}")
             return resp
+
+    def expires_in(self) -> float | None:
+        """Seconds until BRAIN ends this login (GET /authentication ``token.expiry``); None
+        when not logged in (204) or BRAIN gives no expiry."""
+        resp = self._send("GET", self.url("/authentication"))
+        if resp.status != 200:
+            return None
+        body = resp.json() or {}
+        v = (body.get("token") or {}).get("expiry") if isinstance(body, dict) else None
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    def refresh_if_expiring(self, within: float | None) -> float | None:
+        """Log in again now when the login ends within ``within`` seconds (BRAIN caps a
+        login at 4 h; a fresh one at the start of a long run asks for the biometric check
+        while the person is at the terminal, not hours into the run). Returns the seconds
+        the login now has left (None when unknown)."""
+        left = self.expires_in() if self.authenticated else None
+        if within is not None and (left is None or left < within):
+            self.authenticate()
+            left = self.expires_in()
+        return left
 
     def get_ready(self, path: str, max_wait: float, params: dict | None = None) -> Response:
         """GET a resource BRAIN computes on demand: wait while it answers 2xx with a
@@ -555,7 +594,10 @@ def _failure_message(simulation: dict) -> str | None:
         return str(simulation["details"])
     status = str(simulation.get("status", "")).upper()
     if status in _FAILED_STATUSES:
-        return f"{status}: {simulation.get('message') or 'no message'}"
+        where = simulation.get("location")
+        at = (f" (at line {where.get('line')}, columns {where.get('start')}-{where.get('end')})"
+              if isinstance(where, dict) and where.get("line") is not None else "")
+        return f"{status}: {simulation.get('message') or 'no message'}{at}"
     if simulation.get("detail"):
         return str(simulation["detail"])
     if simulation.get("children"):
@@ -668,6 +710,30 @@ def translate(simulation: dict, alpha: dict | None, yearly: dict | None = None,
     }
 
 
+def simulation_quota(headers: dict) -> dict:
+    """BRAIN's daily simulation limit from POST /simulations response headers (BRAIN docs,
+    "simulation limits"): {"limit", "remaining", "reset_seconds"}; empty when absent. Only
+    the unsuffixed headers: other endpoints send per-hour/-minute request limits
+    (x-ratelimit-remaining-hour on /alphas, -minute on correlations), which are not this."""
+    out = {}
+    for key, name in (("limit", "x-ratelimit-limit"), ("remaining", "x-ratelimit-remaining"),
+                      ("reset_seconds", "x-ratelimit-reset")):
+        try:
+            out[key] = int(float((headers or {})[name]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def quota_text(quota: dict, what: str) -> str:
+    bits = [what]
+    if quota.get("remaining") is not None:
+        bits.append(f"{quota['remaining']} of {quota.get('limit', '?')} left")
+    if quota.get("reset_seconds") is not None:
+        bits.append(f"resets in {quota['reset_seconds'] / 3600:.1f} h")
+    return "; ".join(bits)
+
+
 # ---------------------------------------------------------------------------
 # RealBrainClient
 # ---------------------------------------------------------------------------
@@ -686,6 +752,17 @@ class RealBrainClient:
         # checks are fetched (that can take minutes); the simulator sets it for progress lines
         self.on_ready: Callable[[str], None] | None = None
         self.capture_dir = Path(capture_dir) if capture_dir else None
+        # BRAIN's daily simulation limit from the last submit's headers (simulation_quota)
+        self.quota: dict = {}
+
+    def quota_stop(self) -> str | None:
+        """Why a run should stop before its next round: the daily simulation limit has at
+        most ``quota_reserve`` left. None when it has more, or nothing is known yet."""
+        left, reserve = self.quota.get("remaining"), self.config.quota_reserve
+        if left is None or reserve is None or left > reserve:
+            return None
+        return quota_text(self.quota, f"BRAIN's daily simulation limit is nearly used "
+                                      f"(reserve {reserve})")
 
     def _capture(self, sim_id: str, name: str, body) -> None:
         if self.capture_dir is None:
@@ -697,6 +774,9 @@ class RealBrainClient:
     def submit(self, candidate: CandidateRecord) -> str:
         resp = self.session.request("POST", "/simulations",
                                     json_body=simulation_payload(candidate, self.config))
+        quota = simulation_quota(resp.headers)
+        if quota:
+            self.quota = quota
         if 400 <= resp.status < 500:
             raise SubmissionRejected(f"BRAIN rejected the simulation ({resp.status}): {resp.detail()}")
         if resp.status not in (200, 201, 202) or not resp.headers.get("location"):
@@ -709,7 +789,8 @@ class RealBrainClient:
             return translate({"detail": "simulation not found"}, None)
         sim = _expect(resp, f"GET simulation {brain_sim_id}", 200) or {}
         wait = resp.retry_after()
-        running = "progress" in sim and not sim.get("status")
+        status = str(sim.get("status") or "").upper()
+        running = ("progress" in sim and not status) or status in _RUNNING_STATUSES
         if wait is not None or running:
             return {"status": "running", "retry_after": wait, "progress": sim.get("progress")}
         self._capture(brain_sim_id, "simulation", sim)
@@ -752,6 +833,14 @@ class RealBrainClient:
             return "gone"
         raise BrainApiError(f"cancel {brain_sim_id} returned {resp.status}: {resp.detail()}")
 
+    def submission_diversity(self) -> dict | None:
+        """``submission_diversity`` for this session; None when BRAIN does not answer (it
+        is context for Strategy Evolution, never needed for a run)."""
+        try:
+            return submission_diversity(self.session)
+        except (BrainApiError, ConnectionError, TimeoutError):
+            return None
+
     def _fetch(self, sim_id: str, name: str, path: str, notes: list[str],
                max_wait: float | None = None):
         """A missing piece becomes None plus a note; it never fails the whole result."""
@@ -766,6 +855,35 @@ class RealBrainClient:
         body = resp.json()
         self._capture(sim_id, name, body)
         return body
+
+
+def submission_diversity(session: BrainSession) -> dict:
+    """Our submitted alphas by region, delay and data category (BRAIN docs:
+    GET /users/<id>/activities/diversity?grouping=region,delay,dataCategory; ``self``
+    works as the id, checked 2026-11-25). An alpha counts in every category whose data it
+    uses, so category counts add up to more than the region's. Returns
+    ``{"total": n, "regions": {region: n}, "categories": [{region, delay, category,
+    alphas, check, limit}]}``; ``check``/``limit`` are BRAIN's DATA_DIVERSITY per row
+    (limit 0.3 on our account; its meaning is not documented, OQ-18)."""
+    resp = session.request("GET", "/users/self/activities/diversity",
+                           params={"grouping": "region,delay,dataCategory"})
+    body = _expect(resp, "GET submission diversity", 200) or {}
+    out = {"total": body.get("count") if isinstance(body, dict) else None,
+           "regions": {}, "categories": []}
+    for row in (body.get("alphas") or []) if isinstance(body, dict) else []:
+        if not isinstance(row, dict):
+            continue
+        cat = (row.get("dataCategory") or {}).get("id")
+        n = row.get("alphaCount")
+        if cat is None:
+            if row.get("delay") is None and row.get("region"):   # the region's total
+                out["regions"][row["region"]] = n
+            continue
+        div = row.get("dataDiversity") or {}
+        out["categories"].append({"region": row.get("region"), "delay": row.get("delay"),
+                                  "category": cat, "alphas": n, "check": div.get("check"),
+                                  "limit": div.get("limit")})
+    return out
 
 
 def simulation_options(session: BrainSession) -> dict:

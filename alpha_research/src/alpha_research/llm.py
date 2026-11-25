@@ -468,6 +468,39 @@ class OutputCapClient:
         return getattr(self.inner, "last_usage", None)
 
 
+class RequestFitClient:
+    """Lowers a call's output cap so prompt + cap fit the model's per-minute token limit:
+    Groq counts the cap in the request, and a request larger than the limit is refused
+    outright (HTTP 413; run rs20261125111614 lost gpt-oss for the whole run to one 9,195-token
+    request against its 8,000). The prompt is estimated at ``chars_per_token`` characters a
+    token (conservative for prompts heavy in field ids); the cap never goes below
+    ``min_output``, so a prompt too large even then is still sent and refused as before."""
+
+    def __init__(self, inner: LLMClient, tokens_per_minute: int, *,
+                 chars_per_token: float = 3.3, margin: int = 200, min_output: int = 1024):
+        self.inner = inner
+        self.model = inner.model
+        self.provider = getattr(inner, "provider", provider_of(inner.model))
+        self.tokens_per_minute = tokens_per_minute
+        self.chars_per_token, self.margin, self.min_output = chars_per_token, margin, min_output
+
+    def fit(self, system: str, user: str, max_output: int) -> int:
+        prompt = int((len(system) + len(user)) / self.chars_per_token) + 1
+        room = self.tokens_per_minute - prompt - self.margin
+        return max(min(max_output, room), min(max_output, self.min_output))
+
+    def complete(self, system: str, user: str, *, max_output: int = 4096) -> str:
+        cap = self.fit(system, user, max_output)
+        if cap < max_output:
+            log.info("%s: output cap %d -> %d so the request fits its %d tokens a minute",
+                     self.model, max_output, cap, self.tokens_per_minute)
+        return self.inner.complete(system, user, max_output=cap)
+
+    @property
+    def last_usage(self):
+        return getattr(self.inner, "last_usage", None)
+
+
 class PacedClient:
     """Waits before a call so the model's calls and tokens in the last ``window`` seconds
     stay within its free-tier limits (``models.pace`` in config/agents.yaml), instead of
@@ -527,6 +560,8 @@ def make_real_client(model: str, max_output: int | None = None,
     call's output cap, ``pace`` ({calls_per_minute, tokens_per_minute}) paces its calls.
     Kept here so no other module has to name a provider."""
     client = _real_client(model)
+    if pace and pace.get("tokens_per_minute"):   # innermost: no wrapper may raise the cap again
+        client = RequestFitClient(client, pace["tokens_per_minute"])
     if max_output:
         client = OutputCapClient(client, max_output)
     if pace:

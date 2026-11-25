@@ -58,6 +58,11 @@ REGIONS = set(REGION_SETTINGS)
 # BRAIN lists ALL in OPTIONS /simulations but refuses regular alphas there (400 "Region ALL
 # is not available for simulation type REGULAR", run rs20261111162604), so plans can't use it.
 NO_REGULAR_SIMULATION = frozenset({"ALL"})
+# Markets where short selling is restricted (BRAIN's CHN region guide: only eligible blue
+# chips may be shorted, by locally licensed investors), so the opposite of an alpha does
+# not flip its performance. Elsewhere a sign flip mirrored BRAIN's result exactly (GBR
+# -0.98 -> 0.98, USA -1.05 -> 1.05 and -1.18 -> 1.18).
+SHORT_RESTRICTED_REGIONS = frozenset({"CHN"})
 UNIVERSES = {u for s in REGION_SETTINGS.values() for u in s["universes"]}
 NEUTRALIZATIONS = {n for s in REGION_SETTINGS.values() for n in s["neutralizations"]}
 

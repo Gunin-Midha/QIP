@@ -33,9 +33,10 @@ import yaml
 
 from .brain_api import (EMAIL_ENV_VAR, SECRET_ENV_VAR, BrainApiError, RealBrainClient,
                         UrllibTransport, list_datafields, list_datasets, list_operators,
-                        load_brain_config, make_session, prompt_credentials,
-                        simulation_options)
-from .brain_client import FixtureBrainClient, FixtureNotFoundError, SubmissionRejected
+                        load_brain_config, make_session, prompt_credentials, quota_text,
+                        simulation_options, submission_diversity)
+from .brain_client import (FixtureBrainClient, FixtureNotFoundError, SimulationQuotaExhausted,
+                           SubmissionRejected)
 from .compare import model_comparison
 from .config import ConfigError, load_config
 from .fastexpr import FastExprSpec, catalog
@@ -558,6 +559,21 @@ def _brain_datafields(args) -> int:
     return EXIT_OK
 
 
+def _brain_diversity(args) -> int:
+    """Our submitted alphas by region and data category, from BRAIN."""
+    d = submission_diversity(_brain_session(load_brain_config(args.brain_config)))
+    print(f"{d['total']} alpha(s) submitted on BRAIN")
+    by_region: dict = {}
+    for row in d["categories"]:
+        by_region.setdefault(row["region"], []).append(row)
+    for region in sorted(set(d["regions"]) | set(by_region)):
+        cats = ", ".join(f"{r['category']} {r['alphas']} (D{r['delay']}, DATA_DIVERSITY "
+                         f"{r['check']})" for r in sorted(by_region.get(region, []),
+                                                           key=lambda r: r["category"]))
+        print(f"  {region}: {d['regions'].get(region, '?')} alpha(s); categories: {cats or '-'}")
+    return EXIT_OK
+
+
 def _brain_datasets(args) -> int:
     """Every dataset for these settings, with its field count, so a discovery run can see
     which catalogs are too large for one datafield query."""
@@ -604,6 +620,17 @@ def _plan_catalogs(plans) -> dict[tuple, tuple[list[str], dict]]:
     return markets
 
 
+def _fresh_login(session, brain_config) -> None:
+    """Start a long command with a login that lasts (BRAIN ends a login after at most 4 h;
+    the next one asks for the biometric check, which a run hours in cannot answer)."""
+    within = brain_config.relogin_within_seconds
+    if within is None or not hasattr(session, "refresh_if_expiring"):
+        return
+    left = session.refresh_if_expiring(within)
+    if left is not None:
+        print(f"BRAIN login valid for {left / 3600:.1f} h", flush=True)
+
+
 def _research(args) -> int:
     config = load_config(args.config)
     config.require_holdout()  # before logging in or calling the model
@@ -623,7 +650,8 @@ def _research(args) -> int:
     markets = _plan_catalogs(plans)
     budget = Budget(max_simulations=args.max_simulations, per_round=args.per_round,
                     max_llm_calls=args.max_llm_calls)
-    if min(budget.max_simulations, budget.per_round, budget.max_llm_calls) < 1:
+    if min(budget.max_simulations, budget.per_round) < 1 or \
+            (budget.max_llm_calls is not None and budget.max_llm_calls < 1):
         raise ConfigError("--max-simulations, --per-round and --max-llm-calls must be >= 1")
     if args.model:
         agents = dataclasses.replace(agents, models=agents.models.with_default(args.model))
@@ -631,7 +659,9 @@ def _research(args) -> int:
     llm_factory = _llm_factory(args, agents.used_models(),  # before logging in to BRAIN
                                agents.models.max_output, agents.models.pace)
     brain_config = load_brain_config(args.brain_config)
-    client = RealBrainClient(_brain_session(brain_config), brain_config, capture_dir=args.capture_dir)
+    session = _brain_session(brain_config)
+    _fresh_login(session, brain_config)
+    client = RealBrainClient(session, brain_config, capture_dir=args.capture_dir)
     memory = MemoryStore(args.data_dir)
     try:
         run = ResearchRun(plans, agents, budget, llm_factory=llm_factory, client=client,
@@ -646,6 +676,8 @@ def _research(args) -> int:
     print(f"stopped: {report['stop_reason']} | simulations {report['simulations_used']} | "
           f"model calls {report['model_calls']} | pool {report['pool_size']} | report {path}")
     print(f"  model calls by model: {report['model_calls_by_model']}")
+    if report.get("brain_quota"):
+        print(f"  {quota_text(report['brain_quota'], 'BRAIN daily simulations')}")
     if report["regions_this_run"] is not None:
         print(f"  regions this run: {report['regions_this_run']}; simulations per region so far: "
               f"{report['simulations_by_region']}")
@@ -872,8 +904,10 @@ def build_parser() -> argparse.ArgumentParser:
     rs.add_argument("--plan", required=True, help="research plan YAML (arms, hypotheses, papers)")
     rs.add_argument("--max-simulations", type=int, required=True,
                     help="stop after this many candidates reached BRAIN")
-    rs.add_argument("--max-llm-calls", type=int, required=True,
-                    help="stop after this many model calls (all agents together)")
+    rs.add_argument("--max-llm-calls", type=int, default=None,
+                    help="stop after this many model calls (all agents together); default: no "
+                         "cap, the run ends when every generator model has hit its own limit "
+                         "(free tiers), the simulation budget or the rounds. Set it for paid models")
     rs.add_argument("--per-round", type=int, default=10, help="simulation slots per round")
     rs.add_argument("--rounds", type=int, default=5)
     rs.add_argument("--seed", type=int, default=None)
@@ -1026,7 +1060,10 @@ def build_parser() -> argparse.ArgumentParser:
     b_ds.add_argument("--delay", type=int, required=True)
     b_ds.add_argument("--out", required=True)
     b_ds.set_defaults(func=_brain_datasets)
-    for sp in (b_auth, b_out, b_can, b_opt, b_cap, b_ops, b_df, b_ds):
+    b_div = bsub.add_parser("diversity", help="our submitted alphas by region, delay and "
+                                              "data category (BRAIN's count)")
+    b_div.set_defaults(func=_brain_diversity)
+    for sp in (b_auth, b_out, b_can, b_opt, b_cap, b_ops, b_df, b_ds, b_div):
         sp.add_argument("--brain-config", default="config/brain.yaml")
     return p
 
@@ -1049,7 +1086,7 @@ def main(argv: list[str] | None = None) -> int:
     except (LLMUnavailable, GenerationError) as exc:
         print(f"model error: {exc}", file=sys.stderr)
         return EXIT_LLM
-    except (BrainApiError, ConnectionError, TimeoutError) as exc:
+    except (BrainApiError, SimulationQuotaExhausted, ConnectionError, TimeoutError) as exc:
         print(f"BRAIN error: {exc}", file=sys.stderr)
         return EXIT_BRAIN
 

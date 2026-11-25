@@ -34,7 +34,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 from .fastexpr import analyze
-from .generator import GenerationError, ask_json
+from .generator import GenerationError, ask_json, dataset_appeal
 from .lever_stats import LeverStats, repair_events
 from .llm import LLMClient, ModelDown
 from .prompts import BAR_CHECKS, strategy_system, strategy_user
@@ -70,7 +70,14 @@ FEW_TRIALS = 3   # a dataset with fewer decided alphas than this counts as least
 
 
 def summarize(outcomes: list[dict], *, top_n: int = 5,
-              known_datasets: list[str] | None = None) -> dict:
+              known_datasets: list[str] | None = None,
+              dataset_info: dict[str, dict] | None = None,
+              submissions: dict | None = None) -> dict:
+    """``dataset_info``: {dataset: {category, value_score, alpha_count}} from BRAIN's dataset
+    lists (``generator.dataset_facts``). Least-tried datasets are then ordered by our trials,
+    then least crowded on BRAIN (``generator.dataset_appeal``), and their facts are shown as
+    ``least_tried_facts`` (BRAIN's tip for production correlation, 2026-11-25)."""
+    info = dataset_info or {}
     by_family: dict = defaultdict(lambda: {"decided": 0, "accepted": 0, "failures": Counter()})
     by_dataset: Counter = Counter()
     by_arm: dict = defaultdict(lambda: {"decided": 0, "accepted": 0})
@@ -98,7 +105,12 @@ def summarize(outcomes: list[dict], *, top_n: int = 5,
                            "failure_class": d.failure_class, **metrics})
     accepted.sort(key=lambda a: a.get("sharpe") or 0, reverse=True)
     known = sorted(set(known_datasets or []) | set(by_dataset))
-    least = sorted((d for d in known if by_dataset[d] < FEW_TRIALS), key=lambda d: (by_dataset[d], d))
+    least = sorted((d for d in known if by_dataset[d] < FEW_TRIALS),
+                   key=lambda d: (by_dataset[d], dataset_appeal(info.get(d)), d))[:20]
+    least_facts = {d: {"our_trials": by_dataset[d], "category": info[d].get("category"),
+                       "value_score": info[d].get("value_score"),
+                       "brain_alphas": info[d].get("alpha_count")}
+                   for d in least if d in info}
     worked = [r for r in LeverStats.from_events(repair_events(outcomes)).table()
               if r["posterior_mean"] > 0.5]
     return {
@@ -113,10 +125,23 @@ def summarize(outcomes: list[dict], *, top_n: int = 5,
         "best_accepted": accepted[:top_n],
         "recent_failures": failed[-top_n:],
         "datasets": dict(by_dataset.most_common()),
-        "least_tried": least[:20],
+        "least_tried": least,
+        **({"least_tried_facts": least_facts} if least_facts else {}),
+        **({"our_brain_submissions": submissions_view(submissions)} if submissions else {}),
         "what_fixes_worked": [{k: r[k] for k in ("failure_class", "lever", "fixed", "posterior_mean")}
                               for r in worked[:8]],
     }
+
+
+def submissions_view(submissions: dict) -> dict:
+    """BRAIN's count of our submitted alphas (``brain_api.submission_diversity``) as the
+    Strategy summary shows it: the total, per region, and per region the data categories
+    with their counts (an alpha counts in each category it uses)."""
+    cats: dict = {}
+    for row in submissions.get("categories") or []:
+        cats.setdefault(row.get("region"), {})[row.get("category")] = row.get("alphas")
+    return {"total": submissions.get("total"), "by_region": dict(submissions.get("regions") or {}),
+            "categories_by_region": cats}
 
 
 def region_breakdown(outcomes: list[dict]) -> dict:
@@ -246,8 +271,11 @@ class StrategyEvolution:
         return self.config.every_rounds > 0 and round_number % self.config.every_rounds == 0
 
     def evolve(self, outcomes: list[dict], base_prompt_version: str,
-               known_datasets: list[str] | None = None) -> Evolution | None:
-        summary = summarize(outcomes, known_datasets=known_datasets)
+               known_datasets: list[str] | None = None,
+               dataset_info: dict[str, dict] | None = None,
+               submissions: dict | None = None) -> Evolution | None:
+        summary = summarize(outcomes, known_datasets=known_datasets, dataset_info=dataset_info,
+                            submissions=submissions)
         if summary["decided"] == 0:
             return None
         self.count += 1

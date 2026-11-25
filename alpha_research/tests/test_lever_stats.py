@@ -405,8 +405,8 @@ def test_wave_size_follows_closeness_value_and_blocked_checks():
     # ... unless BRAIN's risk-neutralized Sharpe shows the edge (factor exposure hides it)
     rich = res(1.2, alt_stats={"risk_neutralized": {"sharpe": 1.9}})
     assert wave_size(_decision(1.2, 1.1), rich, cfg, pb)[0] == 4
-    # blocked: a BRAIN check no lever fixes (class other)
-    asi = GateResult("brain:LOW_ASI_JPN_SHARPE", False, 0.81, 1.0, "")
+    # blocked: a BRAIN check no lever fixes (an unknown check: class other)
+    asi = GateResult("brain:SOME_NEW_CHECK", False, 0.81, 1.0, "")
     n, why = wave_size(_decision(2.35, 0.92, [asi]), res(2.35), cfg, pb)
     assert n == 1 and "no lever fixes" in why
     # no tiers configured: fixes_per_wave for everyone

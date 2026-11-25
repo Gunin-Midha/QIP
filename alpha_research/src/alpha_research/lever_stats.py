@@ -185,19 +185,21 @@ def _wave_tiers(raw) -> tuple:
     if raw is None:
         return ()
     bad = ConfigError("agents config: repair.wave_tiers must be a list of {max_distance: "
-                      "number or null, fixes: integer >= 0}, distances increasing, the last null")
+                      "number or null, fixes: integer >= 0, mechanical_only: optional bool}, "
+                      "distances increasing, the last null")
     if not isinstance(raw, list) or not raw:
         raise bad
     out, last = [], -1.0
     for t in raw:
-        if not isinstance(t, dict) or set(t) != {"max_distance", "fixes"}:
+        if not isinstance(t, dict) or not {"max_distance", "fixes"} <= set(t) \
+                or set(t) - {"max_distance", "fixes", "mechanical_only"}:
             raise bad
-        d, n = t["max_distance"], t["fixes"]
-        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        d, n, mech = t["max_distance"], t["fixes"], t.get("mechanical_only", False)
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0 or not isinstance(mech, bool):
             raise bad
         if d is not None and (isinstance(d, bool) or not isinstance(d, (int, float)) or d <= last):
             raise bad
-        out.append((None if d is None else float(d), n))
+        out.append((None if d is None else float(d), n, mech))
         last = float("inf") if d is None else float(d)
     if out[-1][0] is not None:
         raise bad
@@ -294,11 +296,12 @@ def wave_size(decision: DecisionRecord | None, result: ResultRecord | None,
     below ``value_sharpe_share`` of the Sharpe bar (little real edge to save)."""
     dist = distance(decision, result, config.unmeasured_failure_penalty)
     n, why = config.fixes_per_wave, "default size"
-    for limit, fixes in config.wave_tiers:
+    for limit, fixes, mech in config.wave_tiers:
         if limit is None or (dist is not None and dist <= limit):
             n = fixes
             why = (f"distance to accept {dist}" if dist is not None else "distance unknown") \
-                + (f" <= {limit}" if limit is not None else "")
+                + (f" <= {limit}" if limit is not None else "") \
+                + (", mechanical fixes only" if mech and fixes else "")
             break
     blocked = sorted(c for c in failing_classes(decision, result) if not playbook.entries.get(c))
     if blocked and n > config.blocked_fixes:
@@ -313,6 +316,17 @@ def wave_size(decision: DecisionRecord | None, result: ResultRecord | None,
             n, why = config.low_value_fixes, (f"best Sharpe {best:.2f} < {share:g} x bar "
                                               f"{bar:g}: little edge")
     return n, why
+
+
+def mechanical_only(decision: DecisionRecord | None, result: ResultRecord | None,
+                    config: RepairLearningConfig) -> bool:
+    """Whether this alpha's wave tier allows mechanical fixes only (no model call): owner
+    2026-11-25, alphas 0.4-0.6 from accept get mechanical fixes only."""
+    dist = distance(decision, result, config.unmeasured_failure_penalty)
+    for limit, _, mech in config.wave_tiers:
+        if limit is None or (dist is not None and dist <= limit):
+            return mech
+    return False
 
 
 def _best_sharpe(result: ResultRecord | None) -> float | None:

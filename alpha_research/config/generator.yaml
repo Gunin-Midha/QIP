@@ -1,7 +1,7 @@
 # Alpha Generator settings (Phase 3). Technical limits have values. Policy limits are
 # null (= not configured, the check is skipped) until the owner decides (OQ-11).
 generator:
-  prompt_version: gen-v10      # written to CandidateRecord.prompt_version; bump when prompts change
+  prompt_version: gen-v13      # written to CandidateRecord.prompt_version; bump when prompts change
   max_repair_rounds: 1         # times rejected expressions are sent back to the model for a fix
   max_paper_chars: 120000      # longer papers are cut to this many characters (null = no cut)
   max_hypotheses_per_paper: 5  # hypotheses extracted from one paper
@@ -23,6 +23,19 @@ generator:
   # dataset; "all" goes to every arm. Evidence: the DEU/GBR analyst7 rounds of 2026-11-14
   # and the EUR pv1 reversal rounds of 2026-11-15 (REPORT.md). Advice in the prompt, never a
   # rule; edit as evidence grows.
+  # Per region, from BRAIN's region guides (shown after the `all` lesson). BRAIN's limits
+  # themselves come from the market line of the prompt, never typed here.
+  region_lessons:
+    CHN: >-
+      China (BRAIN's region guide): trading costs are high, so BRAIN asks for more Sharpe
+      and returns here than in other regions (the bar is in the market line): prefer slower
+      signals with low turnover and strong returns. Short selling is allowed only for
+      eligible blue-chip stocks, so the opposite of an alpha does not mirror its
+      performance: take the direction from the mechanism, never from flipping a weak
+      result. Daily price limits (5-10% by stock type) stop large moves, so a price change
+      measured over a day that hit the limit understates the move. Keep the Sharpe and
+      returns on BRAIN's robust universe close to the full universe's, and judge whether
+      the idea is new by its risk-handled (SLOW_AND_FAST) result.
   category_lessons:
     all: >-
       When you combine parts, keep their speeds alike or smooth the fast part first: each
@@ -40,7 +53,13 @@ generator:
       net-profit estimate passed at 0.69, and its Sharpe on BRAIN's robust universe rose
       (1.01 to 1.36); blended with net-margin levels or changes, or news sentiment, it fell
       below the limit (0.53-0.97). Prefer analyst parts that cover the large stocks; at half
-      weight the same part left the correlation at 0.71.
+      weight the same part left the correlation at 0.71. Keep each alpha's search narrow
+      (BRAIN's research guide): from a family of similar fields (one measure at several
+      horizons or maturities, such as 30-, 120- and 360-day implied volatility) use one;
+      from a group of similar operators (ts_mean, ts_median, ts_sum; ts_delta, ts_av_diff,
+      ts_zscore; group_rank, group_zscore) use one; use common windows, 5, 10 or 21 days for
+      a fast signal and 63, 121 or 252 for a slow one. Variants of a field, operator or
+      window are for later, once a version shows signal.
     pv: >-
       Signals built only from price and volume (open, close, returns, volume, vwap) are the
       most common production alphas, so they tend to fail BRAIN's production correlation

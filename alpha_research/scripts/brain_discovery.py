@@ -14,6 +14,7 @@ then skipped and listed at the end.
 Run from alpha_research/ (BRAIN_EMAIL and BRAIN_PASSWORD in the environment):
     PYTHONPATH=src python3 scripts/brain_discovery.py [--max-datasets 20] [--regions USA EUR]
         [--datasets option6]   # also fetch these datasets where the region has them
+        [--delays 1]           # only these delays
 """
 
 import argparse
@@ -95,6 +96,8 @@ def main() -> int:
     ap.add_argument("--out", default="captures/consultant_catalogs")
     ap.add_argument("--brain-config", default="config/brain.yaml")
     ap.add_argument("--regions", nargs="*", default=list(REGION_SETTINGS))
+    ap.add_argument("--delays", nargs="*", type=int, default=None,
+                    help="only these delays (default: every delay the region allows)")
     ap.add_argument("--max-datasets", type=int, default=20,
                     help="datasets per region/delay to download fields for (0 = all)")
     ap.add_argument("--datasets", nargs="*", default=[],
@@ -117,7 +120,8 @@ def main() -> int:
     say("Logged in to BRAIN.")
 
     combos = [(r, REGION_SETTINGS[r]["universes"][0], d)
-              for r in args.regions for d in REGION_SETTINGS[r]["delays"]]
+              for r in args.regions for d in REGION_SETTINGS[r]["delays"]
+              if args.delays is None or d in args.delays]
     summary, gaps = [], []
     for n, (region, universe, delay) in enumerate(combos, 1):
         tag = f"{region.lower()}_{universe.lower()}_d{delay}"
