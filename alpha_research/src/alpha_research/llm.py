@@ -170,6 +170,37 @@ class ModelDown(LLMUnavailable):
         self.reason = reason
 
 
+class RequestTooLarge(ModelDown):
+    """A request larger than the model's per-minute token limit (the host's HTTP 413, or our
+    own check before sending). The model works; the request does not fit. Callers treat it
+    as ModelDown for this one call (agents fall back to their rules, a FallbackLLM tries the
+    next model), but the call counter never marks the model down for it: run
+    rs20261125130750 lost both Groq models for the rest of the run to one oversized Strategy
+    Evolution request sent to each in turn. ``requested``/``limit``: the host's numbers when
+    it gave them; ``input_only``: the limit counts input tokens only (Groq's ITPM)."""
+
+    def __init__(self, model: str, reason: str, requested: int | None = None,
+                 limit: int | None = None, input_only: bool = False):
+        LLMUnavailable.__init__(self, f"{model}: request too large: {reason}")
+        self.model, self.reason = model, f"request too large: {reason}"
+        self.requested, self.limit, self.input_only = requested, limit, input_only
+
+
+_TOO_LARGE_RE = re.compile(r"Limit (\d+), Requested (\d+)")
+
+
+def too_large(model: str, status: int, msg: str | None) -> RequestTooLarge | None:
+    """A RequestTooLarge for a host's HTTP 413 reply (Groq: "... tokens per minute (TPM):
+    Limit 8000, Requested 11002"), else None."""
+    if status != 413:
+        return None
+    m = _TOO_LARGE_RE.search(msg or "")
+    return RequestTooLarge(model, msg or "HTTP 413",
+                           requested=int(m.group(2)) if m else None,
+                           limit=int(m.group(1)) if m else None,
+                           input_only="ITPM" in (msg or "") or "input tokens" in (msg or ""))
+
+
 class LLMClient(Protocol):
     model: str
 
@@ -341,6 +372,7 @@ class GeminiLLMClient:
             raise LLMUnavailable(f"model call failed: HTTP {status}: {msg or 'no message'}")
         usage = (data.get("usageMetadata") or {}) if isinstance(data, dict) else {}
         self.last_usage = usage.get("totalTokenCount")
+        self.last_prompt_tokens = usage.get("promptTokenCount")
         candidates = data.get("candidates") if isinstance(data, dict) else None
         if not candidates:
             block = (data.get("promptFeedback") or {}).get("blockReason")
@@ -398,9 +430,13 @@ class ChatCompletionsLLMClient:
             msg = error.get("message") if isinstance(error, dict) else None
             if not msg and raw and not data:  # not JSON, e.g. a proxy's "error code: 1010"
                 msg = raw[:200].decode("utf-8", "replace").strip()
+            big = too_large(self.model, status, msg)
+            if big is not None:
+                raise big
             raise LLMUnavailable(f"model call failed: HTTP {status}: {msg or 'no message'}")
         usage = (data.get("usage") or {}) if isinstance(data, dict) else {}
         self.last_usage = usage.get("total_tokens")   # what the host counts, reasoning included
+        self.last_prompt_tokens = usage.get("prompt_tokens")   # the prompt as the host counts it
         choices = data.get("choices") if isinstance(data, dict) else None
         if not choices:
             raise LLMUnavailable("model returned no choices")
@@ -469,32 +505,86 @@ class OutputCapClient:
 
 
 class RequestFitClient:
-    """Lowers a call's output cap so prompt + cap fit the model's per-minute token limit:
-    Groq counts the cap in the request, and a request larger than the limit is refused
-    outright (HTTP 413; run rs20261125111614 lost gpt-oss for the whole run to one 9,195-token
-    request against its 8,000). The prompt is estimated at ``chars_per_token`` characters a
-    token (conservative for prompts heavy in field ids); the cap never goes below
-    ``min_output``, so a prompt too large even then is still sent and refused as before."""
+    """Fits a call to the model's per-minute token limit (Groq counts the output cap in the
+    request and refuses a larger one outright, HTTP 413: run rs20261125111614 lost gpt-oss to
+    one 9,195-token request against its 8,000; run rs20261125130750 lost gpt-oss and Qwen to
+    11,002- and 11,644-token Strategy Evolution requests).
+
+    Prompt size in tokens: ``chars_per_token`` until the host has told us, then the smallest
+    characters-per-token ratio measured on this model (the host's ``prompt_tokens`` on a reply
+    of at least ``min_measure`` tokens, or its "Requested N" on a 413). Field ids tokenize
+    densely, so the default can be optimistic; the measured ratio replaces it after one call.
+    The output cap is lowered so prompt + cap fit (never below ``min_output``). With a measured
+    ratio, a prompt that cannot fit even then raises RequestTooLarge before it is sent. A 413
+    whose numbers show the prompt fits with a smaller cap is retried once with that cap.
+    ``stats()`` reports what was measured."""
 
     def __init__(self, inner: LLMClient, tokens_per_minute: int, *,
-                 chars_per_token: float = 3.3, margin: int = 200, min_output: int = 1024):
+                 chars_per_token: float = 3.3, margin: int = 200, min_output: int = 1024,
+                 min_measure: int = 500):
         self.inner = inner
         self.model = inner.model
         self.provider = getattr(inner, "provider", provider_of(inner.model))
         self.tokens_per_minute = tokens_per_minute
         self.chars_per_token, self.margin, self.min_output = chars_per_token, margin, min_output
+        self.min_measure = min_measure
+        self.measured: float | None = None      # smallest measured characters per token
+        self.max_prompt_tokens: int | None = None
+        self.refused = 0
+
+    @property
+    def ratio(self) -> float:
+        return self.measured if self.measured is not None else self.chars_per_token
+
+    def estimate(self, system: str, user: str) -> int:
+        return int((len(system) + len(user)) / self.ratio) + 1
 
     def fit(self, system: str, user: str, max_output: int) -> int:
-        prompt = int((len(system) + len(user)) / self.chars_per_token) + 1
-        room = self.tokens_per_minute - prompt - self.margin
+        room = self.tokens_per_minute - self.estimate(system, user) - self.margin
         return max(min(max_output, room), min(max_output, self.min_output))
 
+    def _measure(self, chars: int, tokens) -> None:
+        if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < self.min_measure:
+            return
+        self.max_prompt_tokens = max(self.max_prompt_tokens or 0, tokens)
+        r = min(max(chars / tokens, 1.0), 8.0)
+        self.measured = r if self.measured is None else min(self.measured, r)
+
     def complete(self, system: str, user: str, *, max_output: int = 4096) -> str:
+        chars = len(system) + len(user)
         cap = self.fit(system, user, max_output)
+        if self.measured is not None:
+            need = self.estimate(system, user) + min(max_output, self.min_output) + self.margin
+            if need > self.tokens_per_minute:
+                self.refused += 1
+                raise RequestTooLarge(self.model, f"prompt about {self.estimate(system, user)} "
+                                      f"tokens (measured {self.measured:.2f} characters a token) "
+                                      f"does not fit {self.tokens_per_minute} tokens a minute",
+                                      requested=need, limit=self.tokens_per_minute)
         if cap < max_output:
             log.info("%s: output cap %d -> %d so the request fits its %d tokens a minute",
                      self.model, max_output, cap, self.tokens_per_minute)
-        return self.inner.complete(system, user, max_output=cap)
+        try:
+            reply = self.inner.complete(system, user, max_output=cap)
+        except RequestTooLarge as exc:
+            self.refused += 1
+            if exc.requested is None:
+                raise
+            prompt = exc.requested if exc.input_only else exc.requested - cap
+            self._measure(chars, prompt)
+            room = (exc.limit or self.tokens_per_minute) - prompt - self.margin
+            if exc.input_only or room < min(max_output, self.min_output) or room >= cap:
+                raise
+            log.warning("%s: request of %d tokens refused; retrying with output cap %d",
+                        self.model, exc.requested, room)
+            reply = self.inner.complete(system, user, max_output=room)
+        self._measure(chars, getattr(self.inner, "last_prompt_tokens", None))
+        return reply
+
+    def stats(self) -> dict:
+        return {"tokens_per_minute": self.tokens_per_minute,
+                "chars_per_token": None if self.measured is None else round(self.measured, 2),
+                "max_prompt_tokens": self.max_prompt_tokens, "refused": self.refused}
 
     @property
     def last_usage(self):

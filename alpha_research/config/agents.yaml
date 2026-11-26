@@ -85,6 +85,15 @@ repair:
   value_sharpe_share: 0.8          # best Sharpe (raw or risk-neutralized) below 0.8 x the bar:
   low_value_fixes: 0               # ... no fix (little real edge)
   blocked_fixes: 0                 # fails a BRAIN check no lever fixes (e.g. ASI checks): no fix
+  # Leads (owner 2026-11-25): an alpha whose best Sharpe (raw or risk-neutralized, either
+  # sign) is at least lead_sharpe_share x BRAIN's Sharpe bar (0.63 x 1.58 = 1.0 in USA; the
+  # bar differs by region) gets at least lead_fixes mechanical fixes (no model call), however
+  # far its other checks put it, unless it fails a check no lever fixes. Run
+  # rs20261125130750: 43 simulations, leads at Sharpe 1.05-1.39, no repair child at all.
+  # Alphas the evaluator rejects (a Sharpe/fitness/recent-Sharpe failure that is not a near
+  # miss) still get none: this sizes waves of "repair" decisions only.
+  lead_sharpe_share: 0.63
+  lead_fixes: 2
   # Gain match (owner 2026-11-23): a lever's past gains count for an alpha that needs less,
   # even when they never carried an alpha over the bar.
   gain_weight: 0.5                 # weight of P(past gain >= the gain this alpha needs)
@@ -108,6 +117,12 @@ strategy:
   # capped here, spread over datasets, markets and generator models (2026-11-14: one
   # evolution had added 140 arms to a 20-simulation run).
   max_new_arms: 8
+  # Whole prompt (instructions + records) cut to about this many characters, least useful
+  # records first (strategy.trimmed_summary). Run rs20261125130750: an ~11,000-token Strategy
+  # request was refused by gpt-oss (8,000 tokens a minute) and Qwen (7,000) and, before the
+  # fix that keeps a model up after a too-large request, took both down for the run. 15,000
+  # characters is ~6,000 tokens at 2.5 characters a token (field-heavy text). null = no cut.
+  max_prompt_chars: 15000
 
 director:
   floor_share: 0.2                 # spec 13.1 default: share of each round reserved as floor slots
@@ -117,6 +132,11 @@ director:
   # went to 12 arms and each arm's single alpha cost a Generator and a Critic call. An arm
   # given slots now gets at least min_batch (one Generator call writes them all).
   min_batch: 3
+  # Owner 2026-11-26: the round's new-alpha allocation is made before its repairs go to
+  # BRAIN, and a slot freed mid-batch generates the next arm's alphas at once (one Generator
+  # call per arm, as before). Run rs20261125173606: new alphas waited ~30 min twice for a
+  # repair batch's timeouts while 2 of 4 slots sat idle. false = generate after the batch.
+  fill_freed_slots: true
   # With no model-call cap (--max-llm-calls is optional since 2026-11-25) a run ends when
   # every generator model is down (its free limit), the simulation budget or the rounds; this
   # many rounds in a row that send nothing to BRAIN end it too.

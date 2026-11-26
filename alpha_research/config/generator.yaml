@@ -1,7 +1,7 @@
 # Alpha Generator settings (Phase 3). Technical limits have values. Policy limits are
 # null (= not configured, the check is skipped) until the owner decides (OQ-11).
 generator:
-  prompt_version: gen-v13      # written to CandidateRecord.prompt_version; bump when prompts change
+  prompt_version: gen-v14      # written to CandidateRecord.prompt_version; bump when prompts change
   max_repair_rounds: 1         # times rejected expressions are sent back to the model for a fix
   max_paper_chars: 120000      # longer papers are cut to this many characters (null = no cut)
   max_hypotheses_per_paper: 5  # hypotheses extracted from one paper
@@ -18,6 +18,44 @@ generator:
   crowding:
     percentile: 0.9
     min_alphas: 50
+    # Heavily used (owner 2026-11-25, OQ-23): at least this many BRAIN alphas use the field,
+    # whatever its dataset's other fields do. The relative rule above flagged none of the 49
+    # fields of run rs20261125130750, e.g. USA option8 skew (1,350-2,000 alphas) and AMR
+    # model39's value-momentum rank (948; production correlation 0.91). Such fields keep
+    # their place in the list (USA option8 is over 500 everywhere), are tagged, never drawn
+    # for exploration or offered as blend partners, and cannot be an alpha's only signal
+    # (structure below). null = off.
+    heavy_alphas: 500
+
+  # Structure of a fresh alpha (owner 2026-11-25). Sources = distinct non-base signal fields
+  # (not groups or identifiers), +1 when it reads a price/volume field below (cap and adv20
+  # only scale or tilt, so they are not listed). Fewer than min_signal_sources, or (with
+  # need_uncrowded) signal fields that are all crowded or heavily used: the alpha is sent
+  # back once with the reason, then dropped. Applies with BRAIN's field facts only, never
+  # to repairs. Run rs20261125130750: 46% of fresh alphas had one source or none; all five
+  # accepts combine two or more. Memory shows no Sharpe gain from the rule alone (fresh
+  # alphas passing it: mean |Sharpe| 0.60, failing 0.64): it guards novelty; judge it by
+  # `cli quality` over the next runs. null min_signal_sources = off.
+  structure:
+    min_signal_sources: 2
+    need_uncrowded: true
+    price_fields: [close, open, high, low, vwap, returns, volume]
+
+  # Blend slots (owner 2026-11-25): this share of each batch must read two datasets (the
+  # pattern of every accept so far: IND, CHN, EUR). The prompt offers up to `partners`
+  # fields of other datasets whose alphas in this market reached |Sharpe| >= partner_min_sharpe
+  # (raw or risk-neutralized, either sign), neither crowded nor heavily used: a little-used
+  # field with shown signal, not one that is unused because it is empty (the loan and
+  # short-interest fields of that run, 1-40 alphas each, gave Sharpe near 0).
+  blend:
+    share: 0.25
+    partners: 8
+    partner_min_sharpe: 1.0
+
+  # The arm's latest simulated alphas (same dataset, region, delay) with BRAIN's numbers, in
+  # the request, so the model stops repeating them (run rs20261125130750 round 1: four forms
+  # of rank(skew) in one batch). 0 = off.
+  history_in_prompt: 4          # about 200 characters each; prompts sit near the Groq free per-minute limit
 
   # Lessons from our own results, shown to the Generator by the BRAIN category of the arm's
   # dataset; "all" goes to every arm. Evidence: the DEU/GBR analyst7 rounds of 2026-11-14

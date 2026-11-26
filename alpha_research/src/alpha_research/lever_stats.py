@@ -118,6 +118,12 @@ class RepairLearningConfig:
     value_sharpe_share: float | None = None   # below this share of the Sharpe bar: low_value_fixes
     low_value_fixes: int = 1
     blocked_fixes: int = 1               # fails a BRAIN check no playbook lever addresses
+    # leads (owner 2026-11-25): best Sharpe (raw or risk-neutralized, either sign) at least
+    # lead_sharpe_share x the Sharpe bar gets at least lead_fixes mechanical fixes, however
+    # far its other checks put it (run rs20261125130750: 43 simulations, leads at Sharpe
+    # 1.05-1.39, no repair child at all). None = off.
+    lead_sharpe_share: float | None = None
+    lead_fixes: int = 0
     unmeasured_failure_penalty: float = 0.5   # distance added by a failure with no value
     region_prior_strength: float = 2.0   # events the all-region estimate counts for in a region
 
@@ -170,6 +176,9 @@ class RepairLearningConfig:
                                        else float(num("value_sharpe_share", 0, 2))),
                    low_value_fixes=count("low_value_fixes", 0),
                    blocked_fixes=count("blocked_fixes", 0),
+                   lead_sharpe_share=(None if sec.get("lead_sharpe_share") is None
+                                      else float(num("lead_sharpe_share", 0, 2))),
+                   lead_fixes=count("lead_fixes", 0),
                    unmeasured_failure_penalty=float(num("unmeasured_failure_penalty", 0, 10)),
                    region_prior_strength=float(num("region_prior_strength", 0, 1000)))
 
@@ -287,46 +296,67 @@ def distance(decision: DecisionRecord | None, result: ResultRecord | None,
     return round(total, 6)
 
 
+def _sharpe_bar(decision: DecisionRecord | None) -> float | None:
+    if decision is None:
+        return None
+    return next((g.threshold for g in decision.gate_results
+                 if g.name in ("sharpe", "brain:LOW_SHARPE")
+                 and isinstance(g.threshold, (int, float))), None)
+
+
+def _size(decision: DecisionRecord | None, result: ResultRecord | None,
+          config: RepairLearningConfig, playbook: Playbook | None) -> tuple[int, bool, str]:
+    """(fixes, mechanical only, why); ``wave_size`` and ``mechanical_only`` share it. The
+    blocked rule applies only with a ``playbook``."""
+    dist = distance(decision, result, config.unmeasured_failure_penalty)
+    n, mech, why = config.fixes_per_wave, False, "default size"
+    for limit, fixes, m in config.wave_tiers:
+        if limit is None or (dist is not None and dist <= limit):
+            n, mech = fixes, m
+            why = (f"distance to accept {dist}" if dist is not None else "distance unknown") \
+                + (f" <= {limit}" if limit is not None else "") \
+                + (", mechanical fixes only" if m and fixes else "")
+            break
+    if playbook is not None:
+        blocked = sorted(c for c in failing_classes(decision, result)
+                         if not playbook.entries.get(c))
+        if blocked:
+            if n > config.blocked_fixes:
+                n, why = config.blocked_fixes, f"fails {', '.join(blocked)}, which no lever fixes"
+            return n, mech, why
+    bar, best = _sharpe_bar(decision), _best_sharpe(result)
+    share = config.value_sharpe_share
+    if share is not None and n > config.low_value_fixes and bar and best is not None \
+            and best < share * bar:
+        n, why = config.low_value_fixes, (f"best Sharpe {best:.2f} < {share:g} x bar "
+                                          f"{bar:g}: little edge")
+    lead = config.lead_sharpe_share
+    if lead is not None and n < config.lead_fixes and bar and best is not None \
+            and best >= lead * bar:
+        n, mech = config.lead_fixes, True
+        why += (f"; lead: best Sharpe {best:.2f} >= {lead:g} x bar {bar:g}, "
+                f"{n} mechanical fixes")
+    return n, mech, why
+
+
 def wave_size(decision: DecisionRecord | None, result: ResultRecord | None,
               config: RepairLearningConfig, playbook: Playbook) -> tuple[int, str]:
     """(fixes for this alpha's next repair wave, why). The tier of its distance to accept
     (``wave_tiers``), then at most ``blocked_fixes`` when it fails a class no playbook
     lever addresses (no fix can make it pass, e.g. BRAIN's ASI checks), and at most
     ``low_value_fixes`` when its best Sharpe (raw or risk-neutralized, either sign) is
-    below ``value_sharpe_share`` of the Sharpe bar (little real edge to save)."""
-    dist = distance(decision, result, config.unmeasured_failure_penalty)
-    n, why = config.fixes_per_wave, "default size"
-    for limit, fixes, mech in config.wave_tiers:
-        if limit is None or (dist is not None and dist <= limit):
-            n = fixes
-            why = (f"distance to accept {dist}" if dist is not None else "distance unknown") \
-                + (f" <= {limit}" if limit is not None else "") \
-                + (", mechanical fixes only" if mech and fixes else "")
-            break
-    blocked = sorted(c for c in failing_classes(decision, result) if not playbook.entries.get(c))
-    if blocked and n > config.blocked_fixes:
-        n, why = config.blocked_fixes, f"fails {', '.join(blocked)}, which no lever fixes"
-    share = config.value_sharpe_share
-    if share is not None and n > config.low_value_fixes and decision is not None:
-        bar = next((g.threshold for g in decision.gate_results
-                    if g.name in ("sharpe", "brain:LOW_SHARPE")
-                    and isinstance(g.threshold, (int, float))), None)
-        best = _best_sharpe(result)
-        if bar and best is not None and best < share * bar:
-            n, why = config.low_value_fixes, (f"best Sharpe {best:.2f} < {share:g} x bar "
-                                              f"{bar:g}: little edge")
+    below ``value_sharpe_share`` of the Sharpe bar (little real edge to save); finally a
+    lead (best Sharpe >= ``lead_sharpe_share`` of the bar, not blocked) gets at least
+    ``lead_fixes`` mechanical fixes."""
+    n, _, why = _size(decision, result, config, playbook)
     return n, why
 
 
 def mechanical_only(decision: DecisionRecord | None, result: ResultRecord | None,
                     config: RepairLearningConfig) -> bool:
-    """Whether this alpha's wave tier allows mechanical fixes only (no model call): owner
-    2026-11-25, alphas 0.4-0.6 from accept get mechanical fixes only."""
-    dist = distance(decision, result, config.unmeasured_failure_penalty)
-    for limit, _, mech in config.wave_tiers:
-        if limit is None or (dist is not None and dist <= limit):
-            return mech
-    return False
+    """Whether this alpha's wave allows mechanical fixes only (no model call): its tier
+    says so (owner 2026-11-25, alphas 0.4-0.6 from accept), or it got fixes only as a lead."""
+    return _size(decision, result, config, None)[1]
 
 
 def _best_sharpe(result: ResultRecord | None) -> float | None:

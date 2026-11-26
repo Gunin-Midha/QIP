@@ -78,7 +78,7 @@ from .compare import arm_models, model_comparison
 from .fastexpr import FastExprSpec, analyze, catalog, catalog_for
 from .generator import (AlphaGenerator, GenerationError, GenerationSettings, GeneratorConfig,
                         Source, dataset_appeal, dataset_category, dataset_facts)
-from .llm import LLMClient, LLMUnavailable, ModelDown, provider_of
+from .llm import LLMClient, LLMUnavailable, ModelDown, RequestTooLarge, provider_of
 from .memory import MemoryStore
 from .orchestrator import Orchestrator, balance_slots, consolidate
 from . import power_pool
@@ -88,11 +88,12 @@ from .prefilter import PreFilter, PrefilterConfig
 from .repair import Playbook
 from .lessons import LessonsConfig, for_agent, learn, summary
 from .lever_stats import LeverStats, RepairLearningConfig, distance, repair_events
+from .quality import generation_quality
 from .repair_agent import RepairAgent
 from .schemas import (GROUP_NEUTRALIZATIONS, NO_REGULAR_SIMULATION, REGION_SETTINGS,
                       CandidateRecord, experiment_hash)
 from .strategy import (StrategyConfig, StrategyEvolution, brain_limits,
-                       prod_correlation_fields, region_notes)
+                       prod_correlation_fields, region_notes, signal_evidence, arm_history)
 
 DECIDED = ("accept", "reject", "repair")
 
@@ -109,6 +110,7 @@ class CallCounter:
         self.calls = 0
         self.by_model: dict[str, int] = {}
         self.down: dict[str, str] = {}   # model -> why it is out for the rest of the run
+        self.too_large: dict[str, int] = {}   # model -> calls refused as too large
 
 
 class BudgetedLLM:
@@ -139,6 +141,9 @@ class BudgetedLLM:
         c.by_model[self.model] = c.by_model.get(self.model, 0) + 1
         try:
             return self.inner.complete(system, user, max_output=max_output)
+        except RequestTooLarge:   # the request, not the model: it stays up
+            c.too_large[self.model] = c.too_large.get(self.model, 0) + 1
+            raise
         except ModelDown as exc:
             c.down[self.model] = exc.reason
             raise
@@ -163,12 +168,19 @@ class FallbackLLM:
         return (live or self.models)[0].model
 
     def complete(self, system: str, user: str, *, max_output: int = 4096) -> str:
+        tried, big = 0, 0
         for m in self._live():
+            tried += 1
             try:
                 return m.complete(system, user, max_output=max_output)
+            except RequestTooLarge:   # try a model with a larger limit; this one stays up
+                big += 1
+                continue
             except ModelDown:
                 continue
         names = ", ".join(m.model for m in self.models)
+        if tried and big == tried:
+            raise RequestTooLarge(names, "too large for every model of this agent")
         raise ModelDown(names, "every model for this agent is down")
 
 
@@ -231,6 +243,7 @@ class AgentsConfig:
     refill_passes: int = 0   # extra allocation passes per round for slots emptied by drops
     min_batch: int | None = None   # an arm given slots gets at least this many (orchestrator.consolidate)
     stop_after_idle_rounds: int | None = None   # stop after this many rounds in a row with no simulation
+    fresh_fill_freed_slots: bool = True   # a BRAIN slot freed mid-batch takes the round's new alphas
     region_floor_share: float | None = None   # each region's minimum share of a round
     max_region_share: float | None = None     # no region above this share while others are below
     regions_per_run: int | None = None        # rotation: work on this many regions per run
@@ -374,7 +387,9 @@ def agents_config_from_dict(raw) -> AgentsConfig:
             max_hypotheses=_pos_int(st, "strategy", "max_hypotheses", lo=0),
             max_guidance_chars=_pos_int(st, "strategy", "max_guidance_chars"),
             max_new_arms=(_pos_int(st, "strategy", "max_new_arms", lo=0)
-                          if "max_new_arms" in st else StrategyConfig.max_new_arms)),
+                          if "max_new_arms" in st else StrategyConfig.max_new_arms),
+            max_prompt_chars=(_pos_int(st, "strategy", "max_prompt_chars", lo=1000)
+                              if st.get("max_prompt_chars") is not None else None)),
         floor_share=float(floor),
         max_output=_pos_int(raw, "agents", "max_output", lo=256),
         models=models_config_from_dict(raw.get("models")),
@@ -389,6 +404,8 @@ def agents_config_from_dict(raw) -> AgentsConfig:
         stop_after_idle_rounds=(None if secs["director"].get("stop_after_idle_rounds") is None
                                 else _pos_int(secs["director"], "director",
                                               "stop_after_idle_rounds")),
+        fresh_fill_freed_slots=(_bool(secs["director"], "director", "fill_freed_slots")
+                                if "fill_freed_slots" in secs["director"] else True),
         regions_per_run=(None if secs["director"].get("regions_per_run") is None
                          else _pos_int(secs["director"], "director", "regions_per_run")),
         region_balance_since=_opt_date(secs["director"], "director", "region_balance_since"),
@@ -713,8 +730,9 @@ class ResearchRun:
         # one Critic per critic model, plus a rules-only Critic (None) for when they are down
         critic_models = (*m.critic, None) if agents.critic_model else (None,)
         rule = agents.sparse
-        sparse = ({None: rule.fields(self.field_meta),
-                   **{k: rule.fields(meta) for k, (_, meta) in self.markets.items()}}
+        base = spec.base_fields
+        sparse = ({None: rule.fields(self.field_meta, base),
+                   **{k: rule.fields(meta, base) for k, (_, meta) in self.markets.items()}}
                   if rule else {})
         cats = set(agents.price_categories)
         price = ({k: {f for f, x in meta.items() if (x or {}).get("category") in cats}
@@ -764,6 +782,13 @@ class ResearchRun:
         self.sim_queue: list[tuple[tuple, CandidateRecord, dict, bool]] = []
         self._in_flight = 0   # alphas of the current batch not decided yet (budget counts them)
         self._round_waves = 0  # repair waves started this round (repair.waves_per_round)
+        # the round's new-alpha slots not generated yet, {arm: slots} in allocation order;
+        # _run_fresh works through them, and a BRAIN slot freed mid-batch takes the next
+        # arm's share early (_fresh_for_freed)
+        self._fresh_left: dict[tuple, int] = {}
+        self._fresh_ctx: tuple = (0, {}, "", {})   # (round, round log, batch tag, arm index)
+        self._fresh_lost = 0       # slots of fresh_left lost to a down model / emptied by
+        self._fresh_emptied = 0    # drops while taken mid-batch (go to the round's refill)
         self.max_concurrent = max(1, config.simulator.max_concurrent)
         self.log: list[dict] = []
         self.stop_reason: str | None = None
@@ -801,6 +826,17 @@ class ResearchRun:
     def catalog_of(self, region: str, delay: int) -> tuple[list[str] | None, dict]:
         """(datafields, meta) for a market: its own catalog, else the --datafields one."""
         return self.markets.get((region, delay), (self.datafields, self.field_meta))
+
+    def token_stats(self) -> dict[str, dict]:
+        """{model: RequestFitClient.stats()} for the models whose client measures tokens."""
+        out = {}
+        for model, client in self._llms.items():
+            c = client
+            while c is not None and not hasattr(c, "stats"):
+                c = getattr(c, "inner", None)
+            if c is not None:
+                out[model] = c.stats()
+        return out
 
     def down(self) -> dict[str, str]:
         """Models out for the rest of the run, with the reason."""
@@ -897,9 +933,15 @@ class ResearchRun:
         # the region's own evidence from memory, refreshed every time, then the arm's guidance
         outcomes = self.memory.candidate_outcomes()
         notes = region_notes(outcomes, plan.settings.region)
-        self.generators[key].prod_failed = prod_correlation_fields(
-            outcomes, plan.settings.region, self.spec,
-            self.catalog_of(plan.settings.region, plan.settings.delay)[0])
+        region, delay = plan.settings.region, plan.settings.delay
+        fields = self.catalog_of(region, delay)[0]
+        gen = self.generators[key]
+        gen.prod_failed = prod_correlation_fields(outcomes, region, self.spec, fields)
+        # blend partners with shown signal, and this arm's latest results (owner 2026-11-25)
+        if gen.config.blend_partners:
+            gen.evidence = signal_evidence(outcomes, region, delay, self.spec, fields)
+        gen.history = arm_history(outcomes, plan.dataset, region, delay,
+                                  gen.config.history_in_prompt)
         bar = bar_text(self.seen_limits.get((plan.settings.region, plan.settings.delay), {}))
         bar = (f"- BRAIN's bar in this market ({plan.settings.region} delay "
                f"{plan.settings.delay}, from its checks on our alphas): {bar}.") if bar else None
@@ -1373,25 +1415,31 @@ class ResearchRun:
         # arm the Director gives no slot would otherwise never run its repairs
         cap = math.ceil(slots * self.agents.repair.max_share_per_round)
         first = self._take_repairs(min(cap, slots))
+        slots -= sum(len(c) for c in first.values())
+        # the new alphas' allocation is made before the repairs go to BRAIN, so a slot a
+        # finished repair frees can take new alphas at once (run rs20261125173606: new
+        # alphas waited ~30 min twice for a repair batch's timeouts while slots sat idle)
+        live = self._live_arms()
+        alloc = self._allocate(slots, live) if slots > 0 and live else {}
+        entry["allocation"] = {arm_label(k): n for k, n in alloc.items()}
+        repairs = sum(len(c) for c in first.values())
+        if live:
+            self._emit(f"--- round {r}: {f'{repairs} repair(s), then ' if repairs else ''}"
+                       f"{slots} new: {_slots_text(alloc) or 'none'}")
+        self._set_fresh(r, alloc, entry, "")
         for key, cands in first.items():
             arm_log = {"arm": arm_label(key), "slots": len(cands), "repairs_first": True}
             entry["arms"].append(arm_log)
             self._screen_and_simulate(key, cands, {}, arm_log)
             if self._committed() >= self.budget.max_simulations:
                 self.stop_reason = "simulation budget used up"
+                self._fresh_left = {}
                 return
-        slots -= sum(len(c) for c in first.values())
-        live = self._live_arms()
         if not live:
             self.stop_reason = "every generator model is down: " + "; ".join(
                 f"{m}: {why}" for m, why in self.counter.down.items())
             return
-        alloc = self._allocate(slots, live) if slots > 0 else {}
-        entry["allocation"] = {arm_label(k): n for k, n in alloc.items()}
-        repairs = sum(len(c) for c in first.values())
-        self._emit(f"--- round {r}: {f'{repairs} repair(s), then ' if repairs else ''}"
-                   f"{slots} new: {_slots_text(alloc) or 'none'}")
-        lost, emptied = self._run_allocation(r, alloc, entry, "")
+        lost, emptied = self._run_fresh()
         passes = 0
         while not self.stop_reason:
             spare = lost
@@ -1442,10 +1490,24 @@ class ResearchRun:
     def _run_allocation(self, r: int, alloc: dict, entry: dict, tag: str) -> tuple[int, int]:
         """Run each arm's slots. Returns (slots lost to a down generator model, slots
         emptied by the generator, Pre-Filter or Critic)."""
+        self._set_fresh(r, alloc, entry, tag)
+        return self._run_fresh()
+
+    def _set_fresh(self, r: int, alloc: dict, entry: dict, tag: str) -> None:
+        self._fresh_left = {k: n for k, n in alloc.items() if n}
+        self._fresh_ctx = (r, entry, tag, {k: i for i, k in enumerate(alloc)})
+        self._fresh_lost = self._fresh_emptied = 0
+
+    def _run_fresh(self) -> tuple[int, int]:
+        """Generate, screen and queue the arms left in ``_fresh_left``, one arm at a time
+        (a flush started by one arm may take later arms early, see ``_fresh_for_freed``).
+        Returns (slots lost to a down generator model, slots emptied by the generator,
+        Pre-Filter or Critic), counting arms taken mid-batch."""
+        r, entry, tag, index = self._fresh_ctx
         lost = emptied = 0
-        for i, (key, n) in enumerate(alloc.items()):
-            if n == 0:
-                continue
+        while self._fresh_left and not self.stop_reason:
+            key = next(iter(self._fresh_left))
+            n = self._fresh_left.pop(key)   # popped first: a flush inside may take others
             if key[3] in self.counter.down:  # went down earlier in this pass
                 lost += n
                 continue
@@ -1453,17 +1515,63 @@ class ResearchRun:
             if tag:
                 arm_log["refill"] = True
             entry["arms"].append(arm_log)
-            d, e = self._arm(r, i, key, n, arm_log, tag)
+            d, e = self._arm(r, index[key], key, n, arm_log, tag)
             lost, emptied = lost + d, emptied + e
             if self._committed() >= self.budget.max_simulations:
                 self.stop_reason = "simulation budget used up"
                 break
+        self._fresh_left = {}
+        lost, emptied = lost + self._fresh_lost, emptied + self._fresh_emptied
+        self._fresh_lost = self._fresh_emptied = 0
         return lost, emptied
+
+    def _fresh_for_freed(self, room: int,
+                         budget: int) -> list[tuple[tuple, CandidateRecord, dict]]:
+        """New alphas for BRAIN slots freed mid-batch: the next arms of the round's
+        allocation, generated whole (one Generator call per arm, as in ``_arm``) until at
+        least ``room`` are ready; extras wait in the simulator's queue for the next free
+        slot. At most ``budget`` alphas: (arm, alpha, arm log)."""
+        out: list[tuple[tuple, CandidateRecord, dict]] = []
+        if not self.agents.fresh_fill_freed_slots:
+            return out
+        r, entry, tag, index = self._fresh_ctx
+        while len(out) < room and self._fresh_left and not self.stop_reason:
+            left = budget - len(out)     # simulations the budget still allows
+            if left <= 0:
+                break
+            key = next(iter(self._fresh_left))
+            n = self._fresh_left.pop(key)
+            if key[3] in self.counter.down:
+                self._fresh_lost += n
+                continue
+            arm_log = {"arm": arm_label(key), "slots": n, "fresh_mid_batch": True}
+            if tag:
+                arm_log["refill"] = True
+            entry["arms"].append(arm_log)
+            lost, go = self._prepare_arm(r, index[key], key, n, arm_log, tag)
+            for c in go[left:]:            # over budget: not simulated
+                self._wave_done(c.candidate_id)
+            go = go[:left]
+            self._fresh_lost += lost
+            self._fresh_emptied += max(0, n - lost - len(go))
+            out += [(key, c, arm_log) for c in go]
+        if out:
+            self._emit(f"--- BRAIN: {len(out)} new alpha(s) for freed slots: "
+                       f"{', '.join(_short_id(c.candidate_id) for _, c, _ in out)}")
+        return out
 
     def _arm(self, r: int, i: int, key: tuple, n: int, log: dict,
              tag: str = "") -> tuple[int, int]:
         """Fill ``n`` slots of one arm. Returns (slots lost to a down generator model,
         slots emptied by the generator, Pre-Filter or Critic)."""
+        lost, go = self._prepare_arm(r, i, key, n, log, tag)
+        simulated = self._simulate_all(key, go, log)
+        return lost, max(0, n - lost - simulated)
+
+    def _prepare_arm(self, r: int, i: int, key: tuple, n: int, log: dict,
+                     tag: str = "") -> tuple[int, list[CandidateRecord]]:
+        """The arm's queued repairs plus new alphas for the rest of ``n`` slots, screened.
+        Returns (slots lost to a down generator model, alphas that may go to BRAIN)."""
         lost = 0
         queue = self.repair_queue[key]
         batch = [queue.popleft() for _ in range(min(n, len(queue)))]
@@ -1482,7 +1590,8 @@ class ResearchRun:
                 res = None
             except ModelDown as exc:  # the arm gets no more slots; the run goes on
                 log["generation_error"] = str(exc)
-                self._emit(f"{exc}; its arms get no more slots, these go to live arms")
+                self._emit(f"{exc}; these slots go to live arms" if isinstance(exc, RequestTooLarge)
+                           else f"{exc}; its arms get no more slots, these go to live arms")
                 res = None
                 lost = need
             if res is not None:
@@ -1490,13 +1599,15 @@ class ResearchRun:
                 rationales.update(res.rationales)
                 log["generated"] = len(res.candidates)
                 log["generator_rejected"] = len(res.rejected)
-        simulated = self._screen_and_simulate(key, batch, rationales, log)
-        return lost, max(0, n - lost - simulated)
+        return lost, self._screen(key, batch, rationales, log)
 
     def _screen_and_simulate(self, key: tuple, batch: list[CandidateRecord],
                              rationales: dict[str, str], log: dict) -> int:
         """Pre-Filter, Critic and judge, then simulate. Returns how many were simulated."""
-        go = self._screen(key, batch, rationales, log)
+        return self._simulate_all(key, self._screen(key, batch, rationales, log), log)
+
+    def _simulate_all(self, key: tuple, go: list[CandidateRecord], log: dict) -> int:
+        """Queue screened alphas for BRAIN within the budget. Returns how many."""
         simulated = 0
         for i, cand in enumerate(go):
             if self._committed() >= self.budget.max_simulations:
@@ -1605,10 +1716,11 @@ class ResearchRun:
         """Ready repair waves for ``free`` freed BRAIN slots (whole waves when they fit),
         screened like any repair, within the simulation budget: (arm, alpha, arm log)."""
         cap = min(free, self.budget.max_simulations - self._committed())
-        if cap <= 0 or not self.agents.repair.fill_freed_slots:
+        if cap <= 0:
             return []
         out = []
-        for key, cands in self._take_repairs(cap).items():
+        for key, cands in (self._take_repairs(cap).items()
+                           if self.agents.repair.fill_freed_slots else ()):
             arm_log = {"arm": arm_label(key), "slots": len(cands), "repairs_mid_batch": True}
             if self.log:
                 self.log[-1]["arms"].append(arm_log)
@@ -1620,6 +1732,9 @@ class ResearchRun:
         if out:
             self._emit(f"--- BRAIN: {len(out)} repair fix(es) join the running batch: "
                        f"{', '.join(_short_id(c.candidate_id) for _, c, _ in out)}")
+        if len(out) < cap:   # then the round's new alphas not generated yet
+            out += self._fresh_for_freed(
+                cap - len(out), self.budget.max_simulations - self._committed() - len(out))
         return out
 
     def _after_simulation(self, key: tuple, cand: CandidateRecord, log: dict, credit: bool,
@@ -1772,11 +1887,19 @@ class ResearchRun:
             # BRAIN's daily simulation limit after the last submit (X-Ratelimit-* headers)
             "brain_quota": dict(getattr(self.client, "quota", None) or {}),
             "power_pool_candidates": self.power_pool,
+            # how plain or crowded this run's fresh alphas were (quality.py; owner 2026-11-25)
+            "generation_quality": generation_quality(
+                self.memory.candidate_outcomes(), self.run_id, self.spec,
+                self.generator_config, self.catalog_of),
             "simulations_used": self.sims_used,
             "max_concurrent": self.max_concurrent,
             "model_calls": self.counter.calls,
             "model_calls_by_model": dict(self.counter.by_model),
             "models_down": self.down(),
+            # calls refused as too large per model, and what the size client measured
+            # (characters per token, largest prompt) for models with a per-minute token limit
+            "too_large_calls": dict(self.counter.too_large),
+            "prompt_tokens": self.token_stats(),
             "models": {"generator": list(self.models.generator),
                        "critic": [c for c in self.critics if c] if self.agents.critic_model else [],
                        "shadow_critics": self.models.shadow_critics,

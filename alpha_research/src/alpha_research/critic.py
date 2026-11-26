@@ -86,9 +86,13 @@ class SparseFieldRule:
     coverage_below: float | None = None
     lookback: int = 20
 
-    def fields(self, meta: Mapping[str, Mapping]) -> set[str]:
+    def fields(self, meta: Mapping[str, Mapping],
+               exempt: Collection[str] = ()) -> set[str]:
+        """Sparse field ids; ``exempt`` (the base price/volume fields) never count."""
         out = set()
         for f, m in (meta or {}).items():
+            if f in exempt:
+                continue
             cov = m.get("coverage")
             if m.get("category") in self.categories or (
                     self.coverage_below is not None and isinstance(cov, (int, float))

@@ -329,3 +329,17 @@ def test_reserved_variable_names_are_errors(spec):
     e = analyze("delta = ts_delta(close, 8); rank(delta)", spec).errors
     assert e == ["variable name 'delta' is reserved on BRAIN; choose another"]
     assert analyze("d = ts_delta(close, 8); rank(d)", spec).errors == []
+
+
+@pytest.mark.parametrize("expr,bad", [
+    ("group_rank(industry, -1 * returns)", True),        # BRAIN refused this (2026-11-25)
+    ("group_mean(returns, sector, sector)", True),       # group in the weight slot
+    ("group_rank(-returns, industry)", False),
+    ("group_backfill(close, industry, 20)", False),
+    ("group_mean(returns, cap, sector)", False),
+    ("group_cartesian_product(sector, country)", False),
+    ("g = sector; group_rank(close, g)", False),
+])
+def test_a_group_belongs_in_a_group_slot(spec, expr, bad):
+    errors = [e for e in analyze(expr, spec).errors if "is a group" in e]
+    assert bool(errors) == bad

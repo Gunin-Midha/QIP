@@ -79,6 +79,27 @@ class GeneratorConfig:
     # arm's dataset ("analyst", "pv", ...); "all" goes to every arm
     category_lessons: tuple[tuple[str, str], ...] = ()
     region_lessons: tuple[tuple[str, str], ...] = ()     # region -> text (BRAIN region guides)
+    # heavily used fields (crowding.heavy_alphas, owner 2026-11-25): at least this many BRAIN
+    # alphas use the field, whatever its dataset's other fields do. Unlike crowded fields
+    # they stay in their place in the list (in USA every option8 field is over 500, so
+    # ranking them last would hide the arm's own dataset), but they are tagged, never drawn
+    # for exploration or offered as blend partners, and cannot be an alpha's only signal
+    heavy_alphas: int | None = None
+    # structure of a fresh alpha (generator.yaml structure; None = off): signal sources = its
+    # distinct non-base signal fields, +1 when it reads a price/volume field
+    # (structure.price_fields); fewer than min_signal_sources, or (need_uncrowded) signal
+    # fields that are all crowded or heavily used, send the alpha back once with the reason
+    min_signal_sources: int | None = None
+    need_uncrowded: bool = False
+    price_fields: tuple[str, ...] = ()
+    # blend slots (generator.yaml blend): this share of each batch must read two datasets;
+    # the prompt offers up to blend_partners fields of other datasets that showed
+    # |Sharpe| >= partner_min_sharpe in our own alphas in the market
+    blend_share: float = 0.0
+    blend_partners: int = 0
+    partner_min_sharpe: float | None = None
+    # the arm's latest simulated alphas with BRAIN's numbers, shown in the request
+    history_in_prompt: int = 0
 
 
 def _cfg_int(d: dict, key: str, *, nullable: bool = False, minimum: int = 0) -> int | None:
@@ -121,7 +142,46 @@ def load_generator_config(path: str | Path) -> GeneratorConfig:
         **_cfg_crowding(g.get("crowding")),
         category_lessons=_cfg_lessons(g.get("category_lessons")),
         region_lessons=_cfg_lessons(g.get("region_lessons"), "region_lessons"),
+        **_cfg_structure(g.get("structure")),
+        **_cfg_blend(g.get("blend")),
+        history_in_prompt=_cfg_int(g, "history_in_prompt") if "history_in_prompt" in g else 0,
     )
+
+
+def _cfg_structure(raw) -> dict:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or set(raw) - {"min_signal_sources", "need_uncrowded",
+                                                "price_fields"}:
+        raise ConfigError("generator config: 'structure' may set min_signal_sources, "
+                          "need_uncrowded and price_fields")
+    n = raw.get("min_signal_sources")
+    if n is not None and (isinstance(n, bool) or not isinstance(n, int) or n < 1):
+        raise ConfigError("generator config: structure.min_signal_sources must be an "
+                          "integer >= 1 or null")
+    unc = raw.get("need_uncrowded", False)
+    if not isinstance(unc, bool):
+        raise ConfigError("generator config: structure.need_uncrowded must be true or false")
+    pf = raw.get("price_fields", [])
+    if not isinstance(pf, list) or not all(isinstance(x, str) and x for x in pf):
+        raise ConfigError("generator config: structure.price_fields must be a list of names")
+    return {"min_signal_sources": n, "need_uncrowded": unc, "price_fields": tuple(pf)}
+
+
+def _cfg_blend(raw) -> dict:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or set(raw) - {"share", "partners", "partner_min_sharpe"}:
+        raise ConfigError("generator config: 'blend' may set share, partners and "
+                          "partner_min_sharpe")
+    out = {"blend_share": _cfg_share(raw, "share"),
+           "blend_partners": _cfg_int(raw, "partners") if "partners" in raw else 0}
+    m = raw.get("partner_min_sharpe")
+    if m is not None and (isinstance(m, bool) or not isinstance(m, (int, float)) or m < 0):
+        raise ConfigError("generator config: blend.partner_min_sharpe must be a number >= 0 "
+                          "or null")
+    out["partner_min_sharpe"] = None if m is None else float(m)
+    return out
 
 
 def _cfg_lessons(raw, key: str = "category_lessons") -> tuple[tuple[str, str], ...]:
@@ -154,17 +214,21 @@ def lessons_for(config: "GeneratorConfig", category: str | None,
 def _cfg_crowding(raw) -> dict:
     if raw is None:
         return {}
-    if not isinstance(raw, dict) or set(raw) - {"percentile", "min_alphas"}:
-        raise ConfigError("generator config: 'crowding' must map 'percentile' and 'min_alphas'")
-    pct, low = raw.get("percentile"), raw.get("min_alphas", 0)
+    if not isinstance(raw, dict) or set(raw) - {"percentile", "min_alphas", "heavy_alphas"}:
+        raise ConfigError("generator config: 'crowding' must map 'percentile', 'min_alphas' "
+                          "and optionally 'heavy_alphas'")
+    pct, low, heavy = raw.get("percentile"), raw.get("min_alphas", 0), raw.get("heavy_alphas")
+    if heavy is not None and (isinstance(heavy, bool) or not isinstance(heavy, int) or heavy < 1):
+        raise ConfigError(f"generator config: crowding.heavy_alphas must be an integer >= 1 "
+                          f"or null, got {heavy!r}")
     if pct is None:
-        return {}
+        return {"heavy_alphas": heavy}
     if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not 0 <= pct <= 1:
         raise ConfigError(f"generator config: crowding.percentile must be in [0, 1], got {pct!r}")
     if isinstance(low, bool) or not isinstance(low, int) or low < 0:
         raise ConfigError(f"generator config: crowding.min_alphas must be an integer >= 0, "
                           f"got {low!r}")
-    return {"crowded_percentile": float(pct), "crowded_min_alphas": low}
+    return {"crowded_percentile": float(pct), "crowded_min_alphas": low, "heavy_alphas": heavy}
 
 
 def _cfg_roles(raw) -> dict:
@@ -259,7 +323,10 @@ def load_datafields(path: str | Path) -> list[str]:
 def load_datafield_meta(path: str | Path) -> dict[str, dict]:
     """Per-field facts from a JSON catalog written by ``cli brain datafields``: coverage
     (share of instruments with a value), alpha_count (BRAIN alphas using the field, a
-    crowding measure), dataset and its category (news, sentiment, ...). Empty for a catalog of bare ids or a text file."""
+    crowding measure), dataset and its category (news, sentiment, ...). Empty for a catalog of bare ids or a text file.
+    A coverage of exactly 0 is read as not reported (None): BRAIN's GBR and DEU catalogs
+    list every price/volume and fundamental field at 0.0 (2026-11-25), and a field with no
+    values could not be simulated at all."""
     if Path(path).suffix.lower() != ".json":
         return {}
     data = json.loads(Path(path).read_text())
@@ -272,7 +339,8 @@ def load_datafield_meta(path: str | Path) -> dict[str, dict]:
             ds, cat = x.get("dataset"), x.get("category")
             ds = ds.get("id") if isinstance(ds, dict) else ds
             facts = datasets.get(ds) or {}
-            meta[x["id"]] = {"coverage": x.get("coverage"), "alpha_count": x.get("alphaCount"),
+            cov = x.get("coverage")
+            meta[x["id"]] = {"coverage": None if cov == 0 else cov, "alpha_count": x.get("alphaCount"),
                              "dataset": ds,
                              "category": cat.get("id") if isinstance(cat, dict) else cat,
                              "type": x.get("type"), "description": x.get("description"),
@@ -441,6 +509,88 @@ def crowded_fields(meta: dict, percentile: float | None, min_alphas: int | None,
     return out
 
 
+def heavily_used(meta: dict, min_alphas: int | None, exclude: Collection[str] = ()) -> set[str]:
+    """Fields at least ``min_alphas`` BRAIN alphas use (``crowding.heavy_alphas``), whatever
+    the rest of their dataset looks like: the relative rule of ``crowded_fields`` finds none
+    in a dataset where every field is mined (run rs20261125130750: USA option8 skew with
+    1,350-2,000 alphas, AMR model39's value-momentum rank with 948 and production
+    correlation 0.91 were not flagged). Groups and ``exclude`` (base fields) are never
+    flagged. Empty when ``min_alphas`` is None."""
+    if min_alphas is None:
+        return set()
+    exclude = set(exclude)
+    return {f for f, m in meta.items()
+            if f not in exclude and (m or {}).get("type") != "GROUP"
+            and isinstance((m or {}).get("alpha_count"), (int, float))
+            and not isinstance(m.get("alpha_count"), bool) and m["alpha_count"] >= min_alphas}
+
+
+def crowd_sets(meta: dict, config: "GeneratorConfig", base_fields: Collection[str],
+               prod_failed: dict | None = None) -> tuple[set[str], set[str]]:
+    """(crowded, heavily used) fields of a market: crowded = relative rule plus fields of our
+    PROD_CORRELATION failures there (``prod_failed``); heavily used = absolute count."""
+    crowded = crowded_fields(meta, config.crowded_percentile, config.crowded_min_alphas,
+                             base_fields) | {f for f, n in (prod_failed or {}).items() if n}
+    return crowded, heavily_used(meta, config.heavy_alphas, base_fields)
+
+
+def signal_profile(fields_used: Collection[str], base_fields: Collection[str], meta: dict,
+                   config: "GeneratorConfig", crowded: Collection[str] = (),
+                   heavy: Collection[str] = ()) -> dict:
+    """What an alpha's signal is built from. ``fields``: its non-base fields that carry a
+    signal (not groups, not identifiers); ``price``: whether it reads a price/volume field
+    (``structure.price_fields``; cap and adv20 usually only scale or tilt, so they are left
+    out of that list); ``sources`` = len(fields) + price; ``datasets``: the fields'
+    datasets, plus "price/volume" when ``price``; ``fresh``: signal fields neither crowded
+    nor heavily used; ``max_alphas``: the most BRAIN alphas any of its signal fields has."""
+    base = set(base_fields)
+    fields = sorted(f for f in set(fields_used) if f not in base
+                    and (meta.get(f) or {}).get("type") != "GROUP"
+                    and field_role(f, meta, config) != "id")
+    price = any(f in config.price_fields for f in fields_used)
+    datasets = {(meta.get(f) or {}).get("dataset") or f"?{f}" for f in fields}
+    if price:
+        datasets.add("price/volume")
+    counts = [n for f in fields if isinstance(n := (meta.get(f) or {}).get("alpha_count"),
+                                              (int, float))]
+    unused = set(crowded) | set(heavy)
+    return {"fields": fields, "price": price, "sources": len(fields) + int(price),
+            "datasets": sorted(datasets), "fresh": [f for f in fields if f not in unused],
+            "max_alphas": max(counts) if counts else None}
+
+
+def structure_errors(profile: dict, meta: dict, config: "GeneratorConfig") -> list[str]:
+    """Why a fresh alpha's structure is too plain (``structure`` in generator.yaml), as
+    send-back messages; [] when it passes or the rule is off. Run rs20261125130750: 46% of its
+    fresh alphas had one source or none, and its best one-source lead failed production
+    correlation (0.91); all five alphas we accepted combine two or more. In memory the
+    rule does not pick out higher-Sharpe fresh alphas (mean |Sharpe| 0.60 passing vs 0.64
+    failing, 2026-11-25): it is a guard on novelty, judged by ``cli quality`` over runs."""
+    need = config.min_signal_sources
+    if need is None:
+        return []
+    errs = []
+    if profile["sources"] < need:
+        if not profile["fields"]:
+            errs.append("uses only price/volume fields: these are the most common production "
+                        "alphas; add a part from another dataset (analyst, fundamental, model, "
+                        "options, ...) at about equal weight")
+        else:
+            one = profile["fields"][0]
+            errs.append(f"one signal source ({one}"
+                        + (" with price" if profile["price"] else "")
+                        + f"): fewer than {need} independent sources; single-field forms are "
+                        "mostly in BRAIN's production alphas already. Add a second field that "
+                        "carries different information (another dataset, or a field that "
+                        "conditions or scales this one)")
+    if config.need_uncrowded and profile["fields"] and not profile["fresh"]:
+        shown = ", ".join(f"{f}: {(meta.get(f) or {}).get('alpha_count', '?')} alphas"
+                          for f in profile["fields"])
+        errs.append(f"every signal field is crowded or heavily used ({shown}): keep one as a "
+                    "part if you like, and build the idea on a less used field")
+    return errs
+
+
 # words that say nothing about which field a hypothesis needs
 _STOPWORDS = frozenset("""
     the and for are was were has have had not but its into than that this these those then
@@ -535,7 +685,8 @@ def select_datafields(catalog: Collection[str], text: str, limit: int,
                       explore_share: float = 0.0, meta: dict | None = None,
                       config: "GeneratorConfig | None" = None,
                       crowded: Collection[str] = (), plain: Collection[str] = (),
-                      dataset: str | None = None) -> tuple[list[str], list[str]]:
+                      dataset: str | None = None,
+                      heavy: Collection[str] = ()) -> tuple[list[str], list[str]]:
     """(relevant, exploration) fields for the prompt. Fields the task names come first;
     then ``_rank_datafields``; the exploration part (``explore_share`` of ``limit``) is
     drawn from the rest of the catalog one dataset at a time in turn, so every dataset can
@@ -543,10 +694,12 @@ def select_datafields(catalog: Collection[str], text: str, limit: int,
     score above the catalog's median give two fields per turn. Fields within a dataset (and
     the dataset order without facts) are fixed by the text (the same task sees the same fields).
     Identifier/text fields (``field_role`` 'id') are left out unless the task names them;
-    ``crowded`` fields rank last and are never drawn for exploration. ``plain`` (base
+    ``crowded`` fields rank last and are never drawn for exploration; ``heavy`` (heavily
+    used) fields keep their rank but are never drawn for exploration either. ``plain`` (base
     fields and groups) never count as named."""
     meta = meta or {}
     crowded = set(crowded)
+    heavy = set(heavy)
     catalog = set(catalog)
     named = named_fields(catalog, text, plain)
     pool = [f for f in catalog if f in named or field_role(f, meta, config) != "id"]
@@ -558,7 +711,7 @@ def select_datafields(catalog: Collection[str], text: str, limit: int,
     rng = random.Random(hashlib.sha1(text.encode()).hexdigest())
     by_ds: dict[str, list[str]] = {}
     for f in sorted(pool):
-        if (f not in chosen and f not in crowded
+        if (f not in chosen and f not in crowded and f not in heavy
                 and (meta.get(f) or {}).get("type") not in NOT_SIGNALS):
             by_ds.setdefault((meta.get(f) or {}).get("dataset") or "unknown", []).append(f)
     for fields in by_ds.values():
@@ -583,7 +736,8 @@ def select_datafields(catalog: Collection[str], text: str, limit: int,
 
 
 def _annotate(name: str, meta: dict, config: "GeneratorConfig | None" = None,
-              crowded: Collection[str] = (), prod_failed: dict | None = None) -> str:
+              crowded: Collection[str] = (), prod_failed: dict | None = None,
+              heavy: Collection[str] = ()) -> str:
     m = meta.get(name) or {}
     bits = [TYPE_HINTS[m["type"]]] if m.get("type") in TYPE_HINTS else []
     role = field_role(name, meta, config)
@@ -595,6 +749,8 @@ def _annotate(name: str, meta: dict, config: "GeneratorConfig | None" = None,
         bits.append(f"{m['alpha_count']} alphas")
     if name in crowded:
         bits.append("crowded")
+    elif name in heavy:
+        bits.append("heavily used")
     if (prod_failed or {}).get(name):
         bits.append(f"{prod_failed[name]} of ours failed production correlation")
     return f"{name} [{', '.join(bits)}]" if bits else name
@@ -631,10 +787,12 @@ def build_system_prompt(spec: FastExprSpec, datafields: Collection[str] | None,
                         guidance: str | None = None, meta: dict | None = None,
                         neutralizations: Sequence[str] = (), market: str | None = None,
                         prod_failed: dict | None = None, dataset: str | None = None,
-                        lessons: Sequence[str] = ()) -> str:
+                        lessons: Sequence[str] = (),
+                        partners: Sequence[tuple[str, float]] = ()) -> str:
     """``prod_failed``: {field: our alphas using it that failed BRAIN's PROD_CORRELATION}
     in this market (memory); those fields count as crowded too. ``dataset``: the arm's,
-    listed first."""
+    listed first. ``partners``: (field of another dataset, best |Sharpe| of our alphas using
+    it in this market), offered for blends."""
     lines = [
         "You are a quantitative researcher writing alpha expressions for the WorldQuant "
         "BRAIN platform, in the Fast Expression language.",
@@ -684,18 +842,17 @@ def build_system_prompt(spec: FastExprSpec, datafields: Collection[str] | None,
     if datafields is not None:
         meta = meta or {}
         prod_failed = {f: n for f, n in (prod_failed or {}).items() if n}
-        crowded = (crowded_fields(meta, config.crowded_percentile, config.crowded_min_alphas,
-                                  spec.base_fields) | set(prod_failed))
+        crowded, heavy = crowd_sets(meta, config, spec.base_fields, prod_failed)
         plain = {*spec.base_fields, *spec.groups,
                  *(f for f, m in meta.items() if (m or {}).get("type") == "GROUP")}
         shown, explore = select_datafields(datafields, relevance_text,
                                            config.max_datafields_in_prompt,
                                            config.datafield_exploration_share, meta, config,
-                                           crowded, plain, dataset)
+                                           crowded, plain, dataset, heavy)
         named = named_fields(set(datafields), relevance_text, plain)
 
         def note(f: str) -> str:
-            return _annotate(f, meta, config, crowded, prod_failed)
+            return _annotate(f, meta, config, crowded, prod_failed, heavy)
 
         if named:
             lines.append("Fields named in the task (build the signal on these; use other "
@@ -725,6 +882,24 @@ def build_system_prompt(spec: FastExprSpec, datafields: Collection[str] | None,
                          "name are listed last, if at all. If you use a crowded field, do not write its common form "
                          "(its plain level, change or ratio, ranked); combine or condition it "
                          "with less used fields so the result is a different idea.")
+        if heavy & {*named, *shown, *explore}:
+            lines.append(f"heavily used = at least {config.heavy_alphas} BRAIN alphas use the "
+                         "field: usable as one part, never as the whole idea.")
+        if partners:
+            lines.append("Fields from other datasets that showed signal in our own alphas in "
+                         "this market (best |Sharpe| of an alpha using them; a negative "
+                         "Sharpe means that alpha had the direction backwards), good second "
+                         "parts for a blend: "
+                         + ", ".join(f"{_annotate(f, meta, config)} |Sharpe| {v:.2f}"
+                                     for f, v in partners))
+        if config.min_signal_sources is not None and meta:
+            lines.append(
+                f"Every alpha must combine at least {config.min_signal_sources} independent "
+                "sources of information: distinct signal fields beyond the base fields, with "
+                "price/volume (" + ", ".join(config.price_fields) + ") counting as one source"
+                + ("; at least one signal field must be neither crowded nor heavily used"
+                   if config.need_uncrowded else "")
+                + ". An alpha that breaks this is sent back.")
     else:
         lines.append("No datafield catalog was supplied. Prefer the base fields. Any other "
                      "datafield name you use may not exist on the platform and will be "
@@ -764,14 +939,39 @@ _ALPHA_FORMAT = (
     '"neutralization_reason": "<one line; required for a factor neutralization or NONE>"}]}')
 
 
-def _generate_prompt(hypothesis: str, context: str | None, k: int) -> str:
+def blend_count(k: int, share: float) -> int:
+    """Alphas of a batch of ``k`` that must read two datasets: ``share`` of k, rounded half
+    up (k = 2 at 0.25 gives 1, k = 1 gives 0)."""
+    return int(math.floor(k * share + 0.5)) if share > 0 else 0
+
+
+def _generate_prompt(hypothesis: str, context: str | None, k: int, blends: int = 0,
+                     history: Sequence[str] = ()) -> str:
     ctx = f"<context>\n{context}\n</context>\n" if context else ""
+    past = ""
+    if history:
+        past = ("<history>\n" + "\n".join(history) + "\n</history>\n"
+                "The history lists this arm's latest alphas with what BRAIN measured (data, "
+                "newest first). Do not write them again or small variants of them (another "
+                "window, peer group or smoothing); keep fields and ideas that showed signal "
+                "(|Sharpe| near 1 or more; a strong negative Sharpe means the direction was "
+                "backwards) and drop those that did not. A high production correlation (PROD) "
+                "means the idea is already in BRAIN's production alphas.\n\n")
+    blend = ""
+    if blends:
+        blend = (f"At least {blends} of the {k} must be a blend across datasets: the main "
+                 "signal plus a part from another dataset that carries different information "
+                 "(for example rank(main) + w * rank(part), or the part conditioning or "
+                 "scaling the main signal), each part ranked the same way, a missing part "
+                 "value set to the middle rank (e.g. ts_backfill, or 0.5 for a missing rank). "
+                 "Prefer a part listed as having shown signal in our alphas, or a little-used "
+                 "field of another dataset.\n")
     return (
-        f"<hypothesis>\n{hypothesis}\n</hypothesis>\n{ctx}\n"
+        f"<hypothesis>\n{hypothesis}\n</hypothesis>\n{ctx}\n{past}"
         f"Write {k} distinct alpha expressions that test this hypothesis. Vary the datafields, "
         "the transformation, the window lengths and the way the signal is normalized; do not "
         "just change one number. Each must be a complete expression that can be pasted into "
-        "BRAIN as it is.\n\n" + _ALPHA_FORMAT)
+        "BRAIN as it is.\n" + blend + "\n" + _ALPHA_FORMAT)
 
 
 def _repair_prompt(hypothesis: str, bad: list[Rejected]) -> str:
@@ -902,6 +1102,13 @@ class AlphaGenerator:
         # {field: our alphas on it that failed PROD_CORRELATION in this market}; the
         # research loop refreshes it from memory before each batch
         self.prod_failed: dict[str, int] = {}
+        # {field: best |Sharpe| (raw or risk-neutralized) of our alphas using it in this
+        # market} and this arm's latest results as prompt lines; refreshed by the research
+        # loop before each batch (strategy.signal_evidence, strategy.arm_history)
+        self.evidence: dict[str, float] = {}
+        self.history: list[str] = []
+        self._crowded: set[str] = set()
+        self._heavy: set[str] = set()
 
     # ------------------------------------------------------------------ public
 
@@ -964,8 +1171,35 @@ class AlphaGenerator:
         result.hypotheses.extend(u.hypothesis for u in units)
         return units
 
+    def partners(self) -> list[tuple[str, float]]:
+        """Blend partners for the prompt: fields of another dataset than the arm's that
+        showed |Sharpe| >= ``blend.partner_min_sharpe`` in our alphas in this market
+        (``evidence``), in the catalog, carrying a signal, neither crowded nor heavily used;
+        strongest first, then fewest BRAIN alphas; at most ``blend.partners``."""
+        cfg, meta = self.config, self.field_meta
+        if not cfg.blend_partners or cfg.partner_min_sharpe is None or not meta:
+            return []
+        known = set(self.datafields or meta)
+        out = [(f, v) for f, v in self.evidence.items()
+               if v >= cfg.partner_min_sharpe and f in known
+               and f not in self.spec.base_fields and f not in self._crowded
+               and f not in self._heavy
+               and (meta.get(f) or {}).get("dataset") not in (None, self.settings.dataset)
+               and (meta.get(f) or {}).get("type") != "GROUP"
+               and field_role(f, meta, cfg) == "signal"]
+
+        def used(f: str) -> float:
+            n = (meta.get(f) or {}).get("alpha_count")
+            return float(n) if isinstance(n, (int, float)) else float("inf")
+
+        out.sort(key=lambda fv: (-fv[1], used(fv[0]), fv[0]))
+        return out[:cfg.blend_partners]
+
     def _generate_unit(self, unit: _Unit, k: int, result: GenerationResult) -> None:
         relevance = unit.hypothesis + " " + (unit.context or "")
+        self._crowded, self._heavy = crowd_sets(self.field_meta, self.config,
+                                                self.spec.base_fields, self.prod_failed)
+        blends = blend_count(k, self.config.blend_share) if self.field_meta else 0
         system = build_system_prompt(self.spec, self.datafields, relevance, self.config,
                                      self.guidance, self.field_meta,
                                      neutralizations_for(self.settings.region),
@@ -976,8 +1210,11 @@ class AlphaGenerator:
                                      lessons=lessons_for(self.config, dataset_category(
                                          self.settings.dataset, self.field_meta),
                                          self.settings.region)
-                                     + list(self.learned))
-        reply = self._ask_json(system, _generate_prompt(unit.hypothesis, unit.context, k), result)
+                                     + list(self.learned),
+                                     partners=self.partners())
+        history = self.history[:self.config.history_in_prompt]
+        reply = self._ask_json(system, _generate_prompt(unit.hypothesis, unit.context, k,
+                                                        blends, history), result)
         good, bad = self._check(self._items(reply), unit)
 
         for _ in range(self.config.max_repair_rounds):
@@ -989,11 +1226,16 @@ class AlphaGenerator:
             good += more
 
         result.rejected.extend(bad)
-        admitted = 0
+        admitted = cross = 0
         for draft in good:
             if admitted >= k:  # surplus is dropped without being marked as seen
                 break
-            admitted += self._admit(draft, unit, result)
+            added = self._admit(draft, unit, result)
+            admitted += added
+            cross += added and len(self._profile(draft.analysis)["datasets"]) >= 2
+        if blends and cross < blends:
+            result.notes.append(f"{cross} of {admitted} alphas read two datasets "
+                                f"({blends} asked)")
 
     def _ask_json(self, system: str, user: str, result: GenerationResult):
         try:
@@ -1022,7 +1264,7 @@ class AlphaGenerator:
             expr = expr.strip()
             a = analyze(expr, self.spec, datafields=self.catalog,
                         limits=self.config.limits)
-            errors = list(a.errors) or self._role_errors(a)
+            errors = list(a.errors) or self._role_errors(a) or self._structure_errors(a)
             if not errors:
                 good.append(_Draft(expr, raw, a))
             else:
@@ -1037,6 +1279,17 @@ class AlphaGenerator:
             return [f"uses only identifier/text fields ({', '.join(ids)}): they carry no ranking "
                     "information; build the signal on a measured quantity"]
         return []
+
+    def _profile(self, a: Analysis) -> dict:
+        return signal_profile(a.fields_used, self.spec.base_fields, self.field_meta,
+                              self.config, self._crowded, self._heavy)
+
+    def _structure_errors(self, a: Analysis) -> list[str]:
+        """``structure_errors`` for a fresh alpha; only with BRAIN's field facts (a catalog
+        with types and alpha counts), which tell signal fields and crowding apart."""
+        if not self.field_meta:
+            return []
+        return structure_errors(self._profile(a), self.field_meta, self.config)
 
     def _admit(self, draft: _Draft, unit: _Unit, result: GenerationResult) -> int:
         """Add one candidate. Returns 1 if it was added, 0 if rejected or a duplicate."""

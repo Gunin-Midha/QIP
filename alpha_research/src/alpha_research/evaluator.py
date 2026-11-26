@@ -84,6 +84,12 @@ BRAIN_CHECK_TO_CLASS = {
     # limit 1.0). A sub-universe question too; as class "other" it had no levers and blocked
     # every repair of the best ASI lead in run rs20261125111614 (owner 2026-11-25)
     "LOW_ASI_JPN_SHARPE": "sub_universe",
+    # GLB: the alpha must also hold in each of the region's parts (value = that part's
+    # Sharpe, limit 1.0). As "other" these blocked every GLB repair: 28-29 of our 29 GLB
+    # alphas failed each of them by 2026-11-25 (owner 2026-11-25)
+    "LOW_GLB_AMER_SHARPE": "sub_universe",
+    "LOW_GLB_APAC_SHARPE": "sub_universe",
+    "LOW_GLB_EMEA_SHARPE": "sub_universe",
 }
 BRAIN_GATE_PREFIX = "brain:"
 
@@ -274,11 +280,18 @@ def risk_neutralized_sharpe(result: ResultRecord | None) -> float | None:
     return ((result.alt_stats or {}).get("risk_neutralized") or {}).get("sharpe")
 
 
+def _risk_neutralized(result: ResultRecord | None, key: str) -> float | None:
+    if result is None:
+        return None
+    v = ((result.alt_stats or {}).get("risk_neutralized") or {}).get(key)
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
 def near_miss(failed: list[GateResult], failure_class: str,
               shares: dict | None, result: ResultRecord | None = None, *,
               sign_mirrors: bool = True) -> tuple[bool, str | None]:
     """(repairable, reason). A class without a configured share is always repairable. For
-    Sharpe the larger of |raw| and |risk-neutralized| counts: a signal hidden under BRAIN's
+    Sharpe and fitness the larger of |raw| and |risk-neutralized| counts: a signal hidden under BRAIN's
     risk factors is a near miss that a factor neutralization can uncover. Without
     ``sign_mirrors`` (``schemas.SHORT_RESTRICTED_REGIONS``: the opposite alpha does not flip
     the performance) values count with their sign, so a negative one is no near miss."""
@@ -286,7 +299,10 @@ def near_miss(failed: list[GateResult], failure_class: str,
     share = (shares or {}).get(failure_class)
     if share is None:
         return True, None
-    rn = risk_neutralized_sharpe(result) if failure_class == "sharpe" else None
+    # fitness too (2026-11-25): the EUR accept's ancestor had raw fitness 0.41 but
+    # risk-neutralized 0.96, and its neutralized child reached 1.30
+    rn = (risk_neutralized_sharpe(result) if failure_class == "sharpe" else
+          _risk_neutralized(result, "fitness") if failure_class == "fitness" else None)
     for g in failed:
         if check_class(g.name) != failure_class or g.value is None or g.threshold is None:
             continue
@@ -363,10 +379,18 @@ def decide(result: ResultRecord, gates: list[GateResult], playbook: Playbook,
             reasons.append(route)
         if not playbook.has_entry(failure_class):
             return record("reject", failure_class, reasons + [f"no playbook entry for {failure_class}"])
-        ok, why = near_miss(failed, failure_class, near_miss_share, result,
-                            sign_mirrors=sign_mirrors)
-        if not ok:
-            return record("reject", failure_class, reasons + [why])
+        # every failing class with a near-miss limit must be a near miss, not only the one
+        # repaired first (owner 2026-11-25: rs20261125130750r01a1_003, Sharpe -0.59 and
+        # fitness -0.12, went to repair / turnover because only turnover was checked)
+        classes = [failure_class] + sorted({check_class(g.name) for g in failed} - {failure_class})
+        if route and route.startswith(FACTOR_FIRST):
+            # the factor neutralization changes every raw measure; recent-years Sharpe has no
+            # risk-neutralized value to judge it by, so it does not reject here
+            classes = [c for c in classes if c != "recent_sharpe"]
+        for cls in classes:
+            ok, why = near_miss(failed, cls, near_miss_share, result, sign_mirrors=sign_mirrors)
+            if not ok:
+                return record("reject", cls, reasons + [why])
         return record("repair", failure_class, reasons + [f"playbook has {failure_class} levers"])
 
     if risk_veto:

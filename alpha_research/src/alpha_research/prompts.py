@@ -28,7 +28,7 @@ PROMPT_VERSIONS = {
     "critic": "critic-v6",
     "judge": "judge-v4",
     "repair": "repair-v10",
-    "strategy": "strategy-v6",
+    "strategy": "strategy-v7",
     "lessons": "lessons-v3",
 }
 
@@ -451,7 +451,7 @@ Diversity comes first while accepts are few: a handful of accepts is not enough 
 
 
 def strategy_user(summary: dict, max_hypotheses: int) -> str:
-    return (f"<records>\n{json.dumps(summary, indent=1, default=str)}\n</records>\n\n"
+    return (f"<records>\n{json.dumps(summary, separators=(',', ':'), default=str)}\n</records>\n\n"
             f"Propose at most {max_hypotheses} new hypotheses.")
 
 

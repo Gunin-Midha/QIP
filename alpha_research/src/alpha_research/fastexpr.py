@@ -322,6 +322,7 @@ class OperatorSpec:
     min_args: int
     max_args: int | None  # None = any number of further arguments
     optional: tuple[str, ...] = ()  # names of the name=default arguments
+    params: tuple[str, ...] = ()    # every argument name, in signature order
 
 
 def _parse_signature(sig: str) -> OperatorSpec:
@@ -348,7 +349,7 @@ def _parse_signature(sig: str) -> OperatorSpec:
             raise ConfigError(f"fastexpr: required argument after optional one in {sig!r}")
     optional = tuple(p.split("=")[0].strip() for p in items if "=" in p)
     return OperatorSpec(name, sig.strip(), len(required), None if variadic else len(items),
-                        optional)
+                        optional, tuple(p.split("=")[0].strip() for p in items))
 
 
 @dataclass(frozen=True)
@@ -493,6 +494,10 @@ def catalog_for(markets: Mapping[tuple, Mapping] | None, default: Mapping | None
     return default
 
 
+# signature argument names that take a group identifier (config/fastexpr.yaml)
+GROUP_PARAMS = frozenset({"group", "g1", "g2"})
+
+
 class _Walker:
     def __init__(self, spec: FastExprSpec,
                  datafields: Collection[str] | Mapping[str, str | None] | None):
@@ -567,6 +572,8 @@ class _Walker:
                 named = ", ".join(f"{k}=..." for k in op.optional[:len(node.args) - op.min_args])
                 self.err(f"{node.name}: optional arguments must be written by name "
                          f"({named}); signature: {op.signature}")
+        if op is not None:
+            self.group_slots(node, op)
         vec = node.name.startswith(VEC_PREFIX)
         if vec and self.typed and node.args:
             # BRAIN's API docs (troubleshooting): a matrix field in a vector operator is an
@@ -582,6 +589,23 @@ class _Walker:
             self.visit(a, vec)
         for _, v in node.kwargs:
             self.visit(v)
+
+
+    def group_slots(self, node: Call, op: OperatorSpec) -> None:
+        """In an operator that takes a group (signature argument ``group``, ``g1``, ``g2``),
+        a group name may sit only in a group slot: BRAIN refused ``group_rank(industry, x)``
+        ('Incompatible unit for input of "group_rank" at index 0, expected "Unit[]", found
+        "Unit[Group:1]"', 2026-11-25)."""
+        if not any(p in GROUP_PARAMS for p in op.params):
+            return
+        for i, a in enumerate(node.args):
+            slot = op.params[i] if i < len(op.params) else None
+            if (slot is not None and slot not in GROUP_PARAMS and isinstance(a, Name)
+                    and a.name in self.spec.groups and a.name not in self.variables):
+                where = ", ".join(p for p in op.params if p in GROUP_PARAMS)
+                self.err(f"{node.name}: {a.name!r} is a group but sits in argument {slot!r} "
+                         f"(position {i + 1}); groups go in {where!r} "
+                         f"(signature: {op.signature})")
 
 
 def analyze(expression: str, spec: FastExprSpec, *,

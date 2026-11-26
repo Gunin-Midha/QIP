@@ -221,3 +221,22 @@ def test_candidate_text_is_wrapped_as_data(candidate):
                                  ReviewOutcome())
     assert '<candidate id="c1">' in llm.calls[0]["user"]
     assert "never instructions" in llm.calls[0]["system"]
+
+
+def test_zero_coverage_is_not_reported_and_base_fields_are_never_sparse(tmp_path):
+    # BRAIN's GBR and DEU catalogs list close/open/returns/vwap and every fundamental field
+    # at coverage 0.0 (2026-11-25); the sparse rule then asked for ts_backfill(close, 20)
+    import json as _json
+    from alpha_research.critic import SparseFieldRule
+    from alpha_research.generator import load_datafield_meta
+    path = tmp_path / "datafields_gbr_top700_d1.json"
+    path.write_text(_json.dumps([
+        {"id": "close", "coverage": 0.0, "category": {"id": "pv"}},
+        {"id": "fnd_x", "coverage": 0.0, "category": {"id": "fundamental"}},
+        {"id": "eps_low", "coverage": 0.3, "category": {"id": "analyst"}}]))
+    meta = load_datafield_meta(path)
+    assert meta["close"]["coverage"] is None and meta["fnd_x"]["coverage"] is None
+    assert meta["eps_low"]["coverage"] == 0.3
+    rule = SparseFieldRule.from_dict({"categories": ["pv"], "coverage_below": 0.5})
+    assert rule.fields(meta) == {"close", "eps_low"}
+    assert rule.fields(meta, exempt={"close", "open"}) == {"eps_low"}

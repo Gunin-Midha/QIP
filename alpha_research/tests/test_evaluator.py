@@ -50,9 +50,21 @@ def test_negative_sharpe_goes_to_the_sign_flip_before_turnover(config, playbook)
     # a positive near miss keeps the usual priority (turnover first)
     assert evaluate(passing(sharpe=1.10, turnover=0.85), config, playbook).failure_class == \
         "turnover"
-    # a far miss is not rerouted
-    assert evaluate(passing(sharpe=-0.30, turnover=0.85), config, playbook).failure_class == \
-        "turnover"
+    # a far Sharpe miss is not rerouted, and it is rejected even though turnover (the class
+    # repaired first) has no near-miss limit (owner 2026-11-25)
+    d = evaluate(passing(sharpe=-0.30, turnover=0.85), config, playbook)
+    assert (d.decision, d.failure_class) == ("reject", "sharpe")
+    assert any("too far" in r for r in d.reasons)
+
+
+def test_every_failing_class_must_be_a_near_miss(config, playbook):
+    # rs20261125130750r01a1_003: Sharpe -0.59, fitness -0.12, turnover 78% was
+    # "repair / turnover" because only turnover's (absent) limit was checked
+    d = evaluate(passing(sharpe=0.40, fitness=-0.12, turnover=0.78), config, playbook)
+    assert (d.decision, d.failure_class) == ("reject", "fitness")   # checked first by name
+    # near misses on every limited class: still repaired, primary class first
+    d = evaluate(passing(sharpe=1.20, fitness=0.80, turnover=0.78), config, playbook)
+    assert (d.decision, d.failure_class) == ("repair", "turnover")
 
 
 def rn(sharpe):
@@ -174,3 +186,23 @@ def test_screenshot_fixture_accepts_before_risk(make_config, playbook):
 
 def test_classify_none_when_nothing_failed():
     assert classify([GateResult("sharpe", True)]) == "none"
+
+
+def test_factor_first_alphas_are_judged_on_risk_neutralized_fitness(playbook):
+    # rs20261114174347r01a27_001_c1, the EUR accept's ancestor: raw Sharpe 0.91 / fitness
+    # 0.41 / 2-year Sharpe -0.47, risk-neutralized 2.28 / 0.96; its STATISTICAL child reached
+    # 2.71 / 1.30. The every-class rule must not reject it.
+    from alpha_research.evaluator import decide
+    from alpha_research.schemas import GateResult, ResultRecord
+    gates = [GateResult("brain:LOW_SHARPE", False, 0.91, 1.58, ""),
+             GateResult("brain:LOW_FITNESS", False, 0.41, 1.0, ""),
+             GateResult("brain:LOW_2Y_SHARPE", False, -0.47, 1.58, "")]
+    shares = {"sharpe": 0.6, "fitness": 0.5, "recent_sharpe": 0.6}
+    r = ResultRecord("c1", "complete", sharpe=0.91, fitness=0.41,
+                     alt_stats={"risk_neutralized": {"sharpe": 2.28, "fitness": 0.96}})
+    d = decide(r, gates, playbook, near_miss_share=shares, risk_neutralized_gap=0.5)
+    assert (d.decision, d.failure_class) == ("repair", "sharpe")
+    # without BRAIN's risk-neutralized edge the same raw numbers are a far miss
+    plain = ResultRecord("c1", "complete", sharpe=0.91, fitness=0.41)
+    assert decide(plain, gates, playbook, near_miss_share=shares,
+                  risk_neutralized_gap=0.5).decision == "reject"

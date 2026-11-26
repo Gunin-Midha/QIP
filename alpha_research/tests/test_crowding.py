@@ -18,7 +18,8 @@ from conftest import ROOT
 from test_research import make_run
 
 SPEC = FastExprSpec.load(ROOT / "config" / "fastexpr.yaml")
-GEN = load_generator_config(ROOT / "config" / "generator.yaml")
+# single-field test alphas: the structure rule is tested in test_generator_quality.py
+GEN = replace(load_generator_config(ROOT / "config" / "generator.yaml"), min_signal_sources=None)
 
 
 def _meta(counts: dict[str, int], dataset: str = "anl") -> dict:

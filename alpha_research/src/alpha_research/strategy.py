@@ -30,6 +30,7 @@ to the model inside <records> tags marked as data. The prompts are in prompts.py
 
 from __future__ import annotations
 
+import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
@@ -48,6 +49,10 @@ class StrategyConfig:
     # arms for datasets no arm covers, per evolution (2026-11-14: one evolution added 140
     # arms for a 20-simulation run, so the Director could not learn which were good)
     max_new_arms: int = 8
+    # whole prompt (system + records) cut to about this many characters by trimmed_summary;
+    # None = no cut. Run rs20261125130750: an 11,000-token Strategy request was refused by
+    # both Groq models (8,000 and 7,000 tokens a minute) and took both down.
+    max_prompt_chars: int | None = None
 
 
 @dataclass
@@ -131,6 +136,49 @@ def summarize(outcomes: list[dict], *, top_n: int = 5,
         "what_fixes_worked": [{k: r[k] for k in ("failure_class", "lever", "fixed", "posterior_mean")}
                               for r in worked[:8]],
     }
+
+
+def trimmed_summary(summary: dict, max_chars: int) -> dict:
+    """``summary`` cut until its compact JSON is at most ``max_chars`` characters, least
+    useful parts first: older recent failures (2 kept), the arms and families with the
+    fewest decided alphas (5 kept), each region's dataset list (top 5), the weaker best
+    accepted (2 kept), lever records (3 kept), the dataset counts (top 10). Totals, failure
+    classes, least-tried datasets and submissions are never cut. Returns a new dict; the
+    result can stay larger than ``max_chars`` when nothing more can go."""
+    s = json.loads(json.dumps(summary, default=str))
+
+    def size() -> int:
+        return len(json.dumps(s, separators=(",", ":"), default=str))
+
+    def decided(v) -> float:
+        return v.get("decided", 0) if isinstance(v, dict) else 0
+
+    steps = [
+        lambda: len(s.get("recent_failures", [])) > 2 and s["recent_failures"].pop(0),
+        lambda: len(s.get("arms", {})) > 5 and s["arms"].pop(
+            min(s["arms"], key=lambda k: (decided(s["arms"][k]), k))),
+        lambda: len(s.get("families", {})) > 5 and s["families"].pop(
+            min(s["families"], key=lambda k: (decided(s["families"][k]), k))),
+        lambda: _cut_region_datasets(s, 5),
+        lambda: len(s.get("best_accepted", [])) > 2 and s["best_accepted"].pop(),
+        lambda: len(s.get("what_fixes_worked", [])) > 3 and s["what_fixes_worked"].pop(),
+        lambda: len(s.get("datasets", {})) > 10 and s["datasets"].pop(list(s["datasets"])[-1]),
+    ]
+    for step in steps:
+        while size() > max_chars and step():
+            pass
+    return s
+
+
+def _cut_region_datasets(s: dict, keep: int) -> bool:
+    """Cut each region's dataset counts to its ``keep`` largest; False when none had more."""
+    cut = False
+    for reg in (s.get("regions") or {}).values():
+        ds = reg.get("datasets") if isinstance(reg, dict) else None
+        if isinstance(ds, dict) and len(ds) > keep:
+            reg["datasets"] = dict(sorted(ds.items(), key=lambda kv: -kv[1])[:keep])
+            cut = True
+    return cut
 
 
 def submissions_view(submissions: dict) -> dict:
@@ -225,6 +273,80 @@ def prod_correlation_fields(outcomes: list[dict], region: str, spec,
     return dict(out)
 
 
+def _best_abs_sharpe(r) -> float | None:
+    """Best of |Sharpe| and |risk-neutralized Sharpe| of a complete result, else None."""
+    if r is None or r.status != "complete":
+        return None
+    vals = [abs(r.sharpe)] if isinstance(r.sharpe, (int, float)) else []
+    rn = ((getattr(r, "alt_stats", None) or {}).get("risk_neutralized") or {}).get("sharpe")
+    if isinstance(rn, (int, float)):
+        vals.append(abs(rn))
+    return max(vals) if vals else None
+
+
+def signal_evidence(outcomes: list[dict], region: str, delay: int, spec,
+                    datafields=None) -> dict[str, float]:
+    """{datafield: best |Sharpe| (raw or risk-neutralized, either sign) of our complete
+    alphas in this market that use it} from memory. A field in a multi-field alpha shares
+    that alpha's credit, so this is a hint of signal, not a measurement of the field alone.
+    The Generator offers the strong ones of other datasets as blend partners. Base fields
+    are left out."""
+    out: dict[str, float] = {}
+    for row in outcomes:
+        c = row["candidate"]
+        if c.region != region or c.delay != delay:
+            continue
+        best = _best_abs_sharpe(row.get("result"))
+        if best is None:
+            continue
+        try:
+            used = analyze(c.expression, spec, datafields=datafields).fields_used
+        except Exception:   # an old expression the current grammar no longer reads
+            continue
+        for f in used:
+            if f not in spec.base_fields and best > out.get(f, -1.0):
+                out[f] = best
+    return out
+
+
+def arm_history(outcomes: list[dict], dataset: str | None, region: str, delay: int,
+                limit: int, max_chars: int = 160) -> list[str]:
+    """The latest ``limit`` simulated alphas of an arm's dataset in this market, newest
+    first, one line each: expression (cut to ``max_chars``), BRAIN's Sharpe (and
+    risk-neutralized Sharpe), fitness, turnover, production correlation when measured, and
+    our decision. For the Generator, so it stops repeating forms that failed."""
+    if limit <= 0:
+        return []
+    lines = []
+    for row in reversed(outcomes):
+        c, r, d = row["candidate"], row.get("result"), row.get("decision")
+        if (c.dataset != dataset or c.region != region or c.delay != delay
+                or r is None or r.status != "complete"):
+            continue
+        expr = " ".join(c.expression.split())
+        expr = expr if len(expr) <= max_chars else expr[:max_chars - 3] + "..."
+        bits = []
+        if isinstance(r.sharpe, (int, float)):
+            bits.append(f"Sharpe {r.sharpe:.2f}")
+        rn = ((r.alt_stats or {}).get("risk_neutralized") or {}).get("sharpe")
+        if isinstance(rn, (int, float)):
+            bits.append(f"risk-neutralized {rn:.2f}")
+        if isinstance(r.fitness, (int, float)):
+            bits.append(f"fitness {r.fitness:.2f}")
+        if isinstance(r.turnover, (int, float)):
+            bits.append(f"turnover {r.turnover * 100:.0f}%")
+        prod = ((r.check_values or {}).get("PROD_CORRELATION") or {}).get("value")
+        if isinstance(prod, (int, float)):
+            bits.append(f"PROD {prod:.2f}")
+        if d is not None:
+            bits.append(f"{d.decision}" + (f" / {d.failure_class}"
+                                           if d.failure_class not in (None, "none") else ""))
+        lines.append(f"- {expr} | {', '.join(bits)}")
+        if len(lines) == limit:
+            break
+    return lines
+
+
 _FAILURE_ADVICE = {
     "turnover": "turnover is the most common failure: prefer longer windows, decay, or smoothing (ts_mean, ts_decay_linear)",
     "sharpe": "Sharpe is the most common failure: the signals are too weak; combine related fields or condition on liquidity",
@@ -287,10 +409,17 @@ class StrategyEvolution:
         return evo
 
     def _ask(self, summary: dict, evo: Evolution) -> None:
+        system = strategy_system(self.context)
+        user = strategy_user(summary, self.config.max_hypotheses)
+        cap = self.config.max_prompt_chars
+        if cap is not None and len(system) + len(user) > cap:
+            before = len(system) + len(user)
+            user = strategy_user(trimmed_summary(summary, max(cap - len(system) - 200, 0)),
+                                 self.config.max_hypotheses)
+            evo.notes.append(f"records trimmed: prompt {before:,} -> "
+                             f"{len(system) + len(user):,} characters (cap {cap:,})")
         try:
-            reply, calls = ask_json(self.llm, strategy_system(self.context),
-                                    strategy_user(summary, self.config.max_hypotheses),
-                                    max_output=self.max_output)
+            reply, calls = ask_json(self.llm, system, user, max_output=self.max_output)
         except GenerationError as exc:
             evo.llm_calls += 2
             evo.notes.append(f"strategy model reply unusable, rule guidance used: {exc}")

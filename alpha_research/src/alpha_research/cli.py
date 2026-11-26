@@ -24,6 +24,9 @@ import argparse
 import dataclasses
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -51,6 +54,7 @@ from .lever_stats import LeverStats, repair_events
 from .repair_agent import RepairAgent
 from . import power_pool
 from .pool import Pool
+from .quality import generation_quality, quality_lines
 from .lessons import LessonsOutcome, learn as learn_lessons, summary as lessons_summary
 from .research import (Budget, ResearchRun, load_agents_config, load_plan, load_seeds,
                        write_report)
@@ -79,6 +83,7 @@ def _run(args) -> int:
     if args.client == "real":
         config.require_holdout()  # fail before logging in, not after the first submit
         brain_config = load_brain_config(args.brain_config)
+        _keep_awake(args)
         client = RealBrainClient(_brain_session(brain_config), brain_config,
                                  capture_dir=args.capture_dir)
         sleep, clock = time.sleep, time.monotonic
@@ -128,6 +133,31 @@ def _write_lessons(memory: MemoryStore, args, batch_id: str, llm=None) -> Lesson
         memory.put_lessons(batch_id, out.lessons, out.source, out.evidence)
     print(lessons_summary(out))
     return out
+
+
+def _quality(args) -> int:
+    """``quality.generation_quality`` for research runs in memory."""
+    spec = FastExprSpec.load(args.fastexpr)
+    gen = load_generator_config(args.generator_config)
+    markets = _plan_catalogs(load_plan(args.plan))
+    memory = MemoryStore(args.data_dir)
+    try:
+        outcomes = memory.candidate_outcomes()
+    finally:
+        memory.close()
+    runs = args.run
+    if not runs:
+        ids = [r["candidate"].candidate_id for r in outcomes
+               if re.match(r"rs\d{14}", r["candidate"].candidate_id)]
+        runs = [max(ids, key=lambda i: i[:16])[:16]] if ids else []
+    if not runs:
+        print("no research run in memory")
+        return EXIT_OK
+    for rid in runs:
+        q = generation_quality(outcomes, rid, spec, gen,
+                               lambda region, delay: markets.get((region, delay), (None, {})))
+        print("\n".join(quality_lines(q)))
+    return EXIT_OK
 
 
 def _pool(args) -> int:
@@ -620,6 +650,22 @@ def _plan_catalogs(plans) -> dict[tuple, tuple[list[str], dict]]:
     return markets
 
 
+def _keep_awake(args) -> None:
+    """On macOS, keep the computer awake while this command runs: ``caffeinate -ims -w
+    <our pid>`` stops idle, display-idle and (on mains power) system sleep and ends by itself
+    when this process ends (owner 2026-11-25: runs take hours). Closing the lid still
+    sleeps a laptop. ``--no-caffeinate`` turns it off; other systems are left alone."""
+    if getattr(args, "no_caffeinate", False) or sys.platform != "darwin":
+        return
+    exe = shutil.which("caffeinate")
+    if exe is None:
+        return
+    subprocess.Popen([exe, "-ims", "-w", str(os.getpid())],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print("keeping the computer awake while this runs (caffeinate; closing the lid still "
+          "sleeps it)", flush=True)
+
+
 def _fresh_login(session, brain_config) -> None:
     """Start a long command with a login that lasts (BRAIN ends a login after at most 4 h;
     the next one asks for the biometric check, which a run hours in cannot answer)."""
@@ -661,6 +707,7 @@ def _research(args) -> int:
     brain_config = load_brain_config(args.brain_config)
     session = _brain_session(brain_config)
     _fresh_login(session, brain_config)
+    _keep_awake(args)
     client = RealBrainClient(session, brain_config, capture_dir=args.capture_dir)
     memory = MemoryStore(args.data_dir)
     try:
@@ -676,6 +723,8 @@ def _research(args) -> int:
     print(f"stopped: {report['stop_reason']} | simulations {report['simulations_used']} | "
           f"model calls {report['model_calls']} | pool {report['pool_size']} | report {path}")
     print(f"  model calls by model: {report['model_calls_by_model']}")
+    for line in quality_lines(report["generation_quality"]):
+        print(f"  {line}")
     if report.get("brain_quota"):
         print(f"  {quota_text(report['brain_quota'], 'BRAIN daily simulations')}")
     if report["regions_this_run"] is not None:
@@ -842,6 +891,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="run the pipeline on a candidate file")
     run.add_argument("--candidates", required=True)
+    run.add_argument("--no-caffeinate", action="store_true",
+                     help="with --client real: do not keep the Mac awake while it runs")
     run.add_argument("--config", default="config/thresholds.yaml")
     run.add_argument("--playbook", default="config/repair_playbook.yaml")
     run.add_argument("--data-dir", default=str(default_data_dir()))
@@ -911,6 +962,8 @@ def build_parser() -> argparse.ArgumentParser:
     rs.add_argument("--per-round", type=int, default=10, help="simulation slots per round")
     rs.add_argument("--rounds", type=int, default=5)
     rs.add_argument("--seed", type=int, default=None)
+    rs.add_argument("--no-caffeinate", action="store_true",
+                    help="do not keep the Mac awake while the run goes (default: caffeinate)")
     rs.add_argument("--report", default=None, help="report JSON (default: <data-dir>/<run id>.json)")
     rs.add_argument("--config", default="config/thresholds.yaml")
     rs.add_argument("--playbook", default="config/repair_playbook.yaml")
@@ -997,6 +1050,16 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--config", default="config/thresholds.yaml")
     pp.add_argument("--region", default=None)
     pp.set_defaults(func=_power_pool)
+
+    qu = sub.add_parser("quality", help="how plain or crowded a run's fresh alphas were")
+    qu.add_argument("--run", nargs="*", default=None,
+                    help="research run ids (default: the latest run in memory)")
+    qu.add_argument("--plan", default="config/research_plan.v5.yaml",
+                    help="research plan whose catalogs give the field facts")
+    qu.add_argument("--data-dir", default=str(default_data_dir()))
+    qu.add_argument("--fastexpr", default="config/fastexpr.yaml")
+    qu.add_argument("--generator-config", default="config/generator.yaml")
+    qu.set_defaults(func=_quality)
 
     ls = sub.add_parser("lessons", help="the Lesson Writer's latest lessons (--write: new ones now)")
     ls.add_argument("--data-dir", default=str(default_data_dir()))

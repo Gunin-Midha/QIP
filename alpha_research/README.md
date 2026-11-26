@@ -150,8 +150,12 @@ What it does:
 2. For each hypothesis, one model call writes alphas in **Fast Expression**. The prompt lists
    the allowed operators, groups and the datafields most relevant to the hypothesis.
 3. Every expression is parsed and checked (`fastexpr.py`): known operators with the right
-   argument counts, valid syntax, and known datafields when a catalog is given. Failures go
-   back to the model once with the exact errors. What still fails is reported, never emitted.
+   argument counts, valid syntax, and known datafields when a catalog is given. With BRAIN's
+   field facts (a JSON catalog) a fresh alpha must also combine two sources of information
+   (`generator.structure`, gen-v14): distinct signal fields beyond the base fields, price/volume
+   counting as one, at least one neither crowded nor heavily used (>= `crowding.heavy_alphas`
+   500 BRAIN alphas). Failures go back to the model once with the exact errors. What still
+   fails is reported, never emitted.
 4. Survivors are written as `CandidateRecord`s with `prompt_version` and `model` filled in.
    `batch1.json` loads straight into `cli run`. `batch1.report.json` holds the rationale for
    each alpha, warnings (for example unverified datafields), rejects with their errors,
@@ -239,7 +243,9 @@ Up to `simulator.max_concurrent` (4) simulations run on BRAIN at once (OQ-3).
 it the run ends when every generator model has hit its own (free-tier) limit, at the
 simulation budget, after `--rounds`, or after `director.stop_after_idle_rounds` rounds that
 sent nothing to BRAIN. Each arm given slots gets at least `director.min_batch` (3), so one
-Generator call writes several alphas. Alphas are never submitted for competition.
+Generator call writes several alphas. On macOS, `cli research` and `cli run --client real` keep the
+computer awake until they end (`caffeinate -ims -w <pid>`; closing the lid still sleeps a
+laptop); `--no-caffeinate` turns that off. Alphas are never submitted for competition.
 BRAIN's daily simulation limit comes from the `X-Ratelimit-*` headers of each submit: a
 research run stops before a round once at most `brain.yaml` `quota_reserve` (50) are left,
 and at once on a 429 with none left; the report's `brain_quota` shows what remained. A login
@@ -262,8 +268,10 @@ Each round:
    floor for every arm.
    It starts from the outcomes already in memory, so a second run continues the first.
 2. **Repair waves first**: a near miss gets up to `repair.fixes_per_wave` (4) different fixes
-   (sized by `repair.wave_tiers` on its distance to accept: 4 at <= 0.15, 2 at <= 0.4, none
-   beyond; none with little real edge or a failing check no lever fixes)
+   (sized by `repair.wave_tiers` on its distance to accept: 4 at <= 0.15, 2 at <= 0.4, 2
+   mechanical at <= 0.6, none beyond; none with little real edge or a failing check no lever
+   fixes; a lead, best Sharpe >= `repair.lead_sharpe_share` 0.63 x BRAIN's bar, gets at least
+   `lead_fixes` 2 mechanical fixes however far)
    (one per kind of change first, at most `model_levers_per_wave` 1 model-written) that are
    simulated together. When all are in, the next wave starts from the child closest to
    accept if it got closer than the parent (levers that helped its siblings first), else
@@ -709,7 +717,7 @@ screenshot values (aggregate plus yearly rows for 2019 to 2023).
   line prints as each simulation finishes (`   7m30s  r01a27_001_c1 (speed_up)  Sharpe
   0.91  fitness 0.41  turnover 20%   (3 of 5)`; ids without the run prefix, a repair child
   with its fix); the decision lines (`r01a27_001_c1 | repair / sharpe | Sharpe 0.91 | ...`)
-  follow as each alpha is decided, the moment its result is in (research runs and, since 2026-11-24, `cli run`, which also sends the next alpha of the file into a freed slot at once), and a ready repair wave takes a freed slot at once. While alphas run, one status line every
+  follow as each alpha is decided, the moment its result is in (research runs and, since 2026-11-24, `cli run`, which also sends the next alpha of the file into a freed slot at once), and a ready repair wave takes a freed slot at once; when no wave is ready, the freed slot generates the round's next arm of new alphas (the round's allocation is made before its repairs go to BRAIN; `director.fill_freed_slots`, 2026-11-26). While alphas run, one status line every
   `simulator.progress_every_seconds` (60) gives the batch's time, how many are done and the
   range of BRAIN's progress; a `simulated, fetching results and checks ...` note marks the
   minutes spent fetching, and a terminal overwrites it with the result line.
@@ -730,6 +738,16 @@ screenshot values (aggregate plus yearly rows for 2019 to 2023).
   (decay and smoothing windows down) is the first `recent_sharpe` lever. The Critic adds an
   advisory to a fresh alpha that reads only price/volume data
   (`critic.price_volume_categories`), which tends to fail production correlation.
+- **OQ-23 Generator quality defaults** (owner 2026-11-25; numbers builder defaults):
+  `crowding.heavy_alphas` 500, `structure.min_signal_sources` 2 with `need_uncrowded`,
+  `blend.share` 0.25 / `partners` 8 / `partner_min_sharpe` 1.0, `history_in_prompt` 4;
+  `repair.lead_sharpe_share` 0.63, `lead_fixes` 2. Judge them with `cli quality` over runs
+  (baseline `rs20261125130750`: 46% one source or none, 29% only crowded/heavily used
+  fields, mean |Sharpe| 0.53).
+- **Request size (2026-11-25).** A request over a model's per-minute token limit raises
+  `RequestTooLarge`: the call falls back, the model stays up. The size client learns real
+  token counts per model (report `prompt_tokens`) and Strategy Evolution's prompt is cut to
+  `strategy.max_prompt_chars` (15,000).
 - **OQ-4 Drawdown and concentration limits.** Policy choice.
 - **OQ-5 Leg balance and top-PnL-removal thresholds.** Policy choice.
 - **OQ-6 Weak-year floor and yearly Sharpe spread.** Policy choice.

@@ -89,7 +89,8 @@ from typing import Collection, Mapping
 from .evaluator import FACTOR_FIRST
 from .fastexpr import (Assign, Binary, Call, ComplexityLimits, FastExprError, FastExprSpec,
                        Name, Num, Unary, analyze, catalog, catalog_for, parse, render)
-from .generator import GenerationError, ask_json, crowded_fields, dataset_category, field_role
+from .generator import (GenerationError, ask_json, crowded_fields, dataset_category, field_role,
+                        heavily_used)
 from .lever_stats import (PINNED_LAST, LeverStats, RepairLearningConfig, combo_parts,
                           failing_classes, mechanical_only, wave_size,
                           family_budget, needs, rank_levers, repair_events,
@@ -1161,6 +1162,10 @@ class RepairAgent:
                              if f not in self.spec.base_fields}
         pct, low = self.crowding
         crowded = crowded_fields(meta, pct, low, exclude=self.spec.base_fields)
+        # heavily used fields (generator.yaml crowding.heavy_alphas) are no partners either:
+        # a partner must add information production alphas do not have
+        crowded |= heavily_used(meta, getattr(self.generator_config, "heavy_alphas", None),
+                                self.spec.base_fields)
         cfg = self.generator_config
         return partner_fields(meta, own - {None}, self.spec, crowded=crowded,
                               exclude_categories=step.get("exclude_categories", ("pv", "risk")),

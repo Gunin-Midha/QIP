@@ -145,3 +145,66 @@ def test_fill_freed_slots_can_be_switched_off(memory, make_config, playbook):
                    agents=agents(fixes_per_wave=2, fill_freed_slots=False))
     report = run.run(1)
     assert not [a for r in report["rounds"] for a in r["arms"] if a.get("repairs_mid_batch")]
+
+
+class OneSlowChild(StubBrain):
+    """One repair child stays running for many polls (an ASI alpha near our 30-min limit);
+    the rest finish at once. ``events`` is the order of submits and results."""
+
+    def __init__(self, slow: str):
+        super().__init__()
+        self.slow, self.slow_sim, self.polls, self.events = slow, None, 0, []
+
+    def submit(self, c):
+        sim = super().submit(c)
+        self.events.append(("submit", c.candidate_id))
+        if c.candidate_id == self.slow:
+            self.slow_sim = sim
+        return sim
+
+    def poll(self, sim_id):
+        if sim_id == self.slow_sim and self.polls < 20:
+            self.polls += 1
+            return {"status": "running", "retry_after": 5}
+        out = super().poll(sim_id)
+        if out.get("status") != "running":
+            self.events.append(("done", sim_id))
+        return out
+
+
+def _slow_wave_run(memory, make_config, playbook, candidate, **flags):
+    _orphan_repair(memory, candidate)
+    brain = OneSlowChild("old_001_r1b")
+    run = make_run(memory, make_config(simulator__max_concurrent=2), playbook, brain=brain,
+                   agents=dataclasses.replace(agents(fixes_per_wave=2, waves_per_round=1),
+                                              **flags),
+                   budget=Budget(max_simulations=6, per_round=5, max_llm_calls=100))
+    report = run.run(1)
+    slow_done = brain.events.index(("done", brain.slow_sim))
+    fresh = [i for i, (kind, cid) in enumerate(brain.events)
+             if kind == "submit" and not cid.startswith("old_001")]
+    return report, brain, fresh, slow_done
+
+
+def test_a_freed_slot_takes_the_rounds_new_alphas(memory, make_config, playbook, candidate):
+    # run rs20261125173606: new alphas waited ~30 min for a repair batch's timeouts while
+    # BRAIN slots sat idle; now the round's allocation is made first and a freed slot
+    # generates the next arm's alphas at once
+    report, brain, fresh, slow_done = _slow_wave_run(memory, make_config, playbook, candidate)
+    assert fresh and fresh[0] < slow_done
+    arms = report["rounds"][0]["arms"]
+    mid = [a for a in arms if a.get("fresh_mid_batch")]
+    assert mid and all(o["candidate_id"].startswith("rs1r01") for a in mid
+                       for o in a["outcomes"])
+    assert report["simulations_used"] == len(brain.submitted) <= 6
+    # the arm's slots were generated once (one Generator call), not again after the batch
+    assert len([a for a in arms if not a.get("repairs_first")]) == len(
+        report["rounds"][0]["allocation"])
+
+
+def test_fresh_fill_of_freed_slots_can_be_switched_off(memory, make_config, playbook,
+                                                      candidate):
+    report, brain, fresh, slow_done = _slow_wave_run(memory, make_config, playbook, candidate,
+                                                     fresh_fill_freed_slots=False)
+    assert fresh and fresh[0] > slow_done
+    assert not [a for r in report["rounds"] for a in r["arms"] if a.get("fresh_mid_batch")]

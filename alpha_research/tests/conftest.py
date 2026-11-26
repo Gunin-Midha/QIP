@@ -35,6 +35,9 @@ def _no_real_session_or_network(tmp_path, monkeypatch):
 
     monkeypatch.setattr(urllib.request.OpenerDirector, "open", _blocked)
     monkeypatch.setattr(urllib.request, "urlopen", _blocked)
+    # ... and never start caffeinate (cli._keep_awake; tests that check it patch this back)
+    from alpha_research import cli
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
 
 
 @pytest.fixture
