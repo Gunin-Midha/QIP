@@ -1013,3 +1013,13 @@ Dry run on memory: the IND model39 lead (Sharpe 2.29, robust-universe 0.87) gets
 ## Request-size fixes (2026-11-26)
 
 Run `rs20261126082238` lost two things to request size: the Lesson Writer's model write (12,000 characters of evidence fit no model's per-minute limit, so rules wrote the lessons) and gpt-oss for the whole run (the size client squeezed its output cap to fit 8,000 tokens a minute, the reasoning model thought until the cap ran out and replied empty, and an empty reply marks a model down). Now the Lesson Writer halves its evidence and asks again (floor 2,500 characters, then rules), and an empty reply under a cap the size client lowered is a too-large error for that call only: the agent falls back and the model stays up.
+
+
+## Hand rescues of the leads, evening (2026-11-26)
+
+Files `candidates/rescue_20261126_leads.json` (12) and `candidates/rescue_20261126_gbr_val_r2.json` (6). No code change.
+
+- GBR model38 value (P/B + P/E score, flipped): the flip mirrors the parent exactly (Sharpe 1.71, fitness 1.61) but BRAIN's PROD_CORRELATION is 0.819. Truncation 0.05 gave identical numbers (never bound); INDUSTRY failed sub-universe (0.82 vs 0.88) and turned 2017 negative.
+- Blending analyst7 net revision breadth (pre-tax, net income) at 0.5: Sharpe 2.56, fitness 2.74, PROD 0.763. At 1:1: Sharpe 2.95, fitness 3.14, sub-universe 1.44 (limit 1.40); at 2:1 2023 Sharpe falls to 0.67 and IS_LADDER_SHARPE fails (the breadth signal fades in recent years; the value part carries them). STATISTICAL neutralization failed sub-universe and the ladder. Without the model's ready-made region value rank: Sharpe 2.88, risk-neutralized 1.90 (highest). Breadth on less-used items (operating profit, GAAP EPS, gross margin; 30-150 BRAIN alphas against 1,012 and 604 for pre-tax and net income): Sharpe 2.20 (1:1) and 2.00 (2:1). PROD values of the four passing variants were still pending at the end of the day.
+- GBR overnight-vs-intraday reversal: the analyst breadth blend without size tilt reached Sharpe 2.18, fitness 1.19 and fails only IS_LADDER_SHARPE (1.17; 2022-23 weak); the same with the EUR accept's size tilt fell to 1.23. Longer windows (20) and decay 10 lifted fitness only to 0.78 and 0.84.
+- IND analyst4 sales dispersion: alone Sharpe 0.22; with the net-profit estimate trend instead of the reversal 0.52; reversal at 15% 1.00. The 30% reversal part carries the alpha and is also what fails the robust universe (truncation 0.05 lifted it only 0.74 -> 0.78). Family dropped. Testing each part alone (now the `leg_alone` lever) found this in one simulation.
