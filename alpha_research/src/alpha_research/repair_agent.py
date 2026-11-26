@@ -86,7 +86,7 @@ import string
 from dataclasses import dataclass, field
 from typing import Collection, Mapping
 
-from .evaluator import FACTOR_FIRST
+from .evaluator import FACTOR_FIRST, SIGN_FIRST
 from .fastexpr import (Assign, Binary, Call, ComplexityLimits, FastExprError, FastExprSpec,
                        Name, Num, Unary, analyze, catalog, catalog_for, parse, render)
 from .generator import (GenerationError, ask_json, crowded_fields, dataset_category, field_role,
@@ -373,7 +373,9 @@ def _backfill(node, spec, variables: set, lookback: Num, changed: list):
         changed.append(n)
         return Call("ts_backfill", (node, lookback), ())
     if isinstance(node, Call):
-        if node.name == "ts_backfill":
+        # already filled: ts_backfill, or group_backfill (run rs20261126060436: wrapping a
+        # field inside group_backfill in ts_backfill gave BRAIN the same numbers again)
+        if node.name in ("ts_backfill", "group_backfill"):
             return node
         return Call(node.name, tuple(_backfill(a, spec, variables, lookback, changed)
                                      for a in node.args),
@@ -810,6 +812,12 @@ class RepairAgent:
             rest = [x for x in ranked
                     if not x[0].name.startswith("neutralize_") and x[0].name != "flip_sign"]
             ranked = factor + rest
+        elif any(r.startswith(SIGN_FIRST) for r in decision.reasons):
+            # flip alone: every other fix on the unflipped alpha keeps its negative sign
+            # (wasted simulations); the next wave starts from the flipped child's real
+            # numbers. A sign-first alpha is measured as if flipped, so it gets a big wave.
+            flip = [x for x in ranked if x[0].name == "flip_sign"]
+            ranked = flip or ranked
         return ranked
 
     def repair(self, candidate: CandidateRecord, decision: DecisionRecord,
@@ -960,7 +968,13 @@ class RepairAgent:
                 kinds.add(k)
                 spread.append(x)
         # the catch-all model_repair stays last: it costs a model call
-        return first + spread + [x for x in rest if x not in spread] + last
+        options = first + spread + [x for x in rest if x not in spread] + last
+        if any(r.startswith(SIGN_FIRST) for r in decision.reasons):
+            # sign first: the flip alone (see ``ranked``); every other fix of the unflipped
+            # alpha keeps its negative sign
+            flip = [x for x in options if x[1].name == "flip_sign"]
+            options = flip or options
+        return options
 
     def variants(self, candidate: CandidateRecord, decision: DecisionRecord,
                  result: ResultRecord | None = None, *, limit: int | None = None,

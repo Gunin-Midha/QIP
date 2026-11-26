@@ -224,3 +224,48 @@ def test_sub_universe_playbook_has_the_units_fix_and_its_combo():
     names = [lv.name for lv in Playbook.load(PLAYBOOK).entries["sub_universe"]]
     assert "relative_price_change" in names
     assert "combo:relative_price_change+size_tilt" in names
+
+
+def _sign_first_alpha(candidate):
+    """GBR value alpha of run rs20261125173606: Sharpe -1.54, every Sharpe-type check
+    negative; flipped, it misses only LOW_SHARPE by 0.04."""
+    from alpha_research.schemas import GateResult, ResultRecord
+    parent = candidate(candidate_id="p1", region="GBR", universe="TOP700")
+    res = ResultRecord("p1", "complete", sharpe=-1.54, fitness=-1.38, turnover=0.058)
+    d = DecisionRecord("p1", "repair", "sharpe", gate_results=[
+        GateResult("sharpe", False, -1.54, 1.58, ""),
+        GateResult("fitness", False, -1.38, 1.0, ""),
+        GateResult("sub_universe", False, -0.75, -0.73, ""),
+        GateResult("brain:LOW_2Y_SHARPE", False, -2.0, 1.58, "")],
+        reasons=["sign first: Sharpe -1.54 is negative"])
+    return parent, d, res
+
+
+def test_sign_first_alpha_is_measured_as_if_flipped(candidate):
+    # run rs20261126060436: it counted as distance 6.6 and was never resumed
+    from alpha_research.lever_stats import distance
+    parent, d, res = _sign_first_alpha(candidate)
+    assert distance(d, res) == pytest.approx(0.04 / 1.58, abs=1e-6)
+    plain = DecisionRecord("p1", "repair", "sharpe", gate_results=d.gate_results)
+    assert distance(plain, res) > 6
+
+
+def test_sign_first_wave_is_the_flip_alone(memory, playbook, candidate):
+    parent, d, res = _sign_first_alpha(candidate)
+    memory.put_candidate(parent)
+    agent = RepairAgent(playbook, SPEC, memory)
+    wave = agent.repair_wave(parent, d, res, size=4)
+    assert [c.lever for c in wave.children] == ["flip_sign"]
+    assert wave.children[0].expression.startswith("-")
+
+
+def test_backfill_skips_fields_already_inside_group_backfill(candidate):
+    # run rs20261126060436: the ASI VWAP-gap alpha's quality field was already inside
+    # group_backfill; the "fix" re-ran the same alpha (BRAIN: identical numbers)
+    c = candidate(expression="q = group_backfill(total_current_assets_4, industry, 121); "
+                             "group_rank(ts_zscore(vwap - close, 21), industry) * rank(q)")
+    with pytest.raises(LeverNotApplicable):
+        apply("backfill_fields", c, lookback=63)
+    mixed = candidate(expression="group_backfill(fld_a, industry, 63) + rank(fld_b)")
+    out = apply("backfill_fields", mixed, lookback=63).expression
+    assert "ts_backfill(fld_b, 63)" in out and "ts_backfill(fld_a" not in out

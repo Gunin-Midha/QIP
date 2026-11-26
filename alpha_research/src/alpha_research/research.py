@@ -96,6 +96,10 @@ from .strategy import (StrategyConfig, StrategyEvolution, brain_limits,
                        prod_correlation_fields, region_notes, signal_evidence, arm_history)
 
 DECIDED = ("accept", "reject", "repair")
+# fewest catalog fields a generator prompt lists after too-large refusals (each halves the
+# list, from generator.yaml max_datafields_in_prompt); below this the hypothesis has too few
+# fields to choose from, so the model writes no alphas for the rest of the run instead
+MIN_FIELDS_WHEN_TOO_LARGE = 20
 
 
 class LLMBudgetExhausted(LLMUnavailable):
@@ -786,6 +790,10 @@ class ResearchRun:
         # _run_fresh works through them, and a BRAIN slot freed mid-batch takes the next
         # arm's share early (_fresh_for_freed)
         self._fresh_left: dict[tuple, int] = {}
+        # generator models whose prompt was too large: fields listed from now on, and the
+        # ones no field count fits (they write no alphas this run; _shrink_fields)
+        self.field_cap: dict[str, int] = {}
+        self.no_fit: dict[str, str] = {}
         self._fresh_ctx: tuple = (0, {}, "", {})   # (round, round log, batch tag, arm index)
         self._fresh_lost = 0       # slots of fresh_left lost to a down model / emptied by
         self._fresh_emptied = 0    # drops while taken mid-batch (go to the round's refill)
@@ -936,6 +944,9 @@ class ResearchRun:
         region, delay = plan.settings.region, plan.settings.delay
         fields = self.catalog_of(region, delay)[0]
         gen = self.generators[key]
+        cap = self.field_cap.get(key[3])
+        if cap is not None and gen.config.max_datafields_in_prompt > cap:
+            gen.config = dataclasses.replace(gen.config, max_datafields_in_prompt=cap)
         gen.prod_failed = prod_correlation_fields(outcomes, region, self.spec, fields)
         # blend partners with shown signal, and this arm's latest results (owner 2026-11-25)
         if gen.config.blend_partners:
@@ -1184,6 +1195,9 @@ class ResearchRun:
                 # still unfinished long after submission: BRAIN's stuck simulations sat at
                 # 90% for days (2026-11-24); cancel it so it holds no place on BRAIN
                 hours = stuck[c.candidate_id]
+                seen = getattr(self.pipeline.simulator, "last_recover", None) or "no result"
+                self._emit(f"  {_short_id(c.candidate_id)}: {seen} {hours:.0f} h after "
+                           f"submission, cancelling")
                 try:
                     gone = self.pipeline.cancel_submission(
                         c, p["brain_sim_id"], f"still unfinished {hours:.0f} h after submission "
@@ -1437,11 +1451,19 @@ class ResearchRun:
                 return
         if not live:
             self.stop_reason = "every generator model is down: " + "; ".join(
-                f"{m}: {why}" for m, why in self.counter.down.items())
+                f"{m}: {why}" for m, why in {**self.counter.down, **self.no_fit}.items())
             return
         lost, emptied = self._run_fresh()
         passes = 0
+        # every pass for lost slots follows a model leaving the live arms (down, or no
+        # prompt fits), so the loop ends; the cap is a guard against a slot that is lost
+        # without that
+        lost_passes, max_lost = 0, len(self.models.generator) + 1
         while not self.stop_reason:
+            if lost:
+                lost_passes += 1
+                if lost_passes > max_lost:
+                    return
             spare = lost
             if emptied and passes < self.agents.refill_passes:
                 spare += emptied
@@ -1479,7 +1501,7 @@ class ResearchRun:
 
     def _live_arms(self) -> list[tuple]:
         return [k for k in self.arms if k[3] not in self.counter.down and self._in_run(k)
-                and k not in self.successor]
+                and k not in self.successor and k[3] not in self.no_fit]
 
     def _current(self, key: tuple) -> tuple:
         """The arm that now stands for ``key``: itself, or its latest evolved successor."""
@@ -1568,6 +1590,22 @@ class ResearchRun:
         simulated = self._simulate_all(key, go, log)
         return lost, max(0, n - lost - simulated)
 
+    def _shrink_fields(self, model: str, why: str) -> bool:
+        """After a too-large generator request: halve the fields this model's prompts list
+        (``field_cap``, for every arm of the model, for the rest of the run). False when the
+        cap is already at ``MIN_FIELDS_WHEN_TOO_LARGE``: the model then writes no alphas this
+        run (``no_fit``), so its arms get no slots and the round's refill ends."""
+        now = self.field_cap.get(model, self.generator_config.max_datafields_in_prompt)
+        if now > MIN_FIELDS_WHEN_TOO_LARGE:
+            self.field_cap[model] = max(MIN_FIELDS_WHEN_TOO_LARGE, now // 2)
+            self._emit(f"  {model}: generator prompt too large, listing "
+                       f"{self.field_cap[model]} fields instead of {now}")
+            return True
+        self.no_fit[model] = why
+        self._emit(f"  {model}: generator prompt too large even with {now} fields; it writes "
+                   f"no alphas this run (its arms' slots go to other models)")
+        return False
+
     def _prepare_arm(self, r: int, i: int, key: tuple, n: int, log: dict,
                      tag: str = "") -> tuple[int, list[CandidateRecord]]:
         """The arm's queued repairs plus new alphas for the rest of ``n`` slots, screened.
@@ -1582,18 +1620,27 @@ class ResearchRun:
             plan = self.arms[key]
             source = plan.sources[0]
             plan.sources.rotate(-1)
-            try:
-                res = self._generator(key).generate(
-                    source, need, batch_id=f"{self.run_id}r{r:02d}a{i}{tag}")
-            except GenerationError as exc:
-                log["generation_error"] = str(exc)
-                res = None
-            except ModelDown as exc:  # the arm gets no more slots; the run goes on
-                log["generation_error"] = str(exc)
-                self._emit(f"{exc}; these slots go to live arms" if isinstance(exc, RequestTooLarge)
-                           else f"{exc}; its arms get no more slots, these go to live arms")
-                res = None
-                lost = need
+            res = None
+            while True:
+                try:
+                    res = self._generator(key).generate(
+                        source, need, batch_id=f"{self.run_id}r{r:02d}a{i}{tag}")
+                except GenerationError as exc:
+                    log["generation_error"] = str(exc)
+                except RequestTooLarge as exc:
+                    # the prompt does not fit the model's per-minute limit: list fewer
+                    # fields and try again; at the floor, the model writes no more alphas
+                    # this run (run rs20261126060436 looped through 9 refill passes giving
+                    # Groq models slots their prompt could never fit)
+                    if self._shrink_fields(key[3], str(exc)):
+                        continue
+                    log["generation_error"] = str(exc)
+                    lost = need
+                except ModelDown as exc:  # the arm gets no more slots; the run goes on
+                    log["generation_error"] = str(exc)
+                    self._emit(f"{exc}; its arms get no more slots, these go to live arms")
+                    lost = need
+                break
             if res is not None:
                 batch += res.candidates
                 rationales.update(res.rationales)
@@ -1899,6 +1946,8 @@ class ResearchRun:
             # calls refused as too large per model, and what the size client measured
             # (characters per token, largest prompt) for models with a per-minute token limit
             "too_large_calls": dict(self.counter.too_large),
+            "generator_field_cap": dict(self.field_cap),
+            "generator_no_fit": dict(self.no_fit),
             "prompt_tokens": self.token_stats(),
             "models": {"generator": list(self.models.generator),
                        "critic": [c for c in self.critics if c] if self.agents.critic_model else [],

@@ -1,5 +1,6 @@
 """The closed research loop, end to end, with a routing fake model and a stub BRAIN client."""
 
+import io
 import argparse
 import dataclasses
 import os
@@ -744,8 +745,13 @@ def test_run_start_cancels_a_submission_stuck_on_brain(memory, make_config, play
             return "cancelled"
 
     brain = Stuck()
-    report = make_run(memory, config, playbook, brain=brain).run(1)
+    run = make_run(memory, config, playbook, brain=brain)
+    run.out = io.StringIO()
+    report = run.run(1)
     assert brain.cancelled == ["sim_stuck"]
+    # the console says what the poll found before cancelling (owner 2026-11-26)
+    assert "stuck_001: still running on BRAIN at 90% 0 h after submission, cancelling" \
+        in run.out.getvalue()
     assert [c["candidate_id"] for c in report["cancelled_stuck"]] == ["stuck_001"]
     assert memory.results_for("stuck_001")[-1].notes[0].startswith("cancelled on BRAIN")
     assert memory.unfinished_submissions() == []

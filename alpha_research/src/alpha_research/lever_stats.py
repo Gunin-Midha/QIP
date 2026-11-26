@@ -82,7 +82,7 @@ from dataclasses import dataclass, field
 from typing import Iterable
 
 from .config import ConfigError
-from .evaluator import BRAIN_CHECK_TO_CLASS, check_class
+from .evaluator import BRAIN_CHECK_TO_CLASS, SIGN_FIRST, check_class
 from .repair import Lever, Playbook
 from .research_loop import lineage_members, lineage_root, simulated
 from .schemas import CandidateRecord, DecisionRecord, ResultRecord
@@ -287,13 +287,40 @@ def distance(decision: DecisionRecord | None, result: ResultRecord | None,
         return None
     if decision.decision == "accept":
         return 0.0
+    flip = _sign_first(decision)
     total = 0.0
     for cls in failing_classes(decision, result):
         gaps = [x for g in decision.gate_results
                 if g.passed is False and check_class(g.name) == cls
-                and (x := _shortfall(g.name, g.value, g.threshold)) is not None]
+                and (x := _shortfall(g.name, *(_mirrored(g) if flip else
+                                               (g.value, g.threshold)))) is not None]
         total += max(gaps) if gaps else unmeasured_penalty
     return round(total, 6)
+
+
+def _sign_first(decision: DecisionRecord) -> bool:
+    """The evaluator routed this alpha sign first: its Sharpe is negative and flipping it
+    mirrors its performance (not in a short-restricted market such as CHN)."""
+    return any(r.startswith(SIGN_FIRST) for r in decision.reasons)
+
+
+def _mirrored(g) -> tuple:
+    """(value, threshold) of a gate as the flipped alpha would show them. A sign-first
+    alpha is measured as if flipped (run rs20261126060436: GBR Sharpe -1.54 / fitness -1.38
+    counted as distance 6.6, so the resume order never reached it, though its flip is a
+    near miss). Sharpe-, fitness- and returns-type gates change sign; a negative threshold
+    is a share of the alpha's own Sharpe (sub-universe), so it changes sign too. Turnover
+    and correlation gates are unchanged."""
+    name = g.name.upper()
+    if not (g.name in ("sharpe", "fitness", "sub_universe")
+            or any(k in name for k in ("SHARPE", "FITNESS", "RETURNS"))):
+        return g.value, g.threshold
+    value = -g.value if isinstance(g.value, (int, float)) and not isinstance(g.value, bool) \
+        else g.value
+    t = g.threshold
+    if isinstance(t, (int, float)) and not isinstance(t, bool) and t < 0:
+        t = -t
+    return value, t
 
 
 def _sharpe_bar(decision: DecisionRecord | None) -> float | None:

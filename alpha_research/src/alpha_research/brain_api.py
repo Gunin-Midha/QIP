@@ -806,7 +806,7 @@ class RealBrainClient:
             self.on_ready(brain_sim_id)
         notes: list[str] = []
         base = f"/alphas/{alpha_id}"
-        alpha = self._fetch(brain_sim_id, "alpha", base, notes)
+        alpha = self._fetch(brain_sim_id, "alpha", base, notes, required=True)
         yearly = self._fetch(brain_sim_id, "yearly_stats", f"{base}/recordsets/yearly-stats", notes)
         daily = self._fetch(brain_sim_id, "daily_pnl", f"{base}/recordsets/daily-pnl", notes)
         pnl = (None if recordset_rows(daily)
@@ -842,12 +842,21 @@ class RealBrainClient:
             return None
 
     def _fetch(self, sim_id: str, name: str, path: str, notes: list[str],
-               max_wait: float | None = None):
-        """A missing piece becomes None plus a note; it never fails the whole result."""
+               max_wait: float | None = None, required: bool = False):
+        """A missing piece becomes None plus a note; it never fails the whole result. A
+        server error (5xx, dropped connection) counts as missing too, except for a
+        ``required`` piece (the alpha itself, which holds every aggregate): that raises, so
+        the simulator retries the poll. Run rs20261126060436: two finished alphas were
+        recorded as failed because ``yearly-stats`` answered 500 after retries."""
         try:
             resp = self.session.get_ready(path, max_wait or self.config.recordset_max_wait_seconds)
         except TimeoutError as exc:
             notes.append(f"brain_fetch_timeout: {name}: {exc}")
+            return None
+        except ConnectionError as exc:
+            if required:
+                raise
+            notes.append(f"brain_fetch_failed: {name}: {exc}")
             return None
         if resp.status != 200:
             notes.append(f"brain_fetch_failed: {name} returned {resp.status}")

@@ -301,15 +301,21 @@ class MemoryStore:
 
     def unfinished_submissions(self) -> list[dict]:
         """Submissions BRAIN may have finished after we stopped waiting: candidates whose
-        latest result is a ``timeout`` with a simulation id, plus pending submissions with no
-        result at all (crash). ``{"candidate_id", "brain_sim_id"}``, oldest first. Read-only."""
+        latest result is a ``timeout`` with a simulation id, or ``failed`` because polling it
+        failed on our side (note ``poll_error:``: BRAIN or the connection erred while it
+        held the result), plus pending submissions with no result at all (crash).
+        ``{"candidate_id", "brain_sim_id"}``, oldest first. Read-only."""
         out = {p["candidate_id"]: p["brain_sim_id"] for p in self.pending()}
         rows = self.conn.execute(
-            "SELECT r.candidate_id, r.payload_json FROM results r WHERE r.id = "
+            "SELECT r.candidate_id, r.status, r.payload_json FROM results r WHERE r.id = "
             "(SELECT MAX(r2.id) FROM results r2 WHERE r2.candidate_id = r.candidate_id) "
-            "AND r.status = 'timeout' ORDER BY r.id").fetchall()
+            "AND r.status IN ('timeout', 'failed') ORDER BY r.id").fetchall()
         for r in rows:
-            sim_id = json.loads(r["payload_json"]).get("brain_sim_id")
+            payload = json.loads(r["payload_json"])
+            sim_id = payload.get("brain_sim_id")
+            if r["status"] == "failed" and not any(
+                    str(n).startswith("poll_error:") for n in payload.get("notes") or []):
+                continue
             if sim_id:
                 out[r["candidate_id"]] = sim_id
         return [{"candidate_id": c, "brain_sim_id": s} for c, s in out.items()]

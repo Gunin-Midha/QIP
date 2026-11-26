@@ -253,6 +253,7 @@ class Simulator:
                  sleep: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.monotonic):
         self.client = client
+        self.last_recover: str | None = None   # why the last recover() found no result
         self.memory = memory
         self.config = config
         self.sleep = sleep
@@ -417,19 +418,28 @@ class Simulator:
         """One poll of an earlier submission (one that timed out on our side, or a crash
         before its result): BRAIN keeps running a simulation after we stop waiting. Returns
         the persisted result when BRAIN has finished it, None while it is still running or
-        when BRAIN no longer knows the simulation. ``keep(result)`` False: nothing is stored
+        when BRAIN no longer knows the simulation (why: ``last_recover``, shown before a
+        stuck simulation is cancelled). ``keep(result)`` False: nothing is stored
         and None is returned (a recheck whose checks BRAIN has not finished yet); ``note``
         replaces the first note."""
+        self.last_recover = None
         try:
             raw = self._with_retry(lambda: self.client.poll(sim_id))
-        except TRANSIENT_ERRORS:
+        except TRANSIENT_ERRORS as exc:
+            self.last_recover = f"BRAIN did not answer the poll ({exc})"
             return None
         if raw.get("status") not in ("complete", "failed"):
+            prog = raw.get("progress")
+            self.last_recover = "still running on BRAIN" + (
+                f" at {prog:.0%}" if isinstance(prog, (int, float))
+                and not isinstance(prog, bool) else "")
             return None
         result = normalize(raw, candidate.candidate_id, sim_id)
         if result.status == "failed" and any("simulation not found" in n for n in result.notes):
+            self.last_recover = "BRAIN no longer knows the simulation"
             return None
         if keep is not None and not keep(result):
+            self.last_recover = "BRAIN's checks not finished yet"
             return None
         result.notes.insert(0, note or f"recovered: result fetched after our wait ended ({sim_id})")
         return self._persist(self._finish(result))

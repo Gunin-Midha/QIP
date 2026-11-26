@@ -551,6 +551,25 @@ def test_missing_recordset_leaves_field_none(bcfg, config, memory, candidate):
     assert "brain_fetch_failed: pnl returned 404" in r.notes
 
 
+def test_server_error_on_a_recordset_keeps_the_result(bcfg, config, memory, candidate):
+    # run rs20261126060436: yearly-stats answered 500 after retries and two finished
+    # alphas were recorded as failed; a missing recordset is None plus a note
+    routes = brain_routes({("GET", "/alphas/A1/recordsets/yearly-stats"): [ok(None, status=500)]})
+    client, _, vc = make_client(routes, bcfg)
+    r = Simulator(client, memory, config, sleep=vc.sleep, clock=vc.clock).run(candidate())
+    assert r.status == "complete" and r.sharpe is not None and r.yearly == []
+    assert any(n.startswith("brain_fetch_failed: yearly_stats") for n in r.notes)
+
+
+def test_server_error_on_the_alpha_itself_still_fails_the_poll(bcfg, config, memory, candidate):
+    routes = brain_routes({("GET", "/alphas/A1"): [ok(None, status=500)]})
+    client, _, vc = make_client(routes, bcfg)
+    r = Simulator(client, memory, config, sleep=vc.sleep, clock=vc.clock).run(candidate())
+    assert r.status == "failed" and r.notes[0].startswith("poll_error:")
+    # BRAIN finished it: the next run start polls it again
+    assert [u["candidate_id"] for u in memory.unfinished_submissions()] == [r.candidate_id]
+
+
 def test_recordset_wait_is_bounded(bcfg, config, memory, candidate):
     routes = brain_routes({("GET", "/alphas/A1/recordsets/pnl"): [ok(None, retry_after=200)]})
     client, _, vc = make_client(routes, bcfg)
