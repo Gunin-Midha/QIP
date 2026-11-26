@@ -41,6 +41,18 @@ sharpe:
     step: {}
   - lever: increase_decay
     step: {to: 8}
+  # 2026-11-26 (owner; legs.py): combined alphas get their parts tested alone in a wave;
+  # once measured, reweight_legs (model) drops or reweights the weak part. recipe_blend
+  # reuses an accepted blend's partner of this market (mechanical); blend_other_dataset
+  # writes a partner with accepted recipes from any market in its prompt (its step is the
+  # prod_correlation entry's). In memory blend_other_dataset fixed sub-universe in 3 of 3
+  # CHN repairs.
+  - lever: reweight_legs
+    step: {}
+  - lever: recipe_blend
+    step: {weight: 1.0, repeatable: true}
+  - lever: blend_other_dataset
+    step: {}
   - lever: model_repair
     step: {}
 fitness:                            # fitness = Sharpe * sqrt(|returns| / max(turnover, 12.5%))
@@ -56,6 +68,18 @@ fitness:                            # fitness = Sharpe * sqrt(|returns| / max(tu
     step: {}
   - lever: hump
     step: {threshold: 0.01}
+  # 2026-11-26 (owner; legs.py): combined alphas get their parts tested alone in a wave;
+  # once measured, reweight_legs (model) drops or reweights the weak part. recipe_blend
+  # reuses an accepted blend's partner of this market (mechanical); blend_other_dataset
+  # writes a partner with accepted recipes from any market in its prompt (its step is the
+  # prod_correlation entry's). In memory blend_other_dataset fixed sub-universe in 3 of 3
+  # CHN repairs.
+  - lever: reweight_legs
+    step: {}
+  - lever: recipe_blend
+    step: {weight: 1.0, repeatable: true}
+  - lever: blend_other_dataset
+    step: {}
   - lever: model_repair
     step: {}
 turnover:
@@ -113,6 +137,18 @@ sub_universe:                       # the alpha must also work on the larger, li
     step: {}
   - lever: change_universe          # the smaller universe alone cut EUR's Sharpe 2.80 -> 1.03
     step: {to: TOP1000}
+  # 2026-11-26 (owner; legs.py): combined alphas get their parts tested alone in a wave;
+  # once measured, reweight_legs (model) drops or reweights the weak part. recipe_blend
+  # reuses an accepted blend's partner of this market (mechanical); blend_other_dataset
+  # writes a partner with accepted recipes from any market in its prompt (its step is the
+  # prod_correlation entry's). In memory blend_other_dataset fixed sub-universe in 3 of 3
+  # CHN repairs.
+  - lever: reweight_legs
+    step: {}
+  - lever: recipe_blend
+    step: {weight: 1.0, repeatable: true}
+  - lever: blend_other_dataset
+    step: {}
   - lever: model_repair
     step: {}
 drawdown:
@@ -142,6 +178,18 @@ recent_sharpe:                      # BRAIN's LOW_2Y_SHARPE / IS_LADDER_SHARPE: 
   - lever: set_neutralization
     step: {to: SUBINDUSTRY}
   - lever: restore_recent_performance
+    step: {}
+  # 2026-11-26 (owner; legs.py): combined alphas get their parts tested alone in a wave;
+  # once measured, reweight_legs (model) drops or reweights the weak part. recipe_blend
+  # reuses an accepted blend's partner of this market (mechanical); blend_other_dataset
+  # writes a partner with accepted recipes from any market in its prompt (its step is the
+  # prod_correlation entry's). In memory blend_other_dataset fixed sub-universe in 3 of 3
+  # CHN repairs.
+  - lever: reweight_legs
+    step: {}
+  - lever: recipe_blend
+    step: {weight: 1.0, repeatable: true}
+  - lever: blend_other_dataset
     step: {}
   - lever: model_repair
     step: {}
@@ -178,6 +226,8 @@ prod_correlation:                   # BRAIN's PROD_CORRELATION: too close to pro
                                     # kept it at 0.70-0.76; a third analyst blend 0.720, half 0.645
   - lever: differentiate_from_production
     step: {}
+  - lever: recipe_blend             # mechanical: the partner of an accepted blend in this
+    step: {weight: 1.0, repeatable: true}   # market (legs.py), no model call; 2026-11-26
   # Mechanical levers next to the model's (2026-11-25, BRAIN's tips for production
   # correlation: factor neutralization, small liquid universes). A wave takes one lever of
   # each kind, so a 4-fix wave is blend + one neutralization + one universe + one horizon.

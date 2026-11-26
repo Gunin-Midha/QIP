@@ -992,3 +992,24 @@ Owner: blending is how most accepts came; partners must suit the alpha they fix 
 Dry run on memory (no calls): for the EUR reversal leads the rules rank analyst69 as a proven partner (PnL correlation with the alpha 0.07-0.08); analyst69 is the partner of the accepted EUR blend.
 
 Bug found on the way (older): BRAIN's `brain:PROD_CORRELATION` / `SELF_CORRELATION` / `POWER_POOL_CORRELATION` gates were scored higher-is-better in `lever_stats._shortfall` and `_gate_slack`, so every production-correlation failure had distance 0 to accept (0.93 like 0.71). `_lower_is_better`. Replay: 26 of 173 repair distances change, 10 move wave tier (e.g. CHN retail 0.93: 0 -> 0.33). `tests/test_blend_planner.py` (10). 970 tests pass.
+
+## Stopping a run by hand (2026-11-26)
+
+Owner: Ctrl-C must still write the lessons and end the run as smoothly as possible. Before, Ctrl-C cancelled the BRAIN batch and the process ended with no report and no lessons. Now `cli research` installs a staged SIGINT handler (`ResearchRun.run(catch_interrupt=True)`): first press stops new model calls (`CallCounter.stopped`, raised as `LLMBudgetExhausted`, the run's usual budget stop), drops screened alphas not yet on BRAIN (`dropped_on_stop`), starts no new repair waves, waits for the alphas already on BRAIN and decides them, then writes lessons (model allowed) and the report; second press cancels the BRAIN batch and writes rule lessons and the report; third press quits. Tests `test_stop_by_hand.py`.
+
+## Flip fixes from run rs20261126082238 (2026-11-26)
+
+The closest alpha of the run (GBR model38 value, `r01a202_001_c1_r2a`, Sharpe 1.54 vs 1.58) came from a sign flip. Three faults: (1) a flip child mirrors its parent, so its distance to accept equals the parent's and `_next_start` (strictly closer) restarted the next waves on the negative parent: SUBINDUSTRY, hump, restore_recent_performance and size tilt were all simulated unflipped (-1.62, -0.48, -1.71, -1.25); (2) those negative children had risk-neutralized Sharpe less negative than raw (-0.93 vs -1.62, -1.11 vs -1.71) and were routed "factor neutralization first", so their distance was not mirrored (6-7 instead of ~0); the flip of `_r2d` should be Sharpe 1.71, fitness 1.61, sub-universe 0.85 (limit 0.81), 2-year 2.09; (3) `rank_transform` re-ranked `rank(a) + 0.5 * rank(b)` (same result, one simulation lost). Fixed in `research._next_start`, `evaluator.sharpe_route`, `repair_agent._rank_transform`. Rescue file `candidates/rescue_20261126_leads.json`, 12 variants on the three lineages with a chance to pass.
+
+## Part tests and recipes (2026-11-26)
+
+Owner asked why the pipeline did not find the hand fixes. Two of the reasons are now built (`legs.py`, module doc has the method):
+
+1. **Part tests.** A wave of a combined alpha also simulates each part alone (`leg_alone`, at most 3, once per lineage, no model call). The repair model then sees `<parts>` and a new lever `reweight_legs` drops, reweights or replaces the weak part. Before, nothing split an alpha, and the model, seeing only the whole alpha, raised the IND reversal leg's weight (robust-universe failure) instead of lowering it. A part closer to accept than the whole becomes the next wave's start in the usual way (that is "drop the other part").
+2. **Accepted recipes.** Accepted blends become recipes (partner part, market, what the parent failed, BRAIN's numbers). `recipe_blend` applies a same-market partner mechanically; `<recipes>` from every market go to the blend levers' prompts. `blend_other_dataset`, `recipe_blend` and `reweight_legs` are now offered for sharpe, fitness, sub-universe and recent-Sharpe failures (before: production correlation only); in memory blend_other_dataset fixed sub-universe in 3 of 3 CHN repairs.
+
+Dry run on memory: the IND model39 lead (Sharpe 2.29, robust-universe 0.87) gets the accepted IND alpha's analyst4 partner blended in plus its two parts alone; the IND sales-dispersion alpha gets its two parts alone. The GBR reversal stays at the depth limit (rescue file covers it).
+
+## Request-size fixes (2026-11-26)
+
+Run `rs20261126082238` lost two things to request size: the Lesson Writer's model write (12,000 characters of evidence fit no model's per-minute limit, so rules wrote the lessons) and gpt-oss for the whole run (the size client squeezed its output cap to fit 8,000 tokens a minute, the reasoning model thought until the cap ran out and replied empty, and an empty reply marks a model down). Now the Lesson Writer halves its evidence and asks again (floor 2,500 characters, then rules), and an empty reply under a cap the size client lowered is a too-large error for that call only: the agent falls back and the model stays up.

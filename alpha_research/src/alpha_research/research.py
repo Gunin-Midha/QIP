@@ -62,6 +62,9 @@ import hashlib
 import json
 import math
 import re
+import signal
+import sys
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -120,6 +123,7 @@ class CallCounter:
         self.by_model: dict[str, int] = {}
         self.down: dict[str, str] = {}   # model -> why it is out for the rest of the run
         self.too_large: dict[str, int] = {}   # model -> calls refused as too large
+        self.stopped: str | None = None   # set by Ctrl-C: no new model calls (lessons aside)
 
 
 class BudgetedLLM:
@@ -144,6 +148,8 @@ class BudgetedLLM:
         c = self.counter
         if self.model in c.down:
             raise ModelDown(self.model, c.down[self.model])
+        if c.stopped:
+            raise LLMBudgetExhausted(c.stopped)
         if c.max_calls is not None and c.calls >= c.max_calls:
             raise LLMBudgetExhausted(f"model call budget of {c.max_calls} used up")
         c.calls += 1
@@ -840,6 +846,9 @@ class ResearchRun:
         self.max_concurrent = max(1, config.simulator.max_concurrent)
         self.log: list[dict] = []
         self.stop_reason: str | None = None
+        self.stop_requested = False        # first Ctrl-C: finish what is on BRAIN, then stop
+        self.interrupts = 0                # Ctrl-C presses during run(catch_interrupt=True)
+        self.dropped_on_stop: list[str] = []   # screened alphas not sent to BRAIN after Ctrl-C
         self.resumed: list[dict] = []
         self.power_pool: list[dict] = []   # Power Pool candidates this run (recorded only)
         self.recovered: list[dict] = []
@@ -1083,7 +1092,11 @@ class ResearchRun:
             dist = distance(d, r, pen)
             if d is not None and d.decision == "repair" and dist is not None:
                 scored.append((dist, c.candidate_id, c, d, r))
-        closer = sorted(x for x in scored if pdist is None or x[0] < pdist)
+        # a flip of a sign-first parent mirrors it, so its distance equals the parent's
+        # (lever_stats._mirrored); it is still the alpha to build on, never the negative
+        # parent (run rs20261126082238: four fixes went to the unflipped parent, all negative)
+        closer = sorted(x for x in scored if pdist is None or x[0] < pdist
+                        or (x[2].lever == "flip_sign" and x[0] <= pdist))
         if closer:
             best = closer[0]
             priority = [x[2].lever for x in closer[1:] if x[2].lever]
@@ -1149,6 +1162,9 @@ class ResearchRun:
             entry["next"] = "none: no child completed (timeouts are recovered next run)"
             self._emit(f"  repair of {parent}: waiting, no fix completed on BRAIN "
                        "(timeouts are recovered at the next run's start)")
+            return
+        if self.stop_requested:
+            entry["next"] = "none: run stopped by hand (resumed at the next run's start)"
             return
         start = self._next_start(wave["parent"],
                                  [(c, o.decision_record, o.result) for c, o in done])
@@ -1405,21 +1421,78 @@ class ResearchRun:
         return [c.expression for a in self.pipeline.pool.alpha_ids()
                 if (c := self.memory.get_candidate(a)) is not None]
 
-    def run(self, rounds: int) -> dict:
-        self._run(rounds)
-        lessons = self._learn()
-        report = self.report()   # after the Lesson Writer, so its model call is counted
-        report["lessons"] = lessons
-        return report
+    def run(self, rounds: int, *, catch_interrupt: bool = False) -> dict:
+        """The research run, then the Lesson Writer and the report. With ``catch_interrupt``
+        (``cli research``, owner 2026-11-26: a stop by hand must still write the lessons and
+        end smoothly) Ctrl-C is staged:
 
-    def _learn(self) -> dict | None:
+        1. first press: no new model calls, no new alphas to BRAIN, no new repair waves; the
+           alphas already on BRAIN finish and are decided, then lessons and the report;
+        2. second press: the simulations still on BRAIN are cancelled; rule lessons (no model
+           call) and the report are written at once;
+        3. third press: quit at once (nothing more is written).
+
+        Open repairs and anything left unfinished are picked up at the next run's start."""
+        restore = None
+        if catch_interrupt and threading.current_thread() is threading.main_thread():
+            restore = signal.signal(signal.SIGINT, self._on_interrupt)
+        try:
+            hard = False
+            try:
+                self._run(rounds)
+            except KeyboardInterrupt:
+                if self.interrupts >= 3 or not catch_interrupt:
+                    raise
+                hard = True
+                self.stop_reason = ("stopped by hand (Ctrl-C twice): simulations still on "
+                                    "BRAIN were cancelled")
+                self._emit(f"--- {self.stop_reason}; writing lessons (rules) and the report "
+                           "(Ctrl-C again to quit at once)")
+            if self.stop_requested and not hard:
+                self._emit("--- every alpha on BRAIN is in; writing lessons and the report")
+            self.counter.stopped = None   # the Lesson Writer may use its one model call
+            lessons = self._learn(use_model=not hard)
+            report = self.report()   # after the Lesson Writer, so its model call is counted
+            report["lessons"] = lessons
+            return report
+        finally:
+            if restore is not None:
+                signal.signal(signal.SIGINT, restore)
+
+    def _on_interrupt(self, signum, frame) -> None:
+        """SIGINT handler while ``run(catch_interrupt=True)`` runs (see ``run``)."""
+        self.interrupts += 1
+        if self.interrupts == 1:
+            self.request_stop()
+            return
+        if self.interrupts >= 3:   # the next one goes straight to Python
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+        raise KeyboardInterrupt
+
+    def request_stop(self, why: str = "stopped by hand (Ctrl-C)") -> None:
+        """Finish smoothly: no new model calls (each raises ``LLMBudgetExhausted``, which
+        every caller already treats as the end of the run), no new alphas to BRAIN and no new
+        repair waves; the alphas already running on BRAIN are waited for and decided."""
+        if self.stop_requested:
+            return
+        self.stop_requested = True
+        self.stop_reason = self.stop_reason or why
+        self.counter.stopped = why
+        n = self._in_flight
+        wait = (f"waiting for the {n} alpha(s) on BRAIN to finish, then "
+                if n else "")
+        print(f"\n--- {why}: {wait}writing lessons and the report. "
+              "Ctrl-C again to cancel what is on BRAIN and stop now.",
+              file=self.out or sys.stderr, flush=True)
+
+    def _learn(self, use_model: bool = True) -> dict | None:
         """Lesson Writer after the run (lessons.py): evidence from all of memory, lessons
         written by the strategy model while the budget lasts, else by rules; stored for the
         next run's agents."""
         cfg = self.agents.lessons
         if not cfg.after_every_batch:
             return None
-        llm = self.fallback(self.models.strategy) if cfg.use_model else None
+        llm = self.fallback(self.models.strategy) if cfg.use_model and use_model else None
         args = (self.memory.candidate_outcomes(), self.spec,
                 lambda region, delay: self.catalog_of(region, delay)[1], cfg)
         try:
@@ -1912,6 +1985,10 @@ class ResearchRun:
         queued, self.sim_queue = self.sim_queue, []
         if not queued:
             return
+        if self.stop_requested:   # Ctrl-C: nothing new goes to BRAIN
+            self.dropped_on_stop += [c.candidate_id for _, c, _, _ in queued]
+            self._emit(f"--- stopping: {len(queued)} screened alpha(s) not sent to BRAIN")
+            return
         if len(queued) > 1:
             self._emit(f"--- BRAIN: simulating {len(queued)} alphas together")
         meta = {c.candidate_id: (key, c, log, credit) for key, c, log, credit in queued}
@@ -2012,7 +2089,8 @@ class ResearchRun:
             self.director.update(self._current(key), outcome.decision == "accept")
         if in_wave:   # the wave decides where repair goes next, once all its children are in
             self._wave_done(cand.candidate_id, cand, outcome)
-        elif outcome.decision == "repair" and outcome.decision_record is not None:
+        elif outcome.decision == "repair" and outcome.decision_record is not None \
+                and not self.stop_requested:   # after Ctrl-C: resumed at the next start
             rep = self._start_wave(key, cand, outcome.decision_record, outcome.result)
             item["repair"] = rep.notes
             if rep.children:
@@ -2129,6 +2207,7 @@ class ResearchRun:
         return {
             "run_id": self.run_id,
             "stop_reason": self.stop_reason,
+            "dropped_on_stop": self.dropped_on_stop,
             # BRAIN's daily simulation limit after the last submit (X-Ratelimit-* headers)
             "brain_quota": dict(getattr(self.client, "quota", None) or {}),
             "power_pool_candidates": self.power_pool,

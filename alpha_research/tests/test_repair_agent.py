@@ -64,9 +64,9 @@ def test_wrapping_levers(candidate):
     assert apply("volatility_scale", c, window=20).expression == \
         "rank(-ts_delta(close, 5)) / ts_std_dev(returns, 20)"
     assert apply("rank_transform", candidate(expression="close - open")).expression == "rank(close - open)"
-    with pytest.raises(LeverNotApplicable, match="already a rank"):
+    with pytest.raises(LeverNotApplicable, match="already ranks"):
         apply("rank_transform", c)
-    with pytest.raises(LeverNotApplicable, match="already a rank"):  # rank(-rank(x)) = -rank(x)
+    with pytest.raises(LeverNotApplicable, match="already ranks"):  # rank(-rank(x)) = -rank(x)
         apply("rank_transform", candidate(expression="-rank(ts_delta(close, 5))"))
     with pytest.raises(LeverNotApplicable, match="not in the operator list"):
         apply("wrap_in_smoothing", c, operator="no_such_op", window=5)

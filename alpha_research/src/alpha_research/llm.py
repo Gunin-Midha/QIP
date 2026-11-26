@@ -578,6 +578,18 @@ class RequestFitClient:
             log.warning("%s: request of %d tokens refused; retrying with output cap %d",
                         self.model, exc.requested, room)
             reply = self.inner.complete(system, user, max_output=room)
+        except LLMUnavailable as exc:
+            # run rs20261126082238: gpt-oss (a reasoning model) got a cap squeezed to fit its
+            # 8,000 tokens a minute, thought until the cap ran out and replied empty, and was
+            # marked down for the run. A cap we lowered is this request's problem, not the
+            # model's: the call fails as too large (the agent falls back, the model stays up)
+            if cap < max_output and "empty reply" in str(exc):
+                self.refused += 1
+                raise RequestTooLarge(self.model, f"output cap lowered to {cap} (from "
+                                      f"{max_output}) so the prompt fits "
+                                      f"{self.tokens_per_minute} tokens a minute, and the "
+                                      f"reply was empty: {exc}") from exc
+            raise
         self._measure(chars, getattr(self.inner, "last_prompt_tokens", None))
         return reply
 

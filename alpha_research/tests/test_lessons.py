@@ -245,3 +245,36 @@ def test_model_path_with_described_changes(memory, candidate):
     out = learn(memory.candidate_outcomes(), SPEC, lambda r, d: META, CFG,
                 llm=ScriptedLLMClient([json.dumps({"lessons": [lesson]})]))
     assert out.source == "model" and out.lessons == [lesson]   # CHN known from the region
+
+
+def test_too_large_request_halves_the_evidence_and_asks_again(memory, candidate, monkeypatch):
+    # run rs20261126082238: the evidence did not fit any model's per-minute limit
+    from alpha_research import lessons as lessons_mod
+    from alpha_research.llm import RequestTooLarge
+
+    monkeypatch.setattr(lessons_mod, "trimmed", lambda ev, chars: {"evidence": "y" * chars})
+
+    class Fits:
+        model = "groq:fake/model"
+
+        def __init__(self, limit):
+            self.limit, self.sizes = limit, []
+
+        def complete(self, system, user, *, max_output=4096):
+            self.sizes.append(len(user))
+            if len(user) > self.limit:
+                raise RequestTooLarge(self.model, "too big")
+            return json.dumps({"lessons": [{"audience": "repair", "scope": "EUR",
+                                            "text": "size_tilt fixed 3 of 3 in EUR."}]})
+
+    tilt_history(memory, candidate)
+    outcomes = memory.candidate_outcomes()
+    cfg = LessonsConfig(max_prompt_chars=12000)
+    llm = Fits(limit=6000 + 3000)    # fits once the evidence is cut to 6,000 characters
+    out = learn(outcomes, SPEC, lambda r, d: META, cfg, llm=llm)
+    assert out.source == "model" and len(llm.sizes) == 2 and llm.sizes[1] < llm.sizes[0]
+    assert any("evidence cut to 6000" in n for n in out.notes)
+    # never fits: the rules stand (stops at lessons.MIN_PROMPT_CHARS)
+    small = Fits(limit=10)
+    out = learn(outcomes, SPEC, lambda r, d: META, cfg, llm=small)
+    assert out.source == "rules" and "unavailable" in out.notes[-1] and len(small.sizes) == 3

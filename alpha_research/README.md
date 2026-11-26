@@ -520,6 +520,12 @@ we stop waiting for: Ctrl-C cancels the batch's running simulations, and a submi
 still unfinished `simulator.cancel_stuck_after_hours` (6) after it was sent is cancelled
 at the next research run start (`DELETE /simulations/<id>`).
 
+Stopping `cli research` by hand: press Ctrl-C **once** to stop smoothly: no new model calls
+and no new alphas go to BRAIN, the alphas already running there finish and are decided, then
+the Lesson Writer runs and the report is written. Press it **twice** to cancel what is still
+on BRAIN and write rule lessons (no model call) and the report at once; **three times** quits
+immediately. Open repairs and dropped alphas' parents are picked up at the next run start.
+
 `cli repair` writes one child per applicable mechanical lever (every failing class, best
 ranked first; experiments already in memory are skipped), with `parent_id` and `lever`
 set, so the results of a hand rescue become evidence for the learner too.

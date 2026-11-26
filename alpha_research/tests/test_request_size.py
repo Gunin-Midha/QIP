@@ -172,3 +172,26 @@ def test_strategy_config_reads_max_prompt_chars(tmp_path):
     p = tmp_path / "a.yaml"
     p.write_text(yaml.safe_dump(raw))
     assert load_agents_config(p).strategy.max_prompt_chars is None
+
+
+def test_an_empty_reply_under_a_lowered_cap_is_too_large_not_down():
+    # run rs20261126082238: gpt-oss thought through a squeezed cap, replied empty, went down
+    class Thinker:
+        model, provider = "groq:fake/model", "fake"
+
+        def complete(self, system, user, *, max_output=4096):
+            if max_output < 4096:
+                raise LLMUnavailable("model returned an empty reply (finish_reason length)")
+            return "ok"
+
+    fit = RequestFitClient(Thinker(), 8000, chars_per_token=3.0)
+    counter = CallCounter(None)
+    llm = BudgetedLLM(fit, counter=counter)
+    with pytest.raises(RequestTooLarge, match="output cap lowered"):
+        llm.complete("s", "x" * 15000, max_output=4096)
+    assert "groq:fake/model" not in counter.down            # stays up for smaller calls
+    assert llm.complete("s", "x" * 30, max_output=4096) == "ok"
+    # an empty reply at the requested cap is still the model's failure
+    with pytest.raises(ModelDown):
+        BudgetedLLM(RequestFitClient(Thinker(), 8000), counter=counter).complete(
+            "s", "x", max_output=1000)

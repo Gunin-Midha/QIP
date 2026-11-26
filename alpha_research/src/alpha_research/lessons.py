@@ -49,12 +49,14 @@ from .config import ConfigError
 from .fastexpr import FastExprError, FastExprSpec
 from .generator import GenerationError, ask_json, dataset_category
 from .lever_stats import failing_classes
-from .llm import LLMClient, LLMUnavailable
+from .llm import LLMClient, LLMUnavailable, RequestTooLarge
 from .prompts import lessons_system, lessons_user
 from .repair_agent import expression_fields
 
 AUDIENCES = ("generator", "repair")
 MAX_CHARS = 400
+# smallest evidence the Lesson Writer sends after halving it for a too-large request
+MIN_PROMPT_CHARS = 2500
 RATIO_MIN_SHARPE = 0.5
 COMPUTED_LAST = {"prod_correlation", "self_correlation"}
 MAX_DESCRIBED = 40
@@ -344,18 +346,29 @@ def learn(outcomes: list[dict], spec: FastExprSpec, meta_for: Callable[[str, int
         return out
     if llm is None or not config.use_model:
         return out
-    try:
-        reply, calls = ask_json(llm, lessons_system(context),
-                                lessons_user(trimmed(ev, config.max_prompt_chars),
-                                             config.max_lessons),
-                                max_output=max_output)
-    except GenerationError as exc:
-        out.llm_calls += 2
-        out.notes.append(f"lessons model reply unusable, rule lessons kept: {exc}")
-        return out
-    except LLMUnavailable as exc:   # down, out of quota, request too large: rules stand
-        out.notes.append(f"lessons model unavailable, rule lessons kept: {exc}")
-        return out
+    chars = config.max_prompt_chars
+    while True:
+        try:
+            reply, calls = ask_json(llm, lessons_system(context),
+                                    lessons_user(trimmed(ev, chars), config.max_lessons),
+                                    max_output=max_output)
+            break
+        except RequestTooLarge as exc:
+            # run rs20261126082238: 12,000 characters of evidence did not fit any model's
+            # per-minute limit and the rules wrote the lessons; halve the evidence and ask
+            # again (each try is refused before sending once the host's ratio is measured)
+            if chars // 2 < MIN_PROMPT_CHARS:
+                out.notes.append(f"lessons model unavailable, rule lessons kept: {exc}")
+                return out
+            chars //= 2
+            out.notes.append(f"request too large; evidence cut to {chars} characters")
+        except GenerationError as exc:
+            out.llm_calls += 2
+            out.notes.append(f"lessons model reply unusable, rule lessons kept: {exc}")
+            return out
+        except LLMUnavailable as exc:   # down, out of quota: rules stand
+            out.notes.append(f"lessons model unavailable, rule lessons kept: {exc}")
+            return out
     out.llm_calls += calls
     items = reply.get("lessons") if isinstance(reply, dict) else None
     scopes = _scopes(ev)

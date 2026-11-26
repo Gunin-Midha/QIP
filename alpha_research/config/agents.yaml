@@ -122,6 +122,11 @@ repair:
   fill_freed_slots: true           # owner 2026-11-23: each alpha is decided as it finishes; a
                                    # ready wave takes a BRAIN slot freed mid-batch at once
   model_levers_per_wave: 1
+  # Part tests (owner 2026-11-26, legs.py): a wave of an alpha that combines parts (a sum of
+  # signals or a product of factors) also simulates each part alone, at most this many
+  # parts, once per lineage, on top of the wave's fixes (no model call). Then reweight_legs
+  # (a model lever) sees what each part did and drops or reweights the weak one. 0 = off.
+  leg_tests: 3
   # Wave size by how close and how real the alpha is (owner 2026-11-23: many fixes only for
   # alphas that are really close and have value). Distance to accept = sum of each failing
   # check's normalized shortfall (lever_stats.distance). In memory on 2026-11-23 both

@@ -134,6 +134,9 @@ class RepairLearningConfig:
     lead_sharpe_share: float | None = None
     lead_fixes: int = 0
     unmeasured_failure_penalty: float = 0.5   # distance added by a failure with no value
+    # part tests (legs.py, owner 2026-11-26): a wave of a combined alpha also simulates each
+    # of its parts alone (at most this many parts; 0 = off), once per lineage
+    leg_tests: int = 0
     region_prior_strength: float = 2.0   # events the all-region estimate counts for in a region
 
     @classmethod
@@ -188,6 +191,7 @@ class RepairLearningConfig:
                    lead_sharpe_share=(None if sec.get("lead_sharpe_share") is None
                                       else float(num("lead_sharpe_share", 0, 2))),
                    lead_fixes=count("lead_fixes", 0),
+                   leg_tests=count("leg_tests", 0),
                    unmeasured_failure_penalty=float(num("unmeasured_failure_penalty", 0, 10)),
                    region_prior_strength=float(num("region_prior_strength", 0, 1000)))
 

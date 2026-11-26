@@ -68,8 +68,8 @@ def test_every_model_lever_in_the_playbook_has_instructions(playbook):
     from alpha_research.lever_stats import combo_parts
     names = {l.name for levers in playbook.entries.values() for l in levers}
     # a combination of mechanical levers needs no model instructions
-    model_levers = {n for n in names - set(MECHANICAL)
-                    if not (combo_parts(n) and set(combo_parts(n)) <= set(MECHANICAL))}
+    from alpha_research.repair_agent import _mechanical
+    model_levers = {n for n in names if not _mechanical(n)}   # recipe_blend: no model call
     assert model_levers and model_levers <= set(prompts.LEVER_INSTRUCTIONS)
 
 

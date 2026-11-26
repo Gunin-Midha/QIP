@@ -333,6 +333,12 @@ def sharpe_route(failed: list[GateResult], result: ResultRecord, shares: dict | 
     if g is None or not near_miss([g], "sharpe", shares, result, sign_mirrors=sign_mirrors)[0]:
         return None
     rn = risk_neutralized_sharpe(result)
+    if sign_mirrors and g.value < 0 and (rn is None or rn <= 0):
+        # flipping mirrors the alpha, so a risk-neutralized Sharpe that is only less
+        # negative is not a better alpha, it is a weaker mirror (run rs20261126082238: raw
+        # -1.71, risk-neutralized -1.11 was routed factor first and scored 7 from accept,
+        # though its flip was Sharpe 1.71, fitness 1.61); flip first
+        return f"{SIGN_FIRST}: Sharpe {g.value} is negative"
     if gap is not None and rn is not None and rn - g.value >= gap:
         raw_near = near_miss([g], "sharpe", shares, sign_mirrors=sign_mirrors)[0]
         if primary == "sharpe" or not raw_near:

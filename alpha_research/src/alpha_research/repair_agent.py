@@ -97,13 +97,15 @@ from .lever_stats import (PINNED_LAST, LeverStats, RepairLearningConfig, combo_p
                           family_budget, needs, rank_levers, repair_events,
                           successful_examples)
 from .llm import LLMClient, ModelDown
+from . import legs
+from .legs import LEG_LEVER, RECIPE_LEVER, REWEIGHT_LEVER
 from .memory import MemoryStore
 from .prompts import repair_system, repair_user
 from .repair import Lever, Playbook
 from .research_loop import assign_lineage, lineage_members, lineage_root
 from .schemas import (SHORT_RESTRICTED_REGIONS, CandidateRecord, DecisionRecord, ResultRecord,
                       SchemaError,
-                      experiment_hash, neutralizations_for)
+                      experiment_hash, neutralizations_for, normalize_expression)
 
 MODEL_LEVERS_NOTE = "lever has no mechanical rewrite; the model was asked"
 
@@ -136,6 +138,7 @@ LEVER_KINDS = {
     "set_neutralization": "neutralization",
     "change_universe": "universe", "liquidity_tilt": "universe", "size_tilt": "universe",
     "backfill_fields": "data", "flip_sign": "sign",
+    RECIPE_LEVER: "blend",
 }
 
 
@@ -270,12 +273,40 @@ def _hump(c, step, spec, result=None):
     return _with_final(c, Call("hump", (_final(c)[1],), (("hump", _num(step.get("threshold"))),)))
 
 
+RANK_SHAPED = ("rank", "group_rank")
+
+
+def _rank_shaped(node, env: dict, seen: frozenset = frozenset()) -> bool:
+    """The value is already ranks: a rank/group_rank call, or a sum, difference or constant
+    multiple of rank-shaped parts (variables followed through their assignments). Ranking
+    such a value again changes almost nothing (run rs20261126082238: rank(rank(a) + 0.5 *
+    rank(b)) gave Sharpe 1.25 / fitness 0.97, the same as without it)."""
+    if isinstance(node, Call):
+        return node.name in RANK_SHAPED
+    if isinstance(node, Unary):
+        return node.op == "-" and _rank_shaped(node.operand, env, seen)
+    if isinstance(node, Name):
+        if node.name in seen or node.name not in env:
+            return False
+        return _rank_shaped(env[node.name], env, seen | {node.name})
+    if isinstance(node, Binary):
+        if node.op in ("+", "-"):
+            return _rank_shaped(node.left, env, seen) and _rank_shaped(node.right, env, seen)
+        if node.op == "*":
+            return (isinstance(node.left, Num) and _rank_shaped(node.right, env, seen)) or \
+                   (isinstance(node.right, Num) and _rank_shaped(node.left, env, seen))
+        if node.op == "/":
+            return isinstance(node.right, Num) and _rank_shaped(node.left, env, seen)
+    return False
+
+
 def _rank_transform(c, step, spec, result=None):
     _need_op(spec, "rank")
-    final = _final(c)[1]
-    inner = final.operand if isinstance(final, Unary) and final.op == "-" else final
-    if isinstance(inner, Call) and inner.name == "rank":  # rank(-rank(x)) = -rank(x)
-        raise LeverNotApplicable("expression is already a rank(...)")
+    head, final = _final(c)
+    env = {s.name: s.value for s in head if isinstance(s, Assign)}
+    if _rank_shaped(final, env):   # rank(-rank(x)) = -rank(x); rank(rank(a) + rank(b)) ~ same
+        raise LeverNotApplicable("expression is already ranks (rank/group_rank or a "
+                                 "combination of them)")
     return _with_final(c, Call("rank", (final,), ()))
 
 
@@ -902,6 +933,12 @@ class RepairAgent:
             if self.llm is None:
                 out.notes.append("production correlation needs a model call; no model is "
                                  "configured")
+        parts = self._parts(candidate, outcomes)
+        if not prod and sum(r["result"] is not None for r in parts) >= 2:
+            # the parts were measured alone: the model's rewrite of the combination
+            # (reweight_legs) takes the wave's model slot first
+            first = [x for x in options if x[1].name == REWEIGHT_LEVER]
+            options = first + [x for x in options if x not in first]
         out.notes.append("wave order: " + ", ".join(lv.name for _, lv in options))
         seen = {(candidate.expression, candidate.universe, candidate.decay,
                  candidate.neutralization, candidate.truncation)}
@@ -957,6 +994,16 @@ class RepairAgent:
         if prod and model_tries == 0:
             out.notes.append("no model call for production correlation: its model levers "
                              "did not apply (see the notes above)")
+        if not any(r.startswith(SIGN_FIRST) for r in decision.reasons):
+            room = left - len(out.children)
+            for child in self._leg_tests(candidate, outcomes, room, out)[:max(room, 0)]:
+                key = (child.expression, child.universe, child.decay, child.neutralization,
+                       child.truncation)
+                if key in seen or self.memory.has_result_for_hash(experiment_hash(child)):
+                    continue
+                seen.add(key)
+                out.children.append(dataclasses.replace(
+                    child, candidate_id=self._free_id(child.candidate_id, out.children)))
         if out.children:
             out.child, out.lever = out.children[0], out.children[0].lever
         else:
@@ -1099,8 +1146,7 @@ class RepairAgent:
             for lever, _ in self.ranked(candidate, d, result, stats):
                 if lever.name in tried or lever.name in names:
                     continue
-                mechanical = lever.name in MECHANICAL or (
-                    combo_parts(lever.name) and all(x in MECHANICAL for x in combo_parts(lever.name)))
+                mechanical = _mechanical(lever.name)
                 if not mechanical and not use_model:
                     notes.append(f"{lever.name}: skipped (model lever)")
                     continue
@@ -1169,10 +1215,18 @@ class RepairAgent:
         fn = MECHANICAL.get(lever.name)
         if fn is not None:
             return fn(c, lever.step, self.spec, result)
+        if lever.name == RECIPE_LEVER:
+            return self._recipe_blend(c, lever.step, result, out)
+        parts = self._parts(c, getattr(self, "_outcomes", None)
+                            or self.memory.candidate_outcomes())
+        if lever.name == REWEIGHT_LEVER and sum(r["result"] is not None for r in parts) < 2:
+            raise LeverNotApplicable("fewer than two parts of the alpha were measured alone")
         if self.llm is None:
             raise LeverNotApplicable("needs the model, and no model is configured")
         partners = None
         if lever.name == BLEND_LEVER:
+            if not lever.step:   # listed under another class: the prod_correlation step
+                lever = dataclasses.replace(lever, step=self._blend_step())
             partners = self._partners(c, lever.step)
             if not partners:
                 raise LeverNotApplicable("no partner field from another dataset in the "
@@ -1189,7 +1243,11 @@ class RepairAgent:
                                c, getattr(self, "_outcomes", None)
                                or self.memory.candidate_outcomes(), self.spec)
                                if partners else None),
-                           lessons=self._lessons_for(c))
+                           lessons=self._lessons_for(c),
+                           parts=legs.part_lines(parts) if parts else None,
+                           recipes=(legs.recipe_lines(self._recipes())
+                                    if lever.name in (BLEND_LEVER, REWEIGHT_LEVER, "model_repair")
+                                    else None))
         try:
             reply, calls = ask_json(self.llm, repair_system(self.context), user,
                                     max_output=self.max_output)
@@ -1257,6 +1315,104 @@ class RepairAgent:
         meta = self.field_meta.get((c.region, c.delay), self.field_meta.get(None)) or {}
         return for_agent(self.lessons, "repair", c.region, dataset_category(c.dataset, meta))
 
+    def _blend_step(self) -> Mapping:
+        """blend_other_dataset's step where the playbook spells it out (prod_correlation)."""
+        return next((lv.step for levers in self.playbook.entries.values() for lv in levers
+                     if lv.name == BLEND_LEVER and lv.step), {})
+
+    def _meta(self, region: str, delay: int) -> Mapping:
+        return self.field_meta.get((region, delay), self.field_meta.get(None)) or {}
+
+    def _recipes(self) -> list[dict]:
+        outcomes = getattr(self, "_outcomes", None) or self.memory.candidate_outcomes()
+        return legs.recipes(outcomes, self._meta, self.spec)
+
+    def _parts(self, c: CandidateRecord, outcomes: list[dict]) -> list[dict]:
+        """Parts of ``c`` with their alone results; when none of its parts was measured,
+        those of its nearest ancestor whose parts were (a fix such as a backfill changes
+        the parts' text, not what they are)."""
+        n = self.learning.leg_tests or 3
+        by_id = {o["candidate"].candidate_id: o for o in outcomes}
+        node = c
+        for _ in range(20):
+            rows = legs.part_results(node, outcomes, self.spec, n)
+            if any(r["result"] is not None for r in rows):
+                if node is not c:
+                    for r in rows:
+                        r["settings"] = (r["settings"] or "") + f"; parts of ancestor {node.candidate_id}"
+                return rows
+            o = by_id.get(node.parent_id) if node.parent_id else None
+            if o is None:
+                return legs.part_results(c, outcomes, self.spec, n)
+            node = o["candidate"]
+        return []
+
+    def _leg_tests(self, c: CandidateRecord, outcomes: list[dict], room: int,
+                   out: RepairOutcome) -> list[CandidateRecord]:
+        """One child per part of ``c``, each the part alone (legs.py), once per lineage."""
+        n = self.learning.leg_tests
+        if n <= 0 or room <= 0 or c.lever == LEG_LEVER:
+            return []
+        cands = {o["candidate"].candidate_id: o["candidate"] for o in outcomes}
+        cands[c.candidate_id] = c
+        root = lineage_root(c.candidate_id, cands)
+        if any(o["candidate"].lever == LEG_LEVER
+               and lineage_root(o["candidate"].candidate_id, cands) == root for o in outcomes):
+            return []
+        meta = self._meta(c.region, c.delay)
+        kids = []
+        for i, leg in enumerate(legs.split_legs(c.expression, self.spec, n), 1):
+            ds = legs._datasets(expression_fields(leg, self.spec), meta, self.spec)
+            new = dataclasses.replace(
+                c, expression=leg, dataset=sorted(ds)[0] if len(ds) == 1 else c.dataset,
+                hypothesis=f"Part test: part {i} of {c.candidate_id} alone, to see which part "
+                           f"carries the alpha and which one fails. {c.hypothesis or ''}".strip())
+            child = self._child(c, new, LEG_LEVER)
+            if child is not None:
+                kids.append(child)
+                out.notes.append(f"{LEG_LEVER}: part {i} of {len(legs.split_legs(c.expression, self.spec, n))}")
+        return kids
+
+    def _recipe_blend(self, c: CandidateRecord, step: Mapping, result,
+                      out: RepairOutcome) -> CandidateRecord:
+        """An accepted blend's partner from this market blended into ``c`` (legs.py)."""
+        outcomes = getattr(self, "_outcomes", None) or self.memory.candidate_outcomes()
+        by_id = {o["candidate"].candidate_id: o for o in outcomes}
+        meta = self._meta(c.region, c.delay)
+        try:
+            own = legs._datasets(expression_fields(c.expression, self.spec), meta, self.spec)
+        except FastExprError as exc:
+            raise LeverNotApplicable(f"expression does not parse: {exc}") from exc
+        own.add(c.dataset)
+        tried = legs.tried_partner_texts(c, by_id)
+        fields = self._fields(c)
+        for rec in legs.recipes(outcomes, self._meta, self.spec):
+            if (rec["region"], rec["delay"]) != (c.region, c.delay) \
+                    or rec["partner_dataset"] in own:
+                continue
+            key = normalize_expression(rec["partner"])
+            if key in tried:
+                continue
+            if fields and not expression_fields(rec["partner"], self.spec) <= set(fields) \
+                    | set(self.spec.base_fields) | set(self.spec.groups):
+                continue
+            weight = blend_weight(step, result)
+            try:
+                expr = build_blend(c.expression, rec["partner"], self.spec, weight=weight)
+            except (FastExprError, LeverNotApplicable) as exc:
+                out.notes.append(f"{RECIPE_LEVER}: cannot blend {rec['candidate_id']}'s "
+                                 f"partner: {exc}")
+                continue
+            out.notes.append(f"{RECIPE_LEVER}: partner of accepted {rec['candidate_id']} "
+                             f"({rec['partner_dataset']}), weight {weight}")
+            return dataclasses.replace(
+                c, expression=expr,
+                hypothesis=f"[recipe {key}] {c.hypothesis or ''} Blended with the "
+                           f"{rec['partner_dataset']} partner of the accepted "
+                           f"{rec['candidate_id']} in this market.".strip())
+        raise LeverNotApplicable(f"no untried partner from an accepted blend in {c.region} "
+                                 f"delay {c.delay} that uses other data")
+
     def _partners(self, c: CandidateRecord, step: Mapping) -> list[tuple[str, dict]]:
         """Shortlist of partner fields for blend_other_dataset in the alpha's market."""
         meta = self.field_meta.get((c.region, c.delay), self.field_meta.get(None)) or {}
@@ -1289,7 +1445,8 @@ class RepairAgent:
 
 def _mechanical(name: str) -> bool:
     parts = combo_parts(name)
-    return name in MECHANICAL or bool(parts and all(x in MECHANICAL for x in parts))
+    return name in MECHANICAL or name == RECIPE_LEVER or bool(
+        parts and all(x in MECHANICAL for x in parts))
 
 
 def _partner_line(f: str, m: dict) -> str:

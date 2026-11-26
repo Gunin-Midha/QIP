@@ -727,13 +727,15 @@ def _research(args) -> int:
                           playbook=playbook, spec=spec, generator_config=gen_config,
                           memory=memory, datafields=datafields, field_meta=field_meta,
                           markets=markets, seeds=seeds, seed=args.seed, out=sys.stdout)
-        report = run.run(args.rounds)
+        report = run.run(args.rounds, catch_interrupt=True)   # staged Ctrl-C (ResearchRun.run)
         path = write_report(report, args.report or Path(args.data_dir) / f"{report['run_id']}.json")
     finally:
         memory.close()
     print(f"stopped: {report['stop_reason']} | simulations {report['simulations_used']} | "
           f"model calls {report['model_calls']} | pool {report['pool_size']} | report {path}")
     print(f"  model calls by model: {report['model_calls_by_model']}")
+    if report.get("dropped_on_stop"):
+        print(f"  not sent to BRAIN after Ctrl-C: {len(report['dropped_on_stop'])} screened alpha(s)")
     for line in quality_lines(report["generation_quality"]):
         print(f"  {line}")
     if report.get("brain_quota"):
