@@ -23,6 +23,9 @@ SYSTEMS = {
     "repair": (prompts.repair_system, ['"expression"', '"explanation"']),
     "strategy": (prompts.strategy_system, ['"guidance"', '"hypotheses"', '"dataset"']),
     "lessons": (prompts.lessons_system, ['"lessons"', '"audience"', '"scope"', '"text"']),
+    "blend_plan": (prompts.blend_plan_system, ['"variants"', '"partner"', '"mechanism"',
+                                               '"partner_alone"', '"weight"']),
+    "blend_review": (prompts.blend_review_system, ['"reviews"', '"keep"', '"reason"']),
 }
 
 
@@ -108,7 +111,7 @@ def test_research_run_wires_prompts_and_context(memory, config, playbook):
     from test_research import RouterLLM, make_run
     llm = RouterLLM()
     report = make_run(memory, config, playbook, llm=llm).run(2)
-    assert report["prompt_versions"] == {"generator": "gen-v14", **prompts.PROMPT_VERSIONS}
+    assert report["prompt_versions"] == {"generator": "gen-v15", **prompts.PROMPT_VERSIONS}
     assert report["models"]["generator"] == ["claude-test"]
     agent_systems = [s for s in llm.all_systems if "Fast Expression language." not in s[:200]
                      and not s.startswith("You are a quantitative researcher")]

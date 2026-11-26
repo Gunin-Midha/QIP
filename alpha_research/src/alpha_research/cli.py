@@ -677,6 +677,16 @@ def _fresh_login(session, brain_config) -> None:
         print(f"BRAIN login valid for {left / 3600:.1f} h", flush=True)
 
 
+def _unattended(session) -> None:
+    """After the start-up login, a research run never waits for a person: a login BRAIN
+    ends mid-run raises (the run stops cleanly with its report) instead of asking for the
+    biometric check or credentials at a terminal nobody may be watching (owner 2026-11-26)."""
+    if hasattr(session, "on_biometric"):
+        session.on_biometric = None
+    if hasattr(session, "ask_credentials"):
+        session.ask_credentials = None
+
+
 def _research(args) -> int:
     config = load_config(args.config)
     config.require_holdout()  # before logging in or calling the model
@@ -708,6 +718,7 @@ def _research(args) -> int:
     session = _brain_session(brain_config)
     _fresh_login(session, brain_config)
     _keep_awake(args)
+    _unattended(session)
     client = RealBrainClient(session, brain_config, capture_dir=args.capture_dir)
     memory = MemoryStore(args.data_dir)
     try:

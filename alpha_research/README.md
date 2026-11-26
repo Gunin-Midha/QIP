@@ -677,6 +677,66 @@ work in another.
   least floor(share x slots / regions) slots a round; `director.max_region_share` (0.6)
   caps a region while another is below it. Arm posteriors are already per region.
 
+## Arm Designer: the pipeline writes its own arms (2026-11-26)
+
+With `designer.enabled: true` (`config/agents.yaml`) a research run designs the arms of each
+market it works on (`arm_designer.py`), instead of using the plan's arms there. The plan
+still gives the markets, their field catalogs, base settings and seeds.
+
+- A market gets a new batch of arms only when every arm of its latest batch is done:
+  `done_after_alphas` new alphas on that dataset reached BRAIN since the batch was written
+  (all generator models together). Otherwise the run continues the latest batch.
+- Datasets come from the market's field catalog, scored on BRAIN's value score, how few
+  BRAIN alphas use it, its signal fields, our best Sharpe on it there, whether we never tried
+  it, and our PROD_CORRELATION failures on it. Each batch has `explore_arms` never-tried
+  datasets, then one per data category. Datasets of earlier batches are left out while others
+  remain.
+- Decay and neutralization come from our near misses on that category of data in the market,
+  else `decay_by_category` and the plan's neutralization (a group neutralization always).
+- Hypotheses are two briefs per arm from BRAIN's dataset and field descriptions (no model call),
+  naming no catalog field.
+- Designs are stored append-only (`arm_designs` table); the report lists them
+  (`designed_arms`, with score parts and reasons). `enabled: false` = the plan's arms.
+
+## Prompt budget and operator spotlight (2026-11-26, gen-v15)
+
+Every model call carries its full instructions, so the Generator keeps them small whatever
+the catalog size (`config/generator.yaml`):
+- `max_datafields_in_prompt` 60 (was 120), the arm's dataset first, ranked by relevance.
+- `prompt_budget.max_prompt_chars` 14000: system prompt + request; the field listing is cut
+  first (never below 20 fields). `max_lesson_chars` 1800: the arm's data-category and region
+  lessons first, then every arm's, then the Lesson Writer's.
+- `operator_spotlight`: every operator's signature is still listed; up to 6 are shown with
+  BRAIN's own description (`config/operators_brain.json`, BRAIN's operator list), chosen
+  by the arm's latest failure classes (`rules`, e.g. turnover -> trade_when,
+  ts_target_tvr_decay) and event-type data, the rest rotated from operators our alphas never
+  used (40 of 82 on 2026-11-26).
+The catalog is never sent whole: datasets are chosen by rules (Arm Designer), fields per
+call by the ranker.
+
+## Blend Planner: model-planned repair waves (2026-11-26)
+
+Three of our five accepts were a near miss blended with a signal from another dataset, made
+by hand. `blend_planner.py` does it in the pipeline (`blend_plan:` in `config/agents.yaml`):
+- **Who:** a lead within `max_distance` (0.4) of accept that fails an information class
+  (production or self correlation, Sharpe, recent Sharpe, sub/robust universe).
+- **Partner candidates, by rules:** other datasets of the market, scored by fit to this
+  alpha: daily-PnL correlation of our best alpha on that dataset with the alpha and with our
+  submitted pool alphas, its Sharpe in the alpha's weak years, its own Sharpe, BRAIN usage,
+  coverage. *Proven* = our alpha on it reached `min_partner_sharpe` or a partner-alone test did.
+- **One planning call** (repair model): blends (partner signal, weight 1 or 2, economic
+  mechanism) and at most one partner-alone test of an untested dataset.
+- **Rule checks before BRAIN:** the partner reads only its dataset's listed fields; a blend's
+  partner is proven; a partner that failed alone is never reused or flipped; at most
+  `max_partners_per_lineage` partner datasets per lineage; blends are built on the lineage's
+  last non-blend alpha (two parts at most); mechanism required.
+- **One review call** by a critic model from another maker: mechanism, different idea,
+  direction. Variants it does not keep are dropped.
+- **After BRAIN:** a blend that beats its base alpha in fewer than half the years gets a
+  `flag:` line (report `blend_flags`); decisions stay BRAIN's.
+Children carry levers `blend_plan` and `partner_alone`; blend hypotheses start with
+`[blend partner=<dataset> weight=<w>]`, and later plans see the market's past pairings.
+
 ## Regenerating fixtures
 
 ```bash

@@ -94,6 +94,15 @@ _LOWER_IS_BETTER = {"self_correlation", "weight_concentration", "drawdown_depth"
                     "pool_correlation"}
 
 
+def _lower_is_better(name: str) -> bool:
+    """Gates where a smaller value is better: ours above, and BRAIN's correlation checks
+    (brain:PROD_CORRELATION, brain:SELF_CORRELATION, brain:POWER_POOL_CORRELATION). Until
+    2026-11-26 those BRAIN checks were scored as higher-is-better, so a production
+    correlation of 0.93 and one of 0.71 both counted as distance 0 to accept."""
+    return name in _LOWER_IS_BETTER or (name.startswith("brain:")
+                                        and name.endswith("CORRELATION"))
+
+
 @dataclass(frozen=True)
 class RepairLearningConfig:
     order: str = "learned"
@@ -238,7 +247,7 @@ def _gate_slack(name: str, value, threshold) -> float | None:
         if not isinstance(threshold, (list, tuple)) or None in threshold:
             return None
         return min(value - threshold[0], threshold[1] - value)
-    if name in _LOWER_IS_BETTER:
+    if _lower_is_better(name):
         return (threshold - value) if isinstance(threshold, (int, float)) else -value
     return (value - threshold) if isinstance(threshold, (int, float)) else None
 
@@ -275,7 +284,7 @@ def _shortfall(name: str, value, threshold) -> float | None:
         return (value - hi) / hi if value > hi and hi else None
     if not isinstance(threshold, (int, float)) or threshold == 0:
         return None
-    gap = (value - threshold) if name in _LOWER_IS_BETTER else (threshold - value)
+    gap = (value - threshold) if _lower_is_better(name) else (threshold - value)
     return max(gap, 0.0) / abs(threshold)
 
 

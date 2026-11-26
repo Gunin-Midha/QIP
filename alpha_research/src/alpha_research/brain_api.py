@@ -125,6 +125,9 @@ class BrainApiConfig:
     # log in again at the start of a long command when the session ends sooner than this
     # (BRAIN caps a login at 4 h); None = never
     relogin_within_seconds: float | None = None
+    # stop a research run before a round when the login has less than this left: a new
+    # login needs the biometric check, which an unattended run cannot answer; None = never
+    login_reserve_seconds: float | None = None
 
 
 _CANDIDATE_SETTINGS = {"region", "universe", "delay", "decay", "neutralization", "truncation"}
@@ -143,8 +146,10 @@ def brain_config_from_dict(raw, source: str = "<dict>") -> BrainApiConfig:
     kw = {}
     for key in ("request_timeout_seconds", "recordset_max_wait_seconds",
                 "rate_limit_max_wait_seconds", "check_max_wait_seconds",
-                "self_correlation_max_wait_seconds", "relogin_within_seconds"):
-        if key in raw and not (key == "relogin_within_seconds" and raw[key] is None):
+                "self_correlation_max_wait_seconds", "relogin_within_seconds",
+                "login_reserve_seconds"):
+        if key in raw and not (key in ("relogin_within_seconds", "login_reserve_seconds")
+                               and raw[key] is None):
             v = raw[key]
             if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
                 raise ConfigError(f"{source}: {key} must be a positive number, got {v!r}")
@@ -167,7 +172,7 @@ def brain_config_from_dict(raw, source: str = "<dict>") -> BrainApiConfig:
             raise ConfigError(f"{source}: retry_error_messages must be a list of strings")
         kw["retry_error_messages"] = tuple(msgs)
     unknown = set(raw) - {"settings", "session_file", "quota_reserve",
-                          "relogin_within_seconds", *kw}
+                          "relogin_within_seconds", "login_reserve_seconds", *kw}
     if unknown:
         raise ConfigError(f"{source}: unknown keys {sorted(unknown)}")
     return BrainApiConfig(settings=dict(settings), **kw)
@@ -763,6 +768,22 @@ class RealBrainClient:
             return None
         return quota_text(self.quota, f"BRAIN's daily simulation limit is nearly used "
                                       f"(reserve {reserve})")
+
+    def login_stop(self) -> str | None:
+        """Why a run should stop before its next round: the BRAIN login ends within
+        ``login_reserve_seconds`` (a new login needs the biometric check, which nobody may be
+        there to answer). None when it has longer, or the time left is unknown."""
+        reserve = self.config.login_reserve_seconds
+        if reserve is None or not hasattr(self.session, "expires_in"):
+            return None
+        try:
+            left = self.session.expires_in()
+        except (ConnectionError, TimeoutError):
+            return None
+        if left is None or left >= reserve:
+            return None
+        return (f"BRAIN login ends in {left / 60:.0f} min (brain.yaml login_reserve_seconds "
+                f"{reserve:g}); a new login needs the biometric check")
 
     def _capture(self, sim_id: str, name: str, body) -> None:
         if self.capture_dir is None:

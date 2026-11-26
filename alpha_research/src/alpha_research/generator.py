@@ -25,6 +25,7 @@ The generator stops at candidates. It does not simulate, score or admit anything
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import math
@@ -100,6 +101,18 @@ class GeneratorConfig:
     partner_min_sharpe: float | None = None
     # the arm's latest simulated alphas with BRAIN's numbers, shown in the request
     history_in_prompt: int = 0
+    # prompt budget (generator.yaml prompt_budget, owner 2026-11-26): system prompt plus
+    # request at most max_prompt_chars, fields cut first (down to MIN_PROMPT_FIELDS);
+    # lessons at most max_lesson_chars, the arm's data category and region first
+    max_prompt_chars: int | None = None
+    max_lesson_chars: int | None = None
+    # operator spotlight (generator.yaml operator_spotlight): up to spotlight_count operators
+    # shown with BRAIN's description, by the arm's recent failure classes and data kind
+    # (spotlight_rules: trigger -> operators), the rest rotated from operators our alphas
+    # never used; operator_notes: (name, "definition: description") from BRAIN
+    spotlight_count: int = 0
+    spotlight_rules: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    operator_notes: tuple[tuple[str, str], ...] = ()
 
 
 def _cfg_int(d: dict, key: str, *, nullable: bool = False, minimum: int = 0) -> int | None:
@@ -145,7 +158,96 @@ def load_generator_config(path: str | Path) -> GeneratorConfig:
         **_cfg_structure(g.get("structure")),
         **_cfg_blend(g.get("blend")),
         history_in_prompt=_cfg_int(g, "history_in_prompt") if "history_in_prompt" in g else 0,
+        **_cfg_budget(g.get("prompt_budget")),
+        **_cfg_spotlight(g.get("operator_spotlight"), Path(path).parent),
     )
+
+
+def _cfg_budget(raw) -> dict:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or set(raw) - {"max_prompt_chars", "max_lesson_chars"}:
+        raise ConfigError("generator config: 'prompt_budget' may set max_prompt_chars and "
+                          "max_lesson_chars")
+    out = {}
+    for key in ("max_prompt_chars", "max_lesson_chars"):
+        if raw.get(key) is not None:
+            out[key] = _cfg_int(raw, key, minimum=200)
+    return out
+
+
+def _cfg_spotlight(raw, base: Path) -> dict:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or set(raw) - {"count", "notes_file", "rules"}:
+        raise ConfigError("generator config: 'operator_spotlight' may set count, notes_file "
+                          "and rules")
+    count = _cfg_int(raw, "count") if "count" in raw else 0
+    rules = raw.get("rules") or {}
+    if not isinstance(rules, dict) or not all(
+            isinstance(k, str) and isinstance(v, list) and all(isinstance(x, str) for x in v)
+            for k, v in rules.items()):
+        raise ConfigError("generator config: operator_spotlight.rules must map a trigger to "
+                          "a list of operator names")
+    notes = ()
+    if raw.get("notes_file"):
+        path = base / raw["notes_file"]
+        if not path.is_file():   # a copied config: the repository's own config folder
+            path = Path(__file__).resolve().parents[2] / "config" / raw["notes_file"]
+        try:
+            rows = json.loads(path.read_text())
+        except (OSError, ValueError) as exc:
+            raise ConfigError(f"generator config: operator_spotlight.notes_file: {exc}") from exc
+        notes = tuple((r["name"], f"{r.get('definition') or r['name']}: "
+                                  f"{' '.join((r.get('description') or '').split())}")
+                      for r in rows if isinstance(r, dict) and isinstance(r.get("name"), str))
+    return {"spotlight_count": count,
+            "spotlight_rules": tuple((k, tuple(v)) for k, v in rules.items()),
+            "operator_notes": notes}
+
+
+# fewest fields a prompt lists when the prompt budget cuts fields
+MIN_PROMPT_FIELDS = 20
+# BRAIN categories whose data arrive as events (sparse updates): the "event" spotlight rule
+EVENT_CATEGORIES = ("news", "sentiment", "socialmedia", "insiders", "earnings", "broker")
+
+
+def fit_lessons(lessons: Sequence[str], max_chars: int | None) -> list[str]:
+    """Lessons in the given order (most specific first), whole ones only, until
+    ``max_chars``; at least the first."""
+    if max_chars is None:
+        return list(lessons)
+    out, used = [], 0
+    for t in lessons:
+        if out and used + len(t) > max_chars:
+            continue
+        out.append(t)
+        used += len(t)
+    return out
+
+
+def spotlight_ops(config: GeneratorConfig, spec: FastExprSpec, triggers: Sequence[str],
+                  unused: Sequence[str], offset: int) -> list[tuple[str, str]]:
+    """(operator, "definition: description") to show with BRAIN's description: operators of
+    the rules whose trigger fired (in trigger order), then operators our alphas never used,
+    rotated by ``offset``; only operators of this account (fastexpr.yaml), at most
+    ``spotlight_count``."""
+    notes = dict(config.operator_notes)
+    rules = dict(config.spotlight_rules)
+    n = config.spotlight_count
+    if n <= 0 or not notes:
+        return []
+    picked: list[str] = []
+    for t in triggers:
+        for op in rules.get(t, ()):
+            if op in spec.operators and op in notes and op not in picked:
+                picked.append(op)
+    pool = [op for op in unused if op in spec.operators and op in notes and op not in picked]
+    if pool:
+        k = offset % len(pool)
+        pool = pool[k:] + pool[:k]
+    picked = (picked[:max(n - 1, 0)] + pool)[:n] if pool else picked[:n]
+    return [(op, notes[op]) for op in picked]
 
 
 def _cfg_structure(raw) -> dict:
@@ -203,12 +305,14 @@ def dataset_category(dataset: str | None, meta: dict) -> str | None:
 
 
 def lessons_for(config: "GeneratorConfig", category: str | None,
-                region: str | None = None) -> list[str]:
+                region: str | None = None, *, specific_first: bool = False) -> list[str]:
     """The configured lessons for every arm, then for this region, then for this dataset
-    category."""
+    category; ``specific_first``: the category's, then the region's, then every arm's (the
+    order the prompt budget keeps them in)."""
     by, regions = dict(config.category_lessons), dict(config.region_lessons)
-    return [t for t in (by.get("all"), regions.get(region) if region else None,
-                        by.get(category) if category else None) if t]
+    parts = (by.get("all"), regions.get(region) if region else None,
+             by.get(category) if category else None)
+    return [t for t in (parts[::-1] if specific_first else parts) if t]
 
 
 def _cfg_crowding(raw) -> dict:
@@ -378,7 +482,10 @@ def load_dataset_meta(path: str | Path) -> dict[str, dict]:
             out[x["id"]] = {"value_score": _number(x.get("valueScore")),
                             "alpha_count": _number(x.get("alphaCount")),
                             "user_count": _number(x.get("userCount")),
-                            "category": cat.get("id") if isinstance(cat, dict) else cat}
+                            "category": cat.get("id") if isinstance(cat, dict) else cat,
+                            "name": x.get("name") if isinstance(x.get("name"), str) else None,
+                            "description": (x.get("description")
+                                            if isinstance(x.get("description"), str) else None)}
     return out
 
 
@@ -788,7 +895,8 @@ def build_system_prompt(spec: FastExprSpec, datafields: Collection[str] | None,
                         neutralizations: Sequence[str] = (), market: str | None = None,
                         prod_failed: dict | None = None, dataset: str | None = None,
                         lessons: Sequence[str] = (),
-                        partners: Sequence[tuple[str, float]] = ()) -> str:
+                        partners: Sequence[tuple[str, float]] = (),
+                        spotlight: Sequence[tuple[str, str]] = ()) -> str:
     """``prod_failed``: {field: our alphas using it that failed BRAIN's PROD_CORRELATION}
     in this market (memory); those fields count as crowded too. ``dataset``: the arm's,
     listed first. ``partners``: (field of another dataset, best |Sharpe| of our alphas using
@@ -816,6 +924,8 @@ def build_system_prompt(spec: FastExprSpec, datafields: Collection[str] | None,
         "",
         "Operators:",
         *[f"  {sig}" for sig in spec.signatures()],
+        *(["Operators worth considering for this task (BRAIN's descriptions; optional):",
+           *[f"  {text}" for _, text in spotlight]] if spotlight else []),
         "",
         f"Groups (for group_* operators): {', '.join(sorted(spec.groups))}",
         f"Base fields: {', '.join(sorted(spec.base_fields))}",
@@ -1107,6 +1217,11 @@ class AlphaGenerator:
         # loop before each batch (strategy.signal_evidence, strategy.arm_history)
         self.evidence: dict[str, float] = {}
         self.history: list[str] = []
+        # the arm's latest failure classes and the operators our alphas never used (set by
+        # the research loop) choose the operator spotlight; the offset rotates it
+        self.failures: list[str] = []
+        self.unused_ops: list[str] = []
+        self._spot_offset = 0
         self._crowded: set[str] = set()
         self._heavy: set[str] = set()
 
@@ -1200,21 +1315,47 @@ class AlphaGenerator:
         self._crowded, self._heavy = crowd_sets(self.field_meta, self.config,
                                                 self.spec.base_fields, self.prod_failed)
         blends = blend_count(k, self.config.blend_share) if self.field_meta else 0
-        system = build_system_prompt(self.spec, self.datafields, relevance, self.config,
-                                     self.guidance, self.field_meta,
-                                     neutralizations_for(self.settings.region),
-                                     market=f"{self.settings.region} {self.settings.universe}, "
-                                            f"delay {self.settings.delay}",
-                                     prod_failed=self.prod_failed,
-                                     dataset=self.settings.dataset,
-                                     lessons=lessons_for(self.config, dataset_category(
-                                         self.settings.dataset, self.field_meta),
-                                         self.settings.region)
-                                     + list(self.learned),
-                                     partners=self.partners())
+        category = dataset_category(self.settings.dataset, self.field_meta)
+        lessons = fit_lessons(lessons_for(self.config, category, self.settings.region,
+                                          specific_first=True) + list(self.learned),
+                              self.config.max_lesson_chars)
+        triggers = list(dict.fromkeys(self.failures))
+        if category in EVENT_CATEGORIES or any(
+                (m or {}).get("type") == "VECTOR" for f, m in self.field_meta.items()
+                if (m or {}).get("dataset") == self.settings.dataset):
+            triggers.append("event")
+        spot = spotlight_ops(self.config, self.spec, triggers, self.unused_ops,
+                             self._spot_offset)
+        self._spot_offset += max(1, len(spot))
+        partners = self.partners()
         history = self.history[:self.config.history_in_prompt]
-        reply = self._ask_json(system, _generate_prompt(unit.hypothesis, unit.context, k,
-                                                        blends, history), result)
+        user = _generate_prompt(unit.hypothesis, unit.context, k, blends, history)
+
+        def build(n_fields: int) -> str:
+            cfg = dataclasses.replace(self.config, max_datafields_in_prompt=n_fields)
+            return build_system_prompt(self.spec, self.datafields, relevance, cfg,
+                                       self.guidance, self.field_meta,
+                                       neutralizations_for(self.settings.region),
+                                       market=f"{self.settings.region} "
+                                              f"{self.settings.universe}, delay "
+                                              f"{self.settings.delay}",
+                                       prod_failed=self.prod_failed,
+                                       dataset=self.settings.dataset, lessons=lessons,
+                                       partners=partners, spotlight=spot)
+
+        # the prompt budget: fewer fields until system + request fit (the least relevant
+        # fields go first: the listing is ranked), never below MIN_PROMPT_FIELDS
+        n_fields = self.config.max_datafields_in_prompt
+        system = build(n_fields)
+        budget = self.config.max_prompt_chars
+        while (budget is not None and len(system) + len(user) > budget
+               and n_fields > MIN_PROMPT_FIELDS):
+            n_fields = max(MIN_PROMPT_FIELDS, int(n_fields * 0.8))
+            system = build(n_fields)
+        if n_fields < self.config.max_datafields_in_prompt:
+            result.notes.append(f"prompt budget: {len(system) + len(user)} characters, "
+                                f"{n_fields} fields listed")
+        reply = self._ask_json(system, user, result)
         good, bad = self._check(self._items(reply), unit)
 
         for _ in range(self.config.max_repair_rounds):

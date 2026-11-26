@@ -33,10 +33,10 @@ def test_a_prompt_that_never_fits_ends_the_round(memory, config, playbook):
     run = make_run(memory, config, playbook, llm=llm,
                    budget=Budget(max_simulations=8, per_round=4, max_llm_calls=100))
     report = run.run(2)
-    # 120 -> 60 -> 30 -> 20 fields, then no more alphas from this model
+    # 60 (generator.yaml) -> 30 -> 20 fields, then no more alphas from this model
     assert report["generator_field_cap"] == {"claude-test": MIN_FIELDS_WHEN_TOO_LARGE}
     assert "claude-test" in report["generator_no_fit"]
-    assert llm.refused == 4
+    assert llm.refused == 3
     assert report["simulations_used"] == 0
     assert report["stop_reason"].startswith("every generator model is down")
     # no refill loop: at most one refill pass in the round

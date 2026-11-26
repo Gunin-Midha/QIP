@@ -86,6 +86,7 @@ import string
 from dataclasses import dataclass, field
 from typing import Collection, Mapping
 
+from . import blend_planner
 from .evaluator import FACTOR_FIRST, SIGN_FIRST
 from .fastexpr import (Assign, Binary, Call, ComplexityLimits, FastExprError, FastExprSpec,
                        Name, Num, Unary, analyze, catalog, catalog_for, parse, render)
@@ -787,6 +788,10 @@ class RepairAgent:
         self.max_output = max_output
         self.learning = learning or RepairLearningConfig()
         self.rng = random.Random(seed)
+        # Blend Planner (blend_planner.py): set by the research loop; None = off. pool_pnl:
+        # {region: {alpha id: daily PnL}} of our submitted pool alphas
+        self.blend = None
+        self.pool_pnl: dict[str, dict] = {}
 
     def evidence(self) -> tuple[list, LeverStats, list]:
         """Repair events, lever statistics and the outcome rows, read fresh from memory."""
@@ -901,6 +906,29 @@ class RepairAgent:
         seen = {(candidate.expression, candidate.universe, candidate.decay,
                  candidate.neutralization, candidate.truncation)}
         model_tries = 0
+        # owner 2026-11-26: a close lead failing an information class gets a model-planned
+        # wave of blends (blend_planner.py); the rest of the wave is mechanical
+        if self.blend is not None and not mech_only:
+            failing_all = failing_classes(decision, result) | {decision.failure_class}
+            ok, why = blend_planner.eligible(decision, result, failing_all, self.blend.config)
+            out.notes.append(f"blend plan: {why}")
+            if ok and self.llm is not None:
+                calls = out.llm_calls
+                for child in self._planned_blends(candidate, decision, result, failing_all,
+                                                  outcomes, size, out):
+                    key = (child.expression, child.universe, child.decay,
+                           child.neutralization, child.truncation)
+                    if key in seen or self.memory.has_result_for_hash(experiment_hash(child)):
+                        out.notes.append(f"{child.lever}: same experiment as another fix or "
+                                         f"one in memory")
+                        continue
+                    seen.add(key)
+                    out.children.append(dataclasses.replace(
+                        child, candidate_id=self._free_id(child.candidate_id, out.children)))
+                if out.llm_calls > calls:   # the planning call is the wave's model call
+                    model_tries = self.learning.model_levers_per_wave
+                    prod = False
+                    options = [x for x in options if x[1].name != BLEND_LEVER]
         for d, lever in options:
             if len(out.children) >= size:
                 break
@@ -935,6 +963,72 @@ class RepairAgent:
             out.notes.append("repair exhausted: every lever for the failing classes was "
                              "tried or did not apply")
         return out
+
+    def _planned_blends(self, c: CandidateRecord, decision: DecisionRecord,
+                        result: ResultRecord | None, failing: set[str], outcomes: list[dict],
+                        size: int, out: RepairOutcome) -> list[CandidateRecord]:
+        """Children of a planned blend wave (blend_planner.py): blends on the lineage's last
+        non-blend alpha and partner-alone tests, each checked by rules and reviewed."""
+        cfg = self.blend.config
+        meta = self.field_meta.get((c.region, c.delay), self.field_meta.get(None)) or {}
+        by_id = {o["candidate"].candidate_id: o for o in outcomes}
+        base = blend_planner.blend_base(c, by_id)
+        bar = (((result.check_values if result else {}) or {}).get("LOW_SHARPE") or {}).get(
+            "limit") or next((g.threshold for g in decision.gate_results
+                              if g.name in ("sharpe", "brain:LOW_SHARPE")
+                              and isinstance(g.threshold, (int, float))), None) or 1.0
+        cands = blend_planner.partner_candidates(
+            c, result, failing, outcomes, meta, self.spec, self.generator_config,
+            self.pool_pnl.get(c.region, {}), cfg, bar)
+        root = blend_planner.lineage_root(c, by_id)
+        tried = []
+        for o in outcomes:
+            k, r, d = o["candidate"], o["result"], o["decision"]
+            if k.candidate_id.startswith(root) and k.lever and r is not None:
+                prod = ((r.check_values or {}).get("PROD_CORRELATION") or {}).get("value")
+                tried.append(f"{k.lever}: Sharpe {r.sharpe}, fitness {r.fitness}"
+                             + (f", PROD {prod}" if prod is not None else "")
+                             + (f" -> {d.decision}/{d.failure_class}" if d else ""))
+        metrics = _metrics(result)
+        if result is not None and result.yearly:
+            metrics["yearly_sharpe"] = {y.year: y.sharpe for y in result.yearly}
+        plan = self.blend.plan(c, decision, result, failing, cands, catalog=self._fields(c),
+                               outcomes=outcomes, meta=meta, max_variants=size,
+                               metrics=metrics, tried=tried[-12:],
+                               lessons=self._lessons_for(c))
+        out.llm_calls += plan.llm_calls
+        out.notes += plan.notes
+        out.notes += [f"blend plan dropped: {x}" for x in plan.dropped]
+        model = getattr(self.llm, "model", c.model)
+        kids = []
+        for v in plan.variants:
+            if v.weight is None:
+                new = dataclasses.replace(
+                    c, expression=v.partner, dataset=v.dataset, model=model,
+                    hypothesis=f"Partner-alone test of {v.dataset} for {c.candidate_id}: "
+                               f"{v.mechanism}")
+                lever = blend_planner.PARTNER_ALONE
+            else:
+                try:
+                    expr = build_blend(base.expression, v.partner, self.spec, weight=v.weight)
+                except (FastExprError, LeverNotApplicable) as exc:
+                    out.notes.append(f"blend plan: cannot build the blend with {v.dataset}: "
+                                     f"{exc}")
+                    continue
+                new = dataclasses.replace(
+                    c, expression=expr, model=model,
+                    hypothesis=f"{blend_planner.tag(v.dataset, v.weight)} "
+                               f"{base.hypothesis or ''} Blended with {v.dataset}: "
+                               f"{v.mechanism}".strip())
+                lever = blend_planner.BLEND_PLAN
+            child = self._child(c, new, lever)
+            if child is None:
+                out.notes.append(f"blend plan: {lever} with {v.dataset} failed validation")
+                continue
+            out.notes.append(f"{lever}: {v.dataset}"
+                             + (f" x{v.weight:g}" if v.weight else "") + f": {v.mechanism[:120]}")
+            kids.append(child)
+        return kids[:size]
 
     def _repeatable(self) -> set[str]:
         """Levers whose playbook step says ``repeatable: true``: they may be applied again

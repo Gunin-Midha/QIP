@@ -34,6 +34,62 @@ critic:
 # lesson later evidence contradicts is replaced. Advice only: no decision changes. The
 # research run uses the strategy model (one call, within --max-llm-calls) and falls back to
 # rule-written lessons; `cli run` writes rule lessons. Builder defaults 2026-11-15 (OQ-22).
+# Arm Designer (arm_designer.py, owner 2026-11-26; builder defaults OQ-24): at a run's start,
+# each market of the run gets its arms from the pipeline instead of the research plan. A new
+# batch is written only when every arm of the market's previous batch is done
+# (done_after_alphas new alphas on its dataset reached BRAIN since the batch was written,
+# all models together). Datasets come from the market's field catalog, scored on BRAIN's
+# value score, how few BRAIN alphas use it, its signal fields, our best Sharpe on it there,
+# whether we never tried it, and our PROD_CORRELATION failures on it; explore_arms of each
+# batch are never-tried datasets, then one per data category. Decay and neutralization come
+# from our near misses on that category of data in the market (settings_evidence of them),
+# else decay_by_category and the plan's neutralization. Hypotheses are briefs from BRAIN's
+# dataset and field descriptions (no model call). The plan still gives the markets, their
+# catalogs, base settings (universe, truncation, dates) and seeds. enabled: false = the
+# plan's arms, as before.
+# Blend Planner (blend_planner.py, owner 2026-11-26; builder defaults OQ-25): a lead within
+# max_distance of accept that fails an information class gets a model-planned repair wave of
+# blends with partner signals from other datasets (3 of our 5 accepts were such blends, made
+# by hand). Partner candidates are scored by fit to the alpha (PnL correlation with it and
+# with our submitted pool alphas, strength in its weak years, own Sharpe, usage, coverage);
+# the repair model plans blends with a stated mechanism, a critic model from another maker
+# reviews them. A blend's partner must be proven (our alpha on that dataset reached
+# min_partner_sharpe, or a partner-alone test did); an untested one gets a partner-alone
+# test first. Directions are never flipped; weights from `weights`; at most
+# max_partners_per_lineage partner datasets per lineage; blends are built on the lineage's
+# last non-blend alpha (two parts at most). A blend that beats its base in fewer than
+# stable_year_share of the years is flagged (decisions unchanged). enabled: false = off.
+blend_plan:
+  enabled: true
+  classes: [prod_correlation, self_correlation, sharpe, recent_sharpe, sub_universe]
+  max_distance: 0.4
+  max_candidates: 10
+  fields_per_candidate: 8
+  exclude_categories: [pv, risk]
+  min_coverage: 0.3
+  min_partner_sharpe: 0.5
+  weights: [1, 2]
+  max_partners_per_lineage: 4
+  partner_alone_per_wave: 1
+  min_overlap_days: 120
+  min_mechanism_chars: 40
+  stable_year_share: 0.5
+  review: true
+designer:
+  enabled: true
+  arms_per_batch: 4
+  done_after_alphas: 6
+  explore_arms: 1
+  # exploit (owner 2026-11-26): every batch first keeps the dataset with our best |Sharpe|
+  # in the market (>= exploit_min_share x BRAIN's Sharpe bar), designed before or not: all
+  # five accepts came from near misses, and little-used data often gives Sharpe ~0
+  exploit_arms: 1
+  exploit_min_share: 0.6
+  min_signal_fields: 5
+  weights: {value: 1.0, uncrowded: 1.0, fields: 0.5, evidence: 1.0, novelty: 0.5, prod: 1.0}
+  decay_by_category: {pv: 4, analyst: 5, earnings: 5, fundamental: 6, model: 6, default: 6}
+  settings_evidence: 3
+  near_distance: 0.6
 lessons:
   after_every_batch: true
   use_model: true
@@ -141,6 +197,14 @@ director:
   # every generator model is down (its free limit), the simulation budget or the rounds; this
   # many rounds in a row that send nothing to BRAIN end it too.
   stop_after_idle_rounds: 2
+  # Loop guard (owner 2026-11-26, after a round looped through 9 refill passes until stopped
+  # by hand): the run stops cleanly (queued alphas still go out, report and lessons are
+  # written) when no alpha went to or came back from BRAIN for stall_minutes, or
+  # stall_model_calls model calls were spent since the last alpha went to BRAIN. A BRAIN
+  # result takes at most simulator.max_poll_seconds (30 min); a round of 12 new alphas costs
+  # ~10-25 calls. null = off.
+  stall_minutes: 60
+  stall_model_calls: 40
   # Regions (consultant level, builder defaults 2026-11-11, OQ-18): each region in the plan
   # gets at least floor(region_floor_share x slots / n_regions) slots per round, and none
   # gets more than max_region_share of a round while another region is below it.

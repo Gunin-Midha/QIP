@@ -71,13 +71,17 @@ from typing import Callable, TextIO
 
 import yaml
 
+from . import arm_designer
+from .arm_designer import DesignerConfig
+from .blend_planner import BLEND_PLAN, BlendConfig, BlendPlanner, blend_base, stability_flag
 from .brain_client import BrainClient, BrainLoginRequired, SimulationQuotaExhausted
 from .config import Config, ConfigError
 from .critic import Critic, DebateJudge, ReviewOutcome, SparseFieldRule, review_and_debate
 from .compare import arm_models, model_comparison
 from .fastexpr import FastExprSpec, analyze, catalog, catalog_for
 from .generator import (AlphaGenerator, GenerationError, GenerationSettings, GeneratorConfig,
-                        Source, dataset_appeal, dataset_category, dataset_facts)
+                        Source, dataset_appeal, dataset_catalog_for, dataset_category,
+                        dataset_facts, field_role, load_dataset_meta)
 from .llm import LLMClient, LLMUnavailable, ModelDown, RequestTooLarge, provider_of
 from .memory import MemoryStore
 from .orchestrator import Orchestrator, balance_slots, consolidate
@@ -93,7 +97,8 @@ from .repair_agent import RepairAgent
 from .schemas import (GROUP_NEUTRALIZATIONS, NO_REGULAR_SIMULATION, REGION_SETTINGS,
                       CandidateRecord, experiment_hash)
 from .strategy import (StrategyConfig, StrategyEvolution, brain_limits,
-                       prod_correlation_fields, region_notes, signal_evidence, arm_history)
+                       prod_correlation_fields, region_notes, signal_evidence, arm_history,
+                       arm_failures)
 
 DECIDED = ("accept", "reject", "repair")
 # fewest catalog fields a generator prompt lists after too-large refusals (each halves the
@@ -248,6 +253,12 @@ class AgentsConfig:
     min_batch: int | None = None   # an arm given slots gets at least this many (orchestrator.consolidate)
     stop_after_idle_rounds: int | None = None   # stop after this many rounds in a row with no simulation
     fresh_fill_freed_slots: bool = True   # a BRAIN slot freed mid-batch takes the round's new alphas
+    # loop guard: stop when no alpha went to or came back from BRAIN for this many minutes,
+    # or this many model calls were spent with no alpha going to BRAIN (None = off)
+    stall_minutes: float | None = None
+    stall_model_calls: int | None = None
+    designer: DesignerConfig = field(default_factory=DesignerConfig)   # arm_designer.py
+    blend: BlendConfig = field(default_factory=BlendConfig)   # blend_planner.py
     region_floor_share: float | None = None   # each region's minimum share of a round
     max_region_share: float | None = None     # no region above this share while others are below
     regions_per_run: int | None = None        # rotation: work on this many regions per run
@@ -410,10 +421,15 @@ def agents_config_from_dict(raw) -> AgentsConfig:
                                               "stop_after_idle_rounds")),
         fresh_fill_freed_slots=(_bool(secs["director"], "director", "fill_freed_slots")
                                 if "fill_freed_slots" in secs["director"] else True),
+        stall_minutes=_opt_num(secs["director"], "director", "stall_minutes", 1, 10000),
+        stall_model_calls=(None if secs["director"].get("stall_model_calls") is None
+                           else _pos_int(secs["director"], "director", "stall_model_calls")),
         regions_per_run=(None if secs["director"].get("regions_per_run") is None
                          else _pos_int(secs["director"], "director", "regions_per_run")),
         region_balance_since=_opt_date(secs["director"], "director", "region_balance_since"),
         sparse=_sparse_rule(secs["critic"]),
+        designer=DesignerConfig.from_dict(raw.get("designer")),
+        blend=BlendConfig.from_dict(raw.get("blend_plan")),
         price_categories=_categories(secs["critic"], "price_volume_categories"),
         lessons=LessonsConfig.from_dict(raw.get("lessons")),
     )
@@ -695,6 +711,9 @@ class ResearchRun:
                  run_id: str | None = None):
         self.budget = budget
         self.agents = agents
+        self._clock = clock
+        self._progress_at: float | None = None   # last alpha to or from BRAIN (loop guard)
+        self._progress_calls = 0                  # model calls at that moment
         agents.check_models()
         self.models = agents.models
         self.counter = CallCounter(budget.max_llm_calls)
@@ -762,6 +781,16 @@ class ResearchRun:
                                               generator_config.crowded_min_alphas),
                                     generator_config=generator_config,
                                     lessons=self.lessons)
+        if agents.blend.enabled and self.repairer.llm is not None:
+            # the reviewer: critic models from another maker than the planner (repair model)
+            planner_maker = provider_of(m.repair)
+            others = [cm for cm in m.critic if provider_of(cm) != planner_maker]
+            self.repairer.blend = BlendPlanner(
+                spec, agents.blend, llm=self.repairer.llm,
+                reviewer=FallbackLLM([self.llm(cm) for cm in others]) if others else None,
+                context=ctx, max_output=mo, limits=limits)
+            self.repairer.pool_pnl = self._pool_pnl()
+        self.blend_flags: list[dict] = []
         st_llm = self.fallback(m.strategy) if agents.strategy.every_rounds else None
         self.strategist = StrategyEvolution(agents.strategy, llm=st_llm, max_output=mo,
                                             context=ctx)
@@ -780,6 +809,17 @@ class ResearchRun:
         # Strategy Evolution: arm -> the evolved arm that replaced it. A replaced arm gets no
         # new slots (its queued repairs still run) and its outcomes credit the successor
         self.successor: dict[tuple, tuple] = {}
+        # Arm Designer (arm_designer.py): plan arms its designed arms replace in this run's
+        # markets (no new slots; their queued repairs still run), and the run's designs
+        self.inactive: set[tuple] = set()
+        # operators no simulated alpha of ours has used: the Generator's spotlight rotates
+        # through them (generator.yaml operator_spotlight)
+        used_ops: set[str] = set()
+        for o in memory.candidate_outcomes():
+            if o["result"] is not None and o["result"].status != "invalid":
+                used_ops |= set(analyze(o["candidate"].expression, spec).operators_used)
+        self.unused_ops = sorted(set(spec.operators) - used_ops)
+        self.designed: list[dict] = []
         self.sims_used = 0
         # alphas screened and waiting for BRAIN: sent simulator.max_concurrent at a time
         # (OQ-3), then decided in order (_flush)
@@ -953,6 +993,9 @@ class ResearchRun:
             gen.evidence = signal_evidence(outcomes, region, delay, self.spec, fields)
         gen.history = arm_history(outcomes, plan.dataset, region, delay,
                                   gen.config.history_in_prompt)
+        gen.failures = arm_failures(outcomes, plan.dataset, region, delay,
+                                    max(gen.config.history_in_prompt, 4))
+        gen.unused_ops = self.unused_ops
         bar = bar_text(self.seen_limits.get((plan.settings.region, plan.settings.delay), {}))
         bar = (f"- BRAIN's bar in this market ({plan.settings.region} delay "
                f"{plan.settings.delay}, from its checks on our alphas): {bar}.") if bar else None
@@ -1228,6 +1271,78 @@ class ResearchRun:
                        f"an earlier run stopped waiting: {got}"
                        + (f"; {still} not ready yet" if still else ""))
 
+    def _design_arms(self) -> None:
+        """Arm Designer (arm_designer.py) for each market of this run: continue its latest
+        batch of designed arms while any of them is not done, else write a new batch (owner
+        2026-11-26). The designed arms (one per generator model) replace the plan's arms of
+        that market for this run; the plan still gives the markets, their catalogs, base
+        settings and seeds."""
+        cfg = self.agents.designer
+        outcomes = self.memory.candidate_outcomes()
+        markets: dict[tuple, list[tuple]] = {}
+        for k in list(self.arms):
+            if self._in_run(k) and k not in self.successor:
+                markets.setdefault((k[1], k[4]), []).append(k)
+        base_pv = self.generator_config.prompt_version
+        for (region, delay), keys in markets.items():
+            plan = self.arms[keys[0]]
+            fields, meta = self.catalog_of(region, delay)
+            if not meta or plan.catalog is None:
+                self._emit(f"--- arms for {region} D{delay}: no field catalog with dataset "
+                           f"facts; the plan's arms are used")
+                continue
+            history = self.memory.arm_designs(region, delay)
+            batch = arm_designer.latest_batch(history)
+            status = ""
+            if batch:
+                fresh = self.memory.fresh_simulations(region, delay, batch[0]["created_at"])
+                done, lines = arm_designer.batch_done(batch, fresh, cfg)
+                status = ", ".join(lines)
+            if not batch or done:
+                gc = self.generator_config
+                cands = arm_designer.market_candidates(
+                    meta, lambda f, m=meta: field_role(f, m, gc))
+                limits = self.seen_limits.get((region, delay), {})
+                bar = limits.get("LOW_SHARPE") or \
+                    self.pipeline.config.for_settings(region, delay).gates.sharpe_min
+                base = {k: getattr(plan.settings, k) for k in (
+                    "region", "universe", "delay", "decay", "neutralization", "truncation",
+                    "start_date", "end_date")}
+                new = arm_designer.design_batch(
+                    region=region, delay=delay, candidates=cands,
+                    dataset_text=load_dataset_meta(dataset_catalog_for(plan.catalog)),
+                    field_ids=set(fields or meta), outcomes=outcomes, bar=bar,
+                    base_settings=base, earlier={d["dataset"] for d in history}, config=cfg)
+                if not new:
+                    self._emit(f"--- arms for {region} D{delay}: no dataset qualifies; the "
+                               f"plan's arms are used")
+                    continue
+                self.memory.put_arm_designs(f"{self.run_id}_{region}_d{delay}", new)
+                batch = arm_designer.latest_batch(self.memory.arm_designs(region, delay))
+                self._emit(f"--- arms for {region} D{delay}: new batch"
+                           + (f" (previous done: {status})" if status else " (first batch)"))
+            else:
+                self._emit(f"--- arms for {region} D{delay}: continuing batch "
+                           f"{batch[0]['batch_id']} ({status})")
+            designed = set()
+            for d in batch:
+                settings = GenerationSettings.from_mapping(d["settings"])
+                arm = ArmPlan(d["dataset"], settings,
+                              deque(Source("hypothesis", h) for h in d["hypotheses"]),
+                              catalog=plan.catalog)
+                for gm in self.models.generator:
+                    key = (d["dataset"], region, base_pv, gm, delay)
+                    designed.add(key)
+                    if key not in self.arms:
+                        self._add_arm(key, dataclasses.replace(arm, sources=deque(arm.sources)),
+                                      [])
+                self._emit(f"    {d['dataset']} ({d['category']}): {d['why']}; score "
+                           f"{d['score']:g}; decay {settings.decay}, {settings.neutralization}")
+                self.designed.append({k: d[k] for k in (
+                    "batch_id", "region", "delay", "dataset", "category", "why", "score",
+                    "parts", "facts", "settings_why")})
+            self.inactive |= {k for k in keys if k not in designed}
+
     def _prepare_seeds(self) -> None:
         """Turn the plan's seeds into fresh root candidates on BRAIN's current period (the
         arm's dates), queued to simulate before anything else once their region is in the
@@ -1324,6 +1439,8 @@ class ResearchRun:
         # Strategy Evolution (the real client only; None when BRAIN does not answer)
         fetch = getattr(self.client, "submission_diversity", None)
         self.submissions = fetch() if fetch is not None else None
+        if self.agents.designer.enabled:
+            self._design_arms()
         self._prepare_seeds()
         self._recover_submissions()
         self._recheck_pending()
@@ -1335,9 +1452,16 @@ class ResearchRun:
                 self.stop_reason = str(exc)
                 return self.report()
         idle = 0
+        self._mark_progress()   # the loop guard counts from the first round
         for r in range(1, rounds + 1):
             if self.sims_used >= self.budget.max_simulations:
                 self.stop_reason = "simulation budget used up"
+                break
+            if self._stalled():
+                break
+            login_stop = getattr(self.client, "login_stop", None)
+            if login_stop is not None and (why := login_stop()):
+                self.stop_reason = why
                 break
             before = self._committed()
             quota_stop = getattr(self.client, "quota_stop", None)
@@ -1351,8 +1475,13 @@ class ResearchRun:
             except SimulationQuotaExhausted as exc:
                 self.stop_reason = str(exc)
                 break
+            except BrainLoginRequired as exc:   # nobody to answer a new login: stop cleanly
+                self.stop_reason = f"BRAIN login lost: {exc}"
+                break
             try:   # alphas already screened still go to BRAIN, whatever stopped the round
                 self._flush()
+            except BrainLoginRequired as exc:   # running alphas are recovered next start
+                self.stop_reason = f"BRAIN login lost: {exc}"
             except LLMUnavailable as exc:
                 self.stop_reason = self.stop_reason or str(exc)
             except SimulationQuotaExhausted as exc:
@@ -1459,7 +1588,7 @@ class ResearchRun:
         # prompt fits), so the loop ends; the cap is a guard against a slot that is lost
         # without that
         lost_passes, max_lost = 0, len(self.models.generator) + 1
-        while not self.stop_reason:
+        while not self._stalled():
             if lost:
                 lost_passes += 1
                 if lost_passes > max_lost:
@@ -1501,7 +1630,8 @@ class ResearchRun:
 
     def _live_arms(self) -> list[tuple]:
         return [k for k in self.arms if k[3] not in self.counter.down and self._in_run(k)
-                and k not in self.successor and k[3] not in self.no_fit]
+                and k not in self.successor and k[3] not in self.no_fit
+                and k not in self.inactive]
 
     def _current(self, key: tuple) -> tuple:
         """The arm that now stands for ``key``: itself, or its latest evolved successor."""
@@ -1527,7 +1657,7 @@ class ResearchRun:
         Pre-Filter or Critic), counting arms taken mid-batch."""
         r, entry, tag, index = self._fresh_ctx
         lost = emptied = 0
-        while self._fresh_left and not self.stop_reason:
+        while self._fresh_left and not self._stalled():
             key = next(iter(self._fresh_left))
             n = self._fresh_left.pop(key)   # popped first: a flush inside may take others
             if key[3] in self.counter.down:  # went down earlier in this pass
@@ -1557,7 +1687,7 @@ class ResearchRun:
         if not self.agents.fresh_fill_freed_slots:
             return out
         r, entry, tag, index = self._fresh_ctx
-        while len(out) < room and self._fresh_left and not self.stop_reason:
+        while len(out) < room and self._fresh_left and not self._stalled():
             left = budget - len(out)     # simulations the budget still allows
             if left <= 0:
                 break
@@ -1590,6 +1720,63 @@ class ResearchRun:
         simulated = self._simulate_all(key, go, log)
         return lost, max(0, n - lost - simulated)
 
+    def _pool_pnl(self) -> dict[str, dict]:
+        """{region: {alpha id: daily PnL}} of the active pool (our submitted alphas): the
+        Blend Planner checks partners against them."""
+        out: dict[str, dict] = {}
+        try:
+            matrix = self.pipeline.pool.matrix()
+        except Exception:   # a missing or unreadable PnL file never stops a run
+            return out
+        for alpha_id in getattr(matrix, "columns", []):
+            c = self.memory.get_candidate(alpha_id)
+            if c is not None:
+                out.setdefault(c.region, {})[alpha_id] = matrix[alpha_id].dropna()
+        return out
+
+    def _blend_flag(self, cand: CandidateRecord, result) -> str | None:
+        """Stability flag of a planned blend against its base alpha (recorded only)."""
+        by_id = {}
+        c = cand
+        while c.parent_id and (p := self.memory.get_candidate(c.parent_id)) is not None:
+            by_id[p.candidate_id] = {"candidate": p}
+            c = p
+        base = blend_base(cand, by_id)
+        if base.candidate_id == cand.candidate_id:
+            return None
+        rs = self.memory.results_for(base.candidate_id)
+        return stability_flag(result, rs[-1] if rs else None, self.agents.blend)
+
+    def _mark_progress(self) -> None:
+        """An alpha went to BRAIN or came back from it: the loop guard's clock restarts."""
+        self._progress_at = self._clock()
+        self._progress_calls = self.counter.calls
+
+    def _stalled(self) -> bool:
+        """The loop guard (owner 2026-11-26, after a round looped through 9 refill passes
+        until stopped by hand): no alpha went to or came back from BRAIN for
+        ``director.stall_minutes``, or ``director.stall_model_calls`` model calls were spent
+        since the last one went out. Sets the stop reason (the run then flushes what is
+        queued, writes its report and lessons) and returns True."""
+        if self.stop_reason:
+            return True
+        if self._progress_at is None:
+            return False
+        a = self.agents
+        idle = (self._clock() - self._progress_at) / 60
+        calls = self.counter.calls - self._progress_calls
+        why = None
+        if a.stall_minutes is not None and idle >= a.stall_minutes:
+            why = f"{idle:.0f} min"
+        elif a.stall_model_calls is not None and calls >= a.stall_model_calls:
+            why = f"{calls} model calls"
+        if why is None:
+            return False
+        self.stop_reason = (f"loop guard: {why} with no alpha sent to or decided by BRAIN "
+                            f"(director.stall_minutes / stall_model_calls)")
+        self._emit(f"--- {self.stop_reason}; stopping")
+        return True
+
     def _shrink_fields(self, model: str, why: str) -> bool:
         """After a too-large generator request: halve the fields this model's prompts list
         (``field_cap``, for every arm of the model, for the rest of the run). False when the
@@ -1621,7 +1808,7 @@ class ResearchRun:
             source = plan.sources[0]
             plan.sources.rotate(-1)
             res = None
-            while True:
+            while not self._stalled():
                 try:
                     res = self._generator(key).generate(
                         source, need, batch_id=f"{self.run_id}r{r:02d}a{i}{tag}")
@@ -1712,6 +1899,7 @@ class ResearchRun:
         (seeds): the outcome does not update the Director's view of the arm, since the
         alpha is not one of the arm's ideas."""
         self.sim_queue.append((key, cand, log, credit))
+        self._mark_progress()
         if len(self.sim_queue) >= self.max_concurrent:
             self._flush()
 
@@ -1746,6 +1934,8 @@ class ResearchRun:
             except LLMUnavailable as exc:
                 failures.append(exc)
                 return []
+            if added:
+                self._mark_progress()
             for key, c, log in added:
                 meta[c.candidate_id] = (key, c, log, True)
             self._in_flight += len(added)
@@ -1786,6 +1976,7 @@ class ResearchRun:
 
     def _after_simulation(self, key: tuple, cand: CandidateRecord, log: dict, credit: bool,
                           outcome) -> None:
+        self._mark_progress()
         if outcome.result is not None and outcome.result.status != "invalid":
             self.sims_used += 1
             self.region_sims[cand.region] = self.region_sims.get(cand.region, 0) + 1
@@ -1809,6 +2000,13 @@ class ResearchRun:
             item["overfitting_flag"] = flag
             self.overfitting_flags.append({"candidate_id": cand.candidate_id, "flag": flag})
             self._emit(f"  flag: {cand.candidate_id}: {flag.split(': ', 1)[-1]}")
+        if cand.lever == BLEND_PLAN and outcome.result is not None \
+                and outcome.result.status == "complete":
+            bflag = self._blend_flag(cand, outcome.result)
+            if bflag:
+                item["blend_flag"] = bflag
+                self.blend_flags.append({"candidate_id": cand.candidate_id, "flag": bflag})
+                self._emit(f"  flag: {_short_id(cand.candidate_id)}: {bflag}")
         in_wave = cand.candidate_id in self.wave_of
         if outcome.decision in DECIDED and credit and not in_wave:  # a wave: one credit at its end
             self.director.update(self._current(key), outcome.decision == "accept")
@@ -1861,7 +2059,7 @@ class ResearchRun:
         # only the live arms of this run's regions evolve: the others get no slots in this
         # run, and each evolved arm replaces its parent (one arm per idea, not two)
         base = [(k, p) for k, p in self.arms.items()
-                if k not in self.successor and self._in_run(k)]
+                if k not in self.successor and self._in_run(k) and k not in self.inactive]
         arm_datasets = {k[0] for k in self.arms}
         # a hypothesis on a catalog dataset no arm covers gets arms of its own, so the
         # Director credits that dataset, not the arm it ran under (run rs20261104163055 ran
@@ -1959,7 +2157,9 @@ class ResearchRun:
             "warm_start_outcomes": self.warm_started,
             "pool_size": self.pipeline.pool.count(),
             "regions_this_run": self.run_regions,   # None = every region (no rotation)
-            "simulations_by_region": dict(self.region_sims),   # since region_balance_since
+            "simulations_by_region": dict(self.region_sims),
+            "designed_arms": list(self.designed),
+            "blend_flags": list(self.blend_flags),   # since region_balance_since
             "arms": arms,
             "recovered_results": self.recovered,
             "cancelled_stuck": self.cancelled,

@@ -309,6 +309,24 @@ def signal_evidence(outcomes: list[dict], region: str, delay: int, spec,
     return out
 
 
+def arm_failures(outcomes: list[dict], dataset: str | None, region: str, delay: int,
+                 limit: int) -> list[str]:
+    """Failure classes of the latest ``limit`` decided alphas of an arm's dataset in this
+    market, newest first (accepts and pending ones left out): what the Generator's operator
+    spotlight answers."""
+    out = []
+    for row in reversed(outcomes):
+        c, d = row["candidate"], row.get("decision")
+        if (c.dataset != dataset or c.region != region or c.delay != delay or d is None
+                or d.decision not in ("reject", "repair")):
+            continue
+        if d.failure_class and d.failure_class not in ("none", "incomplete"):
+            out.append(d.failure_class)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def arm_history(outcomes: list[dict], dataset: str | None, region: str, delay: int,
                 limit: int, max_chars: int = 160) -> list[str]:
     """The latest ``limit`` simulated alphas of an arm's dataset in this market, newest

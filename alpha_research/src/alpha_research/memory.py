@@ -87,6 +87,15 @@ CREATE TABLE IF NOT EXISTS lessons (
     evidence_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS arm_designs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id TEXT NOT NULL,
+    region TEXT NOT NULL,
+    delay INTEGER NOT NULL,
+    dataset TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS ix_lessons_batch ON lessons(batch_id);
 CREATE INDEX IF NOT EXISTS ix_critic_reviews_candidate ON critic_reviews(candidate_id);
 CREATE INDEX IF NOT EXISTS ix_candidates_hash ON candidates(expression_hash);
@@ -220,6 +229,18 @@ class MemoryStore:
                 [(batch_id, x["audience"], x["scope"], x["text"], source,
                   ev if i == 0 else "{}", now) for i, x in enumerate(lessons)])
         return len(lessons)
+
+    def put_arm_designs(self, batch_id: str, designs: list[dict]) -> int:
+        """One Arm Designer batch (arm_designer.py) for one market: each design {region,
+        delay, dataset, ...} with its settings, hypotheses, score and reasons."""
+        now = _now()
+        with self.conn:
+            self.conn.executemany(
+                "INSERT INTO arm_designs (batch_id, region, delay, dataset, payload_json, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                [(batch_id, d["region"], d["delay"], d["dataset"],
+                  json.dumps(d, sort_keys=True, default=str), now) for d in designs])
+        return len(designs)
 
     def record_os_is(self, alpha_id: str, family: str | None, is_sharpe: float | None,
                      os_sharpe: float | None) -> None:
@@ -382,6 +403,31 @@ class MemoryStore:
             info = out.setdefault(region, {"simulations": 0, "last": None})
             info["simulations"] += 1
             info["last"] = max(info["last"] or "", r["last"])
+        return out
+
+    def arm_designs(self, region: str | None = None, delay: int | None = None) -> list[dict]:
+        """Every Arm Designer design, oldest first, each with its ``batch_id`` and
+        ``created_at`` (optionally for one market). Read-only."""
+        rows = self.conn.execute(
+            "SELECT batch_id, payload_json, created_at FROM arm_designs ORDER BY id").fetchall()
+        out = [{**json.loads(r["payload_json"]), "batch_id": r["batch_id"],
+                "created_at": r["created_at"]} for r in rows]
+        return [d for d in out if (region is None or d["region"] == region)
+                and (delay is None or d["delay"] == delay)]
+
+    def fresh_simulations(self, region: str, delay: int, since: str) -> dict[str, int]:
+        """{dataset: new alphas (no lever) of this market that reached BRAIN (a result other
+        than ``invalid``) with their first result on or after ``since``}. Read-only."""
+        rows = self.conn.execute(
+            "SELECT c.payload_json AS cand, MIN(r.created_at) AS first FROM candidates c "
+            "JOIN results r ON r.candidate_id = c.candidate_id AND r.status != 'invalid' "
+            "GROUP BY c.candidate_id").fetchall()
+        out: dict[str, int] = {}
+        for r in rows:
+            c = json.loads(r["cand"])
+            if (c.get("region") == region and c.get("delay") == delay and not c.get("lever")
+                    and r["first"] >= since and c.get("dataset")):
+                out[c["dataset"]] = out.get(c["dataset"], 0) + 1
         return out
 
     def latest_lessons(self) -> list[dict]:

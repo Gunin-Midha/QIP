@@ -25,7 +25,7 @@ from pathlib import Path
 TABLES = {"candidates": "created_at", "results": "created_at", "decisions": "created_at",
           "variants": "created_at", "critic_reviews": "created_at",
           "pending_submissions": "submitted_at", "pool": "admitted_at", "os_is": "recorded_at",
-          "pool_events": "at"}   # pool_events: since 2026-11-25; older databases lack it
+          "pool_events": "at", "arm_designs": "created_at"}   # pool_events: since 2026-11-25; older databases lack it
 
 
 def counts(db: Path, since: str | None = None) -> dict[str, int]:

@@ -965,3 +965,30 @@ Fixed:
 - Run start prints what the poll found before cancelling a stuck simulation (above).
 
 938 tests pass.
+
+## Unattended runs end by themselves (2026-11-26, owner)
+
+Runs go on while nobody is at the terminal, so a loop or a lost login must end them cleanly (queued alphas still go out, report and lessons written), never hang:
+- **Loop guard** (`agents.yaml` `director.stall_minutes` 60, `stall_model_calls` 40): `ResearchRun._stalled` stops the run when no alpha went to or came back from BRAIN for 60 min, or 40 model calls were spent since the last alpha went out. Checked at every generation, refill pass and freed-slot top-up, and before each round; progress (`_mark_progress`) = an alpha queued for BRAIN, joining a running batch, or decided. Stop reason `loop guard: ...`.
+- **Login guard** (`brain.yaml` `login_reserve_seconds` 2700): before each round `RealBrainClient.login_stop` asks BRAIN how long the login has left and stops the run under 45 min (a new login needs the biometric check). `cli research` switches off the biometric and credential prompts after its start-up login (`cli._unattended`), so a login BRAIN ends mid-run raises `BrainLoginRequired` and the run stops with `BRAIN login lost: ...` (running alphas are recovered at the next start) instead of waiting at a prompt.
+`tests/test_unattended.py` (7). 945 tests pass.
+
+## Arm Designer (2026-11-26, owner)
+
+Owner: arms should be written by the pipeline, a new batch only when the previous arms are done; build steps 1 (dataset choice by rules), 2 (settings from evidence) and 4 (guards, storage, report), not step 3 (model-written hypotheses). `arm_designer.py`; `ResearchRun._design_arms` at run start for each market of the run; `MemoryStore.put_arm_designs` / `arm_designs` / `fresh_simulations` (append-only table `arm_designs`, also copied by `scripts/split_memory.py`); `load_dataset_meta` keeps BRAIN's dataset name and description; agents.yaml `designer:` (OQ-24 builder defaults: 4 arms a batch, done after 6 new alphas, 1 exploration arm, 5 signal fields minimum, weights, decay by category, 3 near misses before their settings are used, near = distance <= 0.6). Plan arms of a designed market go to `ResearchRun.inactive` (no slots, no evolution; their queued repairs still run).
+
+Dry run on memory and the catalogs (offline): GBR -> other250 (exploration), model307, insider_agg_matrix, analyst48; JPN -> model77, sentiment27, socialmedia32, institutions14. Two problems found and fixed before any run: GBR other250's BRAIN description is of an ID mapping while its fields are product ratings, prices and bestseller ranks (the brief now also quotes three of its least used signal fields' descriptions); BRAIN value scores run 1-10 (scaled by the market's highest). `tests/test_arm_designer.py` (7). 952 tests pass.
+
+## Prompt budget and operator spotlight (2026-11-26, owner; gen-v15)
+
+Owner: the same instructions go with every API call; more data breadth must not mean more context. The catalog stays local; per call the Generator sends a slice chosen by rules. Built: `max_datafields_in_prompt` 120 -> 60; `prompt_budget` (`max_prompt_chars` 14000, fields cut by 20% steps to `MIN_PROMPT_FIELDS` 20; `max_lesson_chars` 1800 with `lessons_for(specific_first=True)` and `fit_lessons`); `operator_spotlight` (`spotlight_ops`: rules by the arm's latest failure classes, `strategy.arm_failures`, plus "event" for event categories or VECTOR fields, then operators our simulated alphas never used, `ResearchRun.unused_ops`, rotated per call; BRAIN's descriptions in `config/operators_brain.json`). Measured on the real catalogs: GBR 16,800 -> 12,382 characters, USA 13,932, JPN 12,817, spotlight included; a 2,000-dataset-field catalog gives the same size as a 200 one (`tests/test_prompt_budget.py`). Too-large refusals now start halving from 60 fields. 957 tests pass.
+
+- **Designer keeps an exploit arm** (owner 2026-11-26): each batch first takes the dataset with our best |Sharpe| in the market (>= `exploit_min_share` 0.6 x the bar), designed before or not (`arm_designer.exploit_rows`); all five accepts came from near misses. Dry run: GBR analyst7 (1.82), JPN other176 (1.87), ASI fundamental23 (3.22) lead their batches. 958 tests pass.
+
+## Blend Planner (2026-11-26, owner; prompts blend-v1, blend-review-v1)
+
+Owner: blending is how most accepts came; partners must suit the alpha they fix and have economic backing, not be a random blend. Built `blend_planner.py` (module doc has the method), wired into `RepairAgent.repair_wave` (`_planned_blends`; the planning call is the wave's model call, the rest of the wave mechanical, `blend_other_dataset` skipped that wave), `ResearchRun` (planner with the repair model, reviewer = critic models of another maker; `_pool_pnl` from the active pool by region; `_blend_flag` after BRAIN), prompts `blend_plan_system/user`, `blend_review_system/user`; agents.yaml `blend_plan:` (OQ-25). Partner checks happen before simulation (the owner's rule that an alpha passes on BRAIN's checks alone stays: the year-stability test is a flag, not a gate).
+
+Dry run on memory (no calls): for the EUR reversal leads the rules rank analyst69 as a proven partner (PnL correlation with the alpha 0.07-0.08); analyst69 is the partner of the accepted EUR blend.
+
+Bug found on the way (older): BRAIN's `brain:PROD_CORRELATION` / `SELF_CORRELATION` / `POWER_POOL_CORRELATION` gates were scored higher-is-better in `lever_stats._shortfall` and `_gate_slack`, so every production-correlation failure had distance 0 to accept (0.93 like 0.71). `_lower_is_better`. Replay: 26 of 173 repair distances change, 10 move wave tier (e.g. CHN retail 0.93: 0 -> 0.33). `tests/test_blend_planner.py` (10). 970 tests pass.

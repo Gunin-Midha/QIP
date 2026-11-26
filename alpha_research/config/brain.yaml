@@ -51,3 +51,8 @@ quota_reserve: 50
 # logs in again at its start when the login has less than this left, so the check is asked
 # while you are at the terminal, not hours into the run. null = never.
 relogin_within_seconds: 10800
+# A research run stops cleanly (report, lessons) before a round when its login has less than
+# this left, and a login lost mid-run stops it instead of waiting at the biometric prompt
+# (owner 2026-11-26: runs go on while nobody is at the terminal). A round takes 30-60 min.
+# null = never.
+login_reserve_seconds: 2700

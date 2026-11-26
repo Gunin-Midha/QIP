@@ -1,12 +1,41 @@
 # Alpha Generator settings (Phase 3). Technical limits have values. Policy limits are
 # null (= not configured, the check is skipped) until the owner decides (OQ-11).
 generator:
-  prompt_version: gen-v14      # written to CandidateRecord.prompt_version; bump when prompts change
+  prompt_version: gen-v15      # written to CandidateRecord.prompt_version; bump when prompts change
   max_repair_rounds: 1         # times rejected expressions are sent back to the model for a fix
   max_paper_chars: 120000      # longer papers are cut to this many characters (null = no cut)
   max_hypotheses_per_paper: 5  # hypotheses extracted from one paper
-  max_datafields_in_prompt: 120  # catalog fields listed in the prompt (was 300; a shorter prompt fits Groq's free per-minute limit)
+  max_datafields_in_prompt: 60   # catalog fields listed at most (was 120, before 300); the arm's dataset first, ranked by relevance (2026-11-26)
   datafield_exploration_share: 0.3  # of those, drawn across all datasets, not by relevance (diversity)
+
+  # Prompt budget (owner 2026-11-26: the same instructions go with every model call; keep
+  # them small whatever the catalog size). System prompt + request at most max_prompt_chars:
+  # the field listing is cut first (least relevant fields; never below 20). Lessons at most
+  # max_lesson_chars, the arm's data category and region first, then every arm's, then the
+  # Lesson Writer's. ~14,000 characters fits Groq's free per-minute limits (gpt-oss, Qwen)
+  # with room for the reply. null = no limit.
+  prompt_budget:
+    max_prompt_chars: 14000
+    max_lesson_chars: 1800
+
+  # Operator spotlight (owner 2026-11-26): 40 of our account's 82 operators had never been
+  # used. Each prompt still lists every operator's signature, and shows up to `count` with
+  # BRAIN's own description (notes_file: BRAIN's operator list, 2026-11-10): those the
+  # rules give for the arm's latest failure classes (and "event" for event-type data or
+  # VECTOR fields), then operators our alphas never used, in turn.
+  operator_spotlight:
+    count: 6
+    notes_file: operators_brain.json
+    rules:
+      turnover: [trade_when, ts_target_tvr_decay, ts_target_tvr_delta_limit]
+      fitness: [trade_when, ts_target_tvr_decay, signed_power]
+      sharpe: [ts_regression, ts_quantile, signed_power]
+      recent_sharpe: [ts_target_tvr_decay, jump_decay, ts_step]
+      prod_correlation: [ts_regression, group_mean, group_cartesian_product]
+      self_correlation: [ts_regression, group_mean, bucket]
+      sub_universe: [group_mean, ts_scale, scale_down]
+      concentration: [scale_down, ts_scale, quantile]
+      event: [days_from_last_change, last_diff_value, ts_step, vec_count]
 
   # Crowded fields (OQ-21, builder default 2026-11-14). A field whose BRAIN alpha count is
   # in the top 10% of its dataset (and at least min_alphas) is listed after every other

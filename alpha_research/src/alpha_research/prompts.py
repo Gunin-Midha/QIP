@@ -30,6 +30,8 @@ PROMPT_VERSIONS = {
     "repair": "repair-v10",
     "strategy": "strategy-v7",
     "lessons": "lessons-v3",
+    "blend_plan": "blend-v1",
+    "blend_review": "blend-review-v1",
 }
 
 DATA_RULE = (
@@ -487,3 +489,90 @@ Check every lesson against the numbers before writing it: the direction must mat
 def lessons_user(evidence: dict, max_lessons: int) -> str:
     return (f"<records>\n{json.dumps(evidence, separators=(',', ':'), default=str)}\n</records>\n\n"
             f"Write at most {max_lessons} lessons.")
+
+
+# ---------------------------------------------------------------------------
+# Blend Planner (blend_planner.py, owner 2026-11-26)
+# ---------------------------------------------------------------------------
+
+def blend_plan_system(context: str, config=None) -> str:
+    weights = ", ".join(f"{w:g}" for w in (config.weights if config else (1.0, 2.0)))
+    min_chars = config.min_mechanism_chars if config else 40
+    return f"""You plan blend repairs for a WorldQuant BRAIN alpha that is close to passing. Three of our five accepted alphas were the near miss blended with a signal from another dataset that adds information production alphas do not have (a reversal with analyst revision breadth, momentum with the EPS estimate trend, retail buying with analyst breadth). You choose partner signals and say why they belong with this alpha.
+
+{context}
+
+How a blend is built (by the pipeline, not by you): rank(alpha) + weight x rank(partner), the partner ranked the same way as the alpha (within its group if it has one), 0.5 where the partner has no value; a size or liquidity tilt of the alpha is kept. You write only the partner signal.
+
+Rules:
+- Each partner reads fields of ONE listed candidate dataset only (plus base fields if needed), and only fields listed for it. Write the partner so that a higher value means the stock is expected to outperform.
+- Give the economic mechanism in "mechanism" (at least {min_chars} characters): what behaviour each part captures and why together they predict returns better than the alpha alone. The direction follows from the mechanism and is fixed: the pipeline never flips a partner that fails.
+- A partner must be a different idea from the alpha, not another version of the same signal.
+- "variants": blends, only with candidates marked proven (our own alphas on that dataset showed signal, or a partner-alone test passed). Weights: {weights}.
+- "partner_alone": a test of a partner from an untested candidate simulated by itself, so its direction and strength are known before any blend uses it. At most one.
+- Use the evidence: prefer partners whose PnL correlates little with the alpha and with our submitted alphas, that are strong in the alpha's weak years when recent Sharpe fails, and pairings that worked in this market. Do not repeat a pairing or partner that failed.
+- Keep speeds similar: a slow partner blended with a fast alpha mostly averages away.
+
+{DATA_RULE}
+
+{JSON_RULE}
+{{"variants": [{{"dataset": "...", "partner": "<Fast Expression>", "weight": 1, "mechanism": "..."}}], "partner_alone": [{{"dataset": "...", "partner": "<Fast Expression>", "mechanism": "..."}}]}}"""
+
+
+def blend_plan_user(c, metrics: dict, failing: list[str], candidates, tried: list[str],
+                    pairing_lines: list[str], lessons: list[str], max_variants: int,
+                    config=None) -> str:
+    parts = [_candidate_block(c, extra={"BRAIN metrics": json.dumps(metrics, default=str)
+                                       if metrics else "none",
+                                       "failing": ", ".join(failing)})]
+    if tried:
+        parts.append("Fixes already tried in this lineage (lever: result):\n"
+                     + "\n".join(f"- {t}" for t in tried))
+    lines = []
+    for p in candidates:
+        e = p.evidence or {}
+        head = (f"{p.dataset} ({p.category}; {'proven' if p.proven else 'untested'}; "
+                f"{p.brain_alphas if p.brain_alphas is not None else '?'} BRAIN alphas; "
+                f"coverage {p.coverage if p.coverage is not None else '?'})")
+        ev = []
+        if e:
+            ev.append(f"our best alpha on it: Sharpe {e.get('sharpe')} "
+                      f"(negative = it worked the other way round), PnL correlation with this "
+                      f"alpha {e.get('pnl_corr_with_alpha')}, highest with our submitted "
+                      f"alphas {e.get('max_pnl_corr_with_pool')}, Sharpe in this alpha's weak "
+                      f"years {e.get('sharpe_in_weak_years')}: {e.get('expression')}")
+        for a in p.alone:
+            ev.append(f"tested alone: Sharpe {a['sharpe']}: {a['expression'][:160]}")
+        fields = "; ".join(f"{f}: {n}" for f, n in p.fields)
+        lines.append(f"- {head}\n  fields: {fields}" + "".join(f"\n  {x}" for x in ev))
+    parts.append("<records>\nPartner candidates (by fit to this alpha and failure):\n"
+                 + "\n".join(lines) + "\n</records>")
+    if pairing_lines:
+        parts.append("<records>\nBlends tried in this market (newest first):\n"
+                     + "\n".join(f"- {t}" for t in pairing_lines) + "\n</records>")
+    if lessons:
+        parts.append("Lessons from our results:\n" + "\n".join(f"- {t}" for t in lessons))
+    parts.append(f"Plan up to {max_variants} variants in total (blends plus at most one "
+                 f"partner-alone test).")
+    return "\n\n".join(parts)
+
+
+def blend_review_system(context: str) -> str:
+    return f"""You review planned blend repairs of a WorldQuant BRAIN alpha before they are simulated. Another model chose each partner signal and wrote its economic mechanism. Judge each variant on three questions: does the mechanism make economic sense for these two signals together; is the partner a different idea from the alpha (not another version of the same signal); does the partner's direction (higher value = expected to outperform) follow from the mechanism. Keep a variant only if all three hold. Be strict with stories that would fit any two signals.
+
+{context}
+
+{DATA_RULE}
+
+{JSON_RULE}
+{{"reviews": [{{"index": 0, "keep": true, "reason": "one line"}}]}}"""
+
+
+def blend_review_user(c, variants) -> str:
+    rows = []
+    for i, v in enumerate(variants):
+        kind = "partner-alone test" if v.weight is None else f"blend, weight {v.weight:g}"
+        rows.append(f"[{i}] {kind}; partner dataset {v.dataset}\n  partner: {v.partner}\n"
+                    f"  mechanism: {v.mechanism}")
+    return (_candidate_block(c) + "\n\n<records>\nPlanned variants:\n" + "\n".join(rows)
+            + "\n</records>")
