@@ -327,7 +327,8 @@ class Pipeline:
         # would be appended again at every run start)
         failed = [g for g in d.gate_results if g.passed is False]
         shares = self.config.for_settings(c.region, c.delay).repair.near_miss_share
-        return all(evaluator.near_miss(failed, cls, shares, r)[0]
+        return all(evaluator.near_miss(failed, cls, shares, r,
+                                       flipped=None if cls == "sharpe" else True)[0]
                    for cls in {evaluator.check_class(g.name) for g in failed})
 
     def recheck_pending(self, only: set[str] | None = None) -> tuple[list[Outcome], list[str]]:

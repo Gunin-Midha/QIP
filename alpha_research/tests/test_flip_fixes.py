@@ -69,3 +69,41 @@ def test_rank_transform_skips_combinations_of_ranks(candidate, expr):
 def test_rank_transform_still_ranks_raw_values(candidate):
     out = MECHANICAL["rank_transform"](candidate(expression="rank(close) * volume"), {}, SPEC)
     assert out.expression == "rank(rank(close) * volume)"
+
+
+def test_sign_first_wave_is_the_flip_alone_and_nothing_once_it_was_tried(memory, playbook,
+                                                                          candidate):
+    # run rs20261127123332: after the flip of a USA short-interest alpha (Sharpe -1.03,
+    # fitness -0.20) was tried, the next wave on the negative parent added smoothing,
+    # rank_transform and a combo from the fitness/sub-universe classes (all came back negative)
+    from alpha_research.lever_stats import LeverStats
+    from alpha_research.repair_agent import RepairAgent
+    gates = [low(-1.03), GateResult("brain:LOW_FITNESS", False, -0.2, 1.0, ""),
+             GateResult("brain:LOW_SUB_UNIVERSE_SHARPE", False, -0.84, -0.45, "")]
+    d = DecisionRecord("p", "repair", "sharpe", gate_results=gates,
+                       reasons=[f"{SIGN_FIRST}: Sharpe -1.03 is negative"])
+    r = ResultRecord("p", "complete", sharpe=-1.03, fitness=-0.2)
+    c = candidate(candidate_id="p", expression="rank(close)")
+    agent = RepairAgent(playbook, SPEC, memory)
+    stats = LeverStats.from_events([], agent.learning.prior)
+    first = agent._wave_options(c, d, r, stats, set(), ())
+    assert [lv.name for _, lv in first] == ["flip_sign"]
+    assert agent._wave_options(c, d, r, stats, {"flip_sign"}, ()) == []
+
+
+@pytest.mark.parametrize("two_year, decision", [(-1.0, "repair"), (1.0, "reject")])
+def test_sign_first_alpha_is_judged_as_after_the_flip(playbook, two_year, decision):
+    # owner 2026-11-27: a negative alpha must not be rejected on a value the flip changes.
+    # Fitness -1.2 is 1.2 after the flip (a near miss); a 2-year Sharpe of -1.0 becomes 1.0
+    # (near), but +1.0 becomes -1.0, which |value| used to count as near
+    from alpha_research.evaluator import decide
+    gates = [low(-1.8), GateResult("brain:LOW_FITNESS", False, -1.2, 1.0, ""),
+             GateResult("brain:LOW_2Y_SHARPE", False, two_year, 1.58, "")]
+    shares = {"sharpe": 0.6, "fitness": 0.5, "recent_sharpe": 0.6}
+    d = decide(ResultRecord("c1", "complete", sharpe=-1.8), gates, playbook,
+               near_miss_share=shares, risk_neutralized_gap=0.5)
+    assert d.decision == decision
+    assert any(r.startswith(SIGN_FIRST) for r in d.reasons)
+    if decision == "reject":
+        assert d.failure_class == "recent_sharpe"
+        assert any("after the sign flip" in r for r in d.reasons)

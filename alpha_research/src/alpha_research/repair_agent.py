@@ -867,8 +867,9 @@ class RepairAgent:
             # flip alone: every other fix on the unflipped alpha keeps its negative sign
             # (wasted simulations); the next wave starts from the flipped child's real
             # numbers. A sign-first alpha is measured as if flipped, so it gets a big wave.
-            flip = [x for x in ranked if x[0].name == "flip_sign"]
-            ranked = flip or ranked
+            # Only the flip, even when this class has none: once the flip was tried the
+            # lineage goes on from the flipped child, never from the negative parent
+            ranked = [x for x in ranked if x[0].name == "flip_sign"]
         return ranked
 
     def repair(self, candidate: CandidateRecord, decision: DecisionRecord,
@@ -1263,9 +1264,8 @@ class RepairAgent:
         options = first + spread + [x for x in rest if x not in spread] + last
         if any(r.startswith(SIGN_FIRST) for r in decision.reasons):
             # sign first: the flip alone (see ``ranked``); every other fix of the unflipped
-            # alpha keeps its negative sign
-            flip = [x for x in options if x[1].name == "flip_sign"]
-            options = flip or options
+            # alpha keeps its negative sign; no flip left (already tried) = no wave here
+            options = [x for x in options if x[1].name == "flip_sign"]
         return options
 
     def variants(self, candidate: CandidateRecord, decision: DecisionRecord,

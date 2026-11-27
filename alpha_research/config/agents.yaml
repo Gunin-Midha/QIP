@@ -111,10 +111,10 @@ designer:
   decay_by_category: {pv: 4, analyst: 5, earnings: 5, fundamental: 6, model: 6, default: 6}
   settings_evidence: 3
   near_distance: 0.6
-  # dead datasets (owner 2026-11-27): 5 new alphas in a market, best |Sharpe| (raw or
+  # dead datasets (owner 2026-11-27): 12 new alphas in a market, best |Sharpe| (raw or
   # risk-neutralized) below 0.3 x bar -> no more slots for its arms, never designed again.
-  # On memory: EUR model307 (5 alphas, best 0.36) and GLB fundamental17 (6, 0.36)
-  dead_after_alphas: 5
+  # Was 5; owner (same day): a few weak alphas do not make a dataset dead, wait 10-15
+  dead_after_alphas: 12
   dead_sharpe_share: 0.3
 lessons:
   after_every_batch: true

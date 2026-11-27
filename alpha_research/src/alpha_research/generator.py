@@ -40,7 +40,8 @@ from typing import Callable, Collection, Iterable, Sequence
 import yaml
 
 from .config import ConfigError
-from .fastexpr import Analysis, ComplexityLimits, FastExprSpec, analyze, catalog
+from .fastexpr import (GROUP_PARAMS, Analysis, Assign, Binary, Call, ComplexityLimits,
+                       FastExprSpec, FastExprError, Name, Num, Unary, analyze, catalog, parse)
 from .llm import LLMClient
 from .schemas import (GROUP_NEUTRALIZATIONS, CandidateRecord, SchemaError, experiment_hash,
                       neutralizations_for)
@@ -71,6 +72,13 @@ class GeneratorConfig:
     # field_roles): identifier/text fields are not listed, date/time fields are tagged
     id_patterns: tuple = ()
     time_patterns: tuple = ()
+    # category codes and cluster labels (owner 2026-11-27): numbers that name a class, so
+    # their order means nothing; used only as a group or compared to a code.
+    # category_keep: descriptions that make a labelled field ordered after all (quantile
+    # buckets); category_groups: how many the prompt offers as groupings
+    category_patterns: tuple = ()
+    category_keep: tuple = ()
+    category_groups: int = 0
     # crowded fields (config/generator.yaml crowding, OQ-21): a field whose BRAIN alpha
     # count is in the top (1 - percentile) of its dataset and at least min_alphas is
     # listed only when the task names it; None = off
@@ -335,18 +343,28 @@ def _cfg_crowding(raw) -> dict:
     return {"crowded_percentile": float(pct), "crowded_min_alphas": low, "heavy_alphas": heavy}
 
 
+ROLE_KEYS = ("id", "time", "category", "category_keep")
+
+
 def _cfg_roles(raw) -> dict:
     if raw is None:
         return {}
-    if not isinstance(raw, dict) or set(raw) - {"id", "time"}:
-        raise ConfigError("generator config: 'field_roles' must map 'id' and 'time' to lists")
+    if not isinstance(raw, dict) or set(raw) - {*ROLE_KEYS, "category_groups"}:
+        raise ConfigError("generator config: 'field_roles' must map 'id', 'time', 'category' "
+                          "and 'category_keep' to lists (and 'category_groups' to a number)")
     out = {}
-    for role in ("id", "time"):
+    groups = raw.get("category_groups", 0)
+    if isinstance(groups, bool) or not isinstance(groups, int) or groups < 0:
+        raise ConfigError(f"generator config: field_roles.category_groups must be an integer "
+                          f">= 0, got {groups!r}")
+    out["category_groups"] = groups
+    for role in ROLE_KEYS:
         pats = raw.get(role) or []
         if not isinstance(pats, list) or not all(isinstance(p, str) and p for p in pats):
             raise ConfigError(f"generator config: field_roles.{role} must be a list of patterns")
+        key = "category_keep" if role == "category_keep" else f"{role}_patterns"
         try:
-            out[f"{role}_patterns"] = tuple(re.compile(p, re.I) for p in pats)
+            out[key] = tuple(re.compile(p, re.I) for p in pats)
         except re.error as exc:
             raise ConfigError(f"generator config: bad field_roles.{role} pattern: {exc}") from exc
     return out
@@ -653,7 +671,7 @@ def signal_profile(fields_used: Collection[str], base_fields: Collection[str], m
     base = set(base_fields)
     fields = sorted(f for f in set(fields_used) if f not in base
                     and (meta.get(f) or {}).get("type") != "GROUP"
-                    and field_role(f, meta, config) != "id")
+                    and field_role(f, meta, config) not in ("id", "category"))
     price = any(f in config.price_fields for f in fields_used)
     datasets = {(meta.get(f) or {}).get("dataset") or f"?{f}" for f in fields}
     if price:
@@ -760,12 +778,97 @@ def _rank_datafields(catalog: Collection[str], text: str, limit: int,
 NOT_SIGNALS = {"SYMBOL", "UNIVERSE"}   # identifiers and universe flags: never sampled
 TYPE_HINTS = {"VECTOR": "vector: wrap in vec_avg or vec_sum", "GROUP": "group"}
 TIME_HINT = "date/time: for event timing, e.g. days_from_last_change, not as a score"
+CATEGORY_HINT = ("category code: no order; only as a group, e.g. group_rank(x, densify(f)), "
+                 "or compared to a code, f == 3")
+# operators a category code may pass through on its way to a group slot or a code test
+CATEGORY_WRAPPERS = frozenset({"densify"})
+CATEGORY_TESTS = frozenset({"is_nan"})
+
+
+def category_fields(catalog: Collection[str], text: str, meta: dict,
+                    config: "GeneratorConfig", dataset: str | None = None,
+                    exclude: Collection[str] = ()) -> list[str]:
+    """Up to ``config.category_groups`` category codes (``field_role`` 'category') to offer
+    as groupings: matrix fields only (a vector field cannot be a group), the arm's own
+    dataset and the task's words first (``_rank_datafields``)."""
+    if not config.category_groups or not meta:
+        return []
+    cats = [f for f in catalog if f not in exclude
+            and (meta.get(f) or {}).get("type") == "MATRIX"
+            and field_role(f, meta, config) == "category"]
+    return _rank_datafields(cats, text, config.category_groups, meta, (), dataset)
+
+
+def category_misuse(expression: str, categories: Collection[str],
+                    spec: FastExprSpec) -> list[str]:
+    """Category codes used as values. A code may sit in a group slot (``group``, ``g1``,
+    ``g2`` in the operator's signature), directly, through ``densify`` or through a
+    variable holding one of those; it may be compared to a constant with == or != or
+    tested with is_nan. Anything else (rank, ts_*, vec_avg, arithmetic) treats the code's
+    number as an amount. Owner 2026-11-27, run rs20261127123332:
+    rank(ts_zscore(vec_avg(news_category_tag), 21))."""
+    cats = set(categories)
+    if not cats:
+        return []
+    try:
+        stmts = parse(expression)
+    except FastExprError:
+        return []
+    bad: dict[str, None] = {}
+    code_vars: dict[str, str] = {}   # variable -> the code it holds
+
+    def code_of(n) -> str | None:
+        if isinstance(n, Name):
+            return n.name if n.name in cats else code_vars.get(n.name)
+        if isinstance(n, Call) and n.name in CATEGORY_WRAPPERS and len(n.args) == 1:
+            return code_of(n.args[0])
+        return None
+
+    def is_code(n) -> bool:
+        return code_of(n) is not None
+
+    def walk(n, ok: bool = False) -> None:
+        if isinstance(n, Name):
+            if code_of(n) is not None and not ok:
+                bad[code_of(n)] = None
+        elif isinstance(n, Unary):
+            walk(n.operand)
+        elif isinstance(n, Binary):
+            test = n.op in ("==", "!=") and (
+                (is_code(n.left) and isinstance(n.right, Num))
+                or (is_code(n.right) and isinstance(n.left, Num)))
+            walk(n.left, test)
+            walk(n.right, test)
+        elif isinstance(n, Call):
+            op = spec.operators.get(n.name)
+            params = op.params if op is not None else ()
+            for i, a in enumerate(n.args):
+                slot = params[i] if i < len(params) else None
+                walk(a, (ok and n.name in CATEGORY_WRAPPERS) or slot in GROUP_PARAMS
+                     or n.name in CATEGORY_TESTS)
+            for k, v in n.kwargs:
+                walk(v, k in GROUP_PARAMS)
+
+    for st in stmts:
+        if isinstance(st, Assign):
+            if is_code(st.value):
+                code_vars[st.name] = code_of(st.value)   # checked where it is used
+            else:
+                walk(st.value)
+        else:
+            walk(st)
+    return [f"{f!r} is a category code (its number names a class, it is not an amount): "
+            f"use it only as a group, e.g. group_rank(x, densify({f})), or compare it to a "
+            f"code ({f} == 3); never rank, average or smooth it" for f in bad]
+
 
 
 def field_role(name: str, meta: dict, config: "GeneratorConfig | None") -> str:
-    """'id' (identifier, code, name or raw text: no ordering information), 'time' (a date
-    or time of day) or 'signal'. From BRAIN's type and the start of its description;
-    GROUP fields are groups, never ids."""
+    """'id' (identifier, code, name or raw text: no ordering information), 'category' (a
+    number that names a class: a news-topic code, a cluster label; usable as a group or
+    compared to a code, never ranked), 'time' (a date or time of day) or 'signal'. From
+    BRAIN's type and the start of its description (``category_keep`` anywhere in it, e.g.
+    quantile buckets, keeps a labelled field a signal); GROUP fields are groups."""
     m = meta.get(name) or {}
     if m.get("type") in NOT_SIGNALS:
         return "id"
@@ -774,6 +877,9 @@ def field_role(name: str, meta: dict, config: "GeneratorConfig | None") -> str:
     desc = (m.get("description") or "").strip()
     if any(p.match(desc) for p in config.id_patterns):
         return "id"
+    if (any(p.match(desc) for p in config.category_patterns)
+            and not any(p.search(desc) for p in config.category_keep)):
+        return "category"
     if any(p.match(desc) for p in config.time_patterns):
         return "time"
     return "signal"
@@ -809,7 +915,8 @@ def select_datafields(catalog: Collection[str], text: str, limit: int,
     show up; less crowded datasets (``dataset_appeal``) go first, and those with a BRAIN value
     score above the catalog's median give two fields per turn. Fields within a dataset (and
     the dataset order without facts) are fixed by the text (the same task sees the same fields).
-    Identifier/text fields (``field_role`` 'id') are left out unless the task names them;
+    Identifier/text fields and category codes (``field_role`` 'id', 'category') are left
+    out unless the task names them (``category_fields`` offers a few codes as groupings);
     ``crowded`` fields rank last and are never drawn for exploration; ``heavy`` (heavily
     used) fields keep their rank but are never drawn for exploration either. ``plain`` (base
     fields and groups) never count as named."""
@@ -818,7 +925,8 @@ def select_datafields(catalog: Collection[str], text: str, limit: int,
     heavy = set(heavy)
     catalog = set(catalog)
     named = named_fields(catalog, text, plain)
-    pool = [f for f in catalog if f in named or field_role(f, meta, config) != "id"]
+    pool = [f for f in catalog
+            if f in named or field_role(f, meta, config) not in ("id", "category")]
     n_explore = round(limit * explore_share) if len(pool) > limit else 0
     ranked = [f for f in _rank_datafields(pool, text, len(pool), meta, crowded, dataset)
               if f not in named]
@@ -858,7 +966,8 @@ def _annotate(name: str, meta: dict, config: "GeneratorConfig | None" = None,
     bits = [TYPE_HINTS[m["type"]]] if m.get("type") in TYPE_HINTS else []
     role = field_role(name, meta, config)
     if role != "signal":
-        bits.append(TIME_HINT if role == "time" else "identifier/text: no ranking information")
+        bits.append(TIME_HINT if role == "time" else CATEGORY_HINT if role == "category"
+                    else "identifier/text: no ranking information")
     if isinstance(m.get("coverage"), (int, float)):
         bits.append(f"cov {m['coverage'] * 100:.0f}%")
     if isinstance(m.get("alpha_count"), (int, float)):
@@ -985,6 +1094,13 @@ def build_system_prompt(spec: FastExprSpec, datafields: Collection[str] | None,
             lines.append("From across the other datasets (optional; for combinations or "
                          "conditioning beyond the obvious inputs):")
             lines.append("  " + ", ".join(note(f) for f in explore))
+        groupings = category_fields(datafields, relevance_text, meta, config, dataset,
+                                    exclude={*named, *shown, *explore})
+        if groupings:
+            lines.append("Category codes (optional groupings: each number names a class, such "
+                         "as a return-based cluster, so use one only as a group, e.g. "
+                         "group_rank(x, densify(f)), or compared to a code; never rank, average "
+                         "or smooth it): " + ", ".join(groupings))
         if meta:
             lines.append("In brackets: cov = share of stocks with a value (for a low-coverage "
                          "field consider ts_backfill or group_backfill so more stocks carry a "
@@ -1414,21 +1530,23 @@ class AlphaGenerator:
             expr = expr.strip()
             a = analyze(expr, self.spec, datafields=self.catalog,
                         limits=self.config.limits)
-            errors = list(a.errors) or self._role_errors(a) or self._structure_errors(a)
+            errors = list(a.errors) or self._role_errors(a, expr) or self._structure_errors(a)
             if not errors:
                 good.append(_Draft(expr, raw, a))
             else:
                 bad.append(Rejected(expr, unit.hypothesis, errors))
         return good, bad
 
-    def _role_errors(self, a: Analysis) -> list[str]:
-        """An alpha whose only datafields are identifiers or text carries no signal."""
+    def _role_errors(self, a: Analysis, expression: str = "") -> list[str]:
+        """An alpha whose only datafields are identifiers or text carries no signal; a
+        category code used as an amount (``category_misuse``) is sent back too."""
         own = [f for f in a.fields_used if f not in self.spec.base_fields]
         ids = [f for f in own if field_role(f, self.field_meta, self.config) == "id"]
         if own and len(ids) == len(own):
             return [f"uses only identifier/text fields ({', '.join(ids)}): they carry no ranking "
                     "information; build the signal on a measured quantity"]
-        return []
+        cats = [f for f in own if field_role(f, self.field_meta, self.config) == "category"]
+        return category_misuse(expression, cats, self.spec) if cats and expression else []
 
     def _profile(self, a: Analysis) -> dict:
         return signal_profile(a.fields_used, self.spec.base_fields, self.field_meta,

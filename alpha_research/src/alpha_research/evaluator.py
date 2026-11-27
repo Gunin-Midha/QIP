@@ -292,13 +292,24 @@ FLIP_DOES_NOT_MIRROR = "a flip does not mirror here"
 
 def near_miss(failed: list[GateResult], failure_class: str,
               shares: dict | None, result: ResultRecord | None = None, *,
-              sign_mirrors: bool = True) -> tuple[bool, str | None]:
+              sign_mirrors: bool = True,
+              flipped: bool | None = None) -> tuple[bool, str | None]:
     """(repairable, reason). A class without a configured share is always repairable. For
     Sharpe and fitness the larger of |raw| and |risk-neutralized| counts: a signal hidden under BRAIN's
     risk factors is a near miss that a factor neutralization can uncover. Without
     ``sign_mirrors`` (``schemas.SHORT_RESTRICTED_REGIONS``: the opposite alpha does not flip
-    the performance) values count with their sign, so a negative one is no near miss."""
-    size = abs if sign_mirrors else (lambda v: v)
+    the performance) values count with their sign, so a negative one is no near miss.
+    ``flipped`` judges the value in the orientation the alpha will be repaired in, not by
+    its size: True = as after a sign flip (-value; the alpha is sent sign first), False =
+    as measured. A value with the opposite sign to the Sharpe (Sharpe -1.03 with 2-year
+    Sharpe +0.48, run rs20261125130750) turns negative when flipped, which |value| hid; None
+    = |value| (where the orientation is not known yet, e.g. the Sharpe itself)."""
+    if flipped is None:
+        size = abs if sign_mirrors else (lambda v: v)
+    elif flipped:
+        size = lambda v: -v  # noqa: E731
+    else:
+        size = lambda v: v  # noqa: E731
     share = (shares or {}).get(failure_class)
     if share is None:
         return True, None
@@ -313,7 +324,9 @@ def near_miss(failed: list[GateResult], failure_class: str,
         best = max(size(g.value), size(rn)) if rn is not None else size(g.value)
         if best < need:
             shown = f"{g.value}" + (f" (risk-neutralized {rn})" if rn is not None else "")
-            how = "|value|" if sign_mirrors else f"value ({FLIP_DOES_NOT_MIRROR})"
+            how = ("value after the sign flip" if flipped else
+                   "value" if flipped is False and sign_mirrors else
+                   "|value|" if sign_mirrors else f"value ({FLIP_DOES_NOT_MIRROR})")
             return False, (f"{g.name} {shown} is too far from {g.threshold} to repair "
                            f"({how} < {share} x threshold = {need:.4g})")
     return True, None
@@ -396,8 +409,12 @@ def decide(result: ResultRecord, gates: list[GateResult], playbook: Playbook,
             # the factor neutralization changes every raw measure; recent-years Sharpe has no
             # risk-neutralized value to judge it by, so it does not reject here
             classes = [c for c in classes if c != "recent_sharpe"]
+        # an alpha sent sign first is judged as it will be after the flip (owner 2026-11-27:
+        # a value the flip changes must not reject it as measured); the Sharpe itself by size
+        flip = True if route and route.startswith(SIGN_FIRST) else None
         for cls in classes:
-            ok, why = near_miss(failed, cls, near_miss_share, result, sign_mirrors=sign_mirrors)
+            ok, why = near_miss(failed, cls, near_miss_share, result, sign_mirrors=sign_mirrors,
+                                flipped=None if cls == "sharpe" else flip)
             if not ok:
                 return record("reject", cls, reasons + [why])
         return record("repair", failure_class, reasons + [f"playbook has {failure_class} levers"])

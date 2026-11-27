@@ -1,7 +1,7 @@
 # Alpha Generator settings (Phase 3). Technical limits have values. Policy limits are
 # null (= not configured, the check is skipped) until the owner decides (OQ-11).
 generator:
-  prompt_version: gen-v16      # written to CandidateRecord.prompt_version; bump when prompts change
+  prompt_version: gen-v17      # written to CandidateRecord.prompt_version; bump when prompts change
   max_repair_rounds: 1         # times rejected expressions are sent back to the model for a fix
   max_paper_chars: 120000      # longer papers are cut to this many characters (null = no cut)
   max_hypotheses_per_paper: 5  # hypotheses extracted from one paper
@@ -178,6 +178,23 @@ generator:
       - 'replicator\b'
       - 'technical helper'
       - 'employer identification'
+    # category codes and cluster labels (owner 2026-11-27): a number that names a class
+    # (news topic code, return-based cluster label, currency or fiscal-period code); its
+    # order means nothing, so it is not listed as a signal, it may be a group
+    # (group_rank(x, densify(f))) or compared to a code (f == 3), never ranked or averaged.
+    # Run rs20261127123332 ranked news_category_tag and a cluster label as signals.
+    # 1/0 indicator flags are not codes (they start with "Indicator"/"Flag", not matched)
+    category:
+      - '(an? |the )?(integer|numeric|numerical|categorical|discrete) (code|label|tag|cluster|class|category|classification|id\b|identifier)'
+      - '(an? |the )?(cluster|class|category|classification|sector|industry|bucket|segment|group|grouping) (label|code|tag|assignment|id\b|identifier|number|membership)'
+      - '(an? |the )?(classification |categorical )?(code|label|tag) (for|of|representing|indicating|identifying|describing|that)\b'
+      - '(an? |the )?(categorical )?tag or label'
+      - '(an? |the )?coded\b'
+      - '(an? |the )?identifier (or code|or date|of the)\b'
+    # a labelled field that is ordered after all (owner: keep quantile buckets as signals)
+    category_keep:
+      - '\b(quantile|quintile|decile|tercile|quartile|percentile)s?\b'
+    category_groups: 3          # category fields of the arm's dataset offered as groupings
     time:
       - '(the )?(effective |expected |scheduled |latest |most recent )*(earnings report )?date\b'
       - '(the )?(utc |vendor )?timestamp'

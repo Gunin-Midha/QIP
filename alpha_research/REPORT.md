@@ -1127,3 +1127,33 @@ child, the 8 JPN fundamental17 children's fixes, the recipe blend onto the 0.11-
 alpha); the accept's lineage unchanged. On the closest EUR lead (`..r01a215f1_001_r1a`) the
 next wave is now `drop_weak_legs` (news part + analyst69 partner) and an analyst7 breadth
 blend. `tests/test_feasibility.py`. 1019 tests pass.
+
+## Category codes are not signals (2026-11-27, owner; gen-v17)
+
+Run `rs20261127123332` (USA/AMR/GLB) ranked and averaged fields whose numbers name a class:
+`rank(ts_zscore(vec_avg(news_category_tag), 21))` (an "integer code representing a
+classification tag", e.g. M&A), `rank(ts_backfill(industry_grouping_level2_top200_542, 20))`
+(a "cluster label assignment (1-2)"), `vec_avg(news_subject_code)`. Their order means nothing;
+all three alphas were weak (Sharpe 0.08, -0.59, -0.12) and the news tags gave turnover over 100%.
+
+Built: a third field role `category` (`generator.field_role`, patterns `field_roles.category`
+in `config/generator.yaml`: descriptions starting "integer/numeric/categorical code/label/tag",
+"cluster/class/industry ... label/assignment/code", "code representing/indicating ...", "coded",
+"identifier or code/date ..."). 1/0 indicator flags are not matched; descriptions naming
+quantiles/quintiles/deciles anywhere (`category_keep`, owner's exception) stay signals. Over the
+10 D1 catalogs: 170 distinct fields (373 entries) are categories, e.g. news topic and event type
+codes, return-based cluster labels stored as numbers, industry level codes, currency and
+fiscal-period codes. Effects:
+- The Generator does not list them as signals unless the task names them (then with the hint
+  "category code: no order; only as a group ... or compared to a code"); up to
+  `category_groups` (3) matrix codes, the arm's dataset first, are offered on a "Category codes"
+  line as optional groupings (`generator.category_fields`).
+- `generator.category_misuse`: a code may sit in a group slot (directly, through `densify`, or
+  through a variable holding one), be compared to a constant with == / !=, or be tested with
+  `is_nan`; any other use is an error and the alpha is sent back once with the reason.
+- `signal_profile` does not count a code as a signal source; blend partners (Repair Agent, Blend
+  Planner) and the Arm Designer's signal-field count already take signal-role fields only.
+
+Not verified on BRAIN: a densified matrix code as a group argument (BRAIN's own docs use
+`densify` on grouping fields). Replay over memory: 3 alphas misused a code (the three above), none
+used one correctly. `tests/test_category_fields.py`. 1035 tests pass.
