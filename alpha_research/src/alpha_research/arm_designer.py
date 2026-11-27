@@ -39,6 +39,12 @@ Method
 4. Done. A design is done once ``done_after_alphas`` new alphas (no repair lever) on its
    dataset in that market reached BRAIN since its batch was written, counting every model.
    The market gets a new batch when every design of its latest batch is done.
+5. Dead datasets (owner 2026-11-27). A dataset is dead in a market once ``dead_after_alphas``
+   new alphas on it there (any time, any arm) completed on BRAIN and the best |Sharpe| (raw
+   or BRAIN's risk-neutralized) is below ``dead_sharpe_share`` x the market's Sharpe bar. A
+   dead dataset's arms get no more slots (designed or plan arms), its design counts as done,
+   and it is not designed again. Run rs20261127085437: EUR model307, the exploration arm,
+   kept taking refill slots after 5 alphas at |Sharpe| <= 0.36.
 """
 
 from __future__ import annotations
@@ -70,6 +76,8 @@ class DesignerConfig:
     decay_by_category: Mapping[str, int] = field(default_factory=lambda: {"default": 6})
     settings_evidence: int = 3
     near_distance: float = 0.6
+    dead_after_alphas: int = 0          # 0 = off (method step 5)
+    dead_sharpe_share: float = 0.3
 
     @classmethod
     def from_dict(cls, raw) -> "DesignerConfig":
@@ -81,7 +89,7 @@ class DesignerConfig:
         known = {"enabled", "arms_per_batch", "done_after_alphas", "explore_arms",
                  "exploit_arms", "exploit_min_share",
                  "min_signal_fields", "weights", "decay_by_category", "settings_evidence",
-                 "near_distance"}
+                 "near_distance", "dead_after_alphas", "dead_sharpe_share"}
         if set(raw) - known:
             raise ConfigError(f"agents config: designer: unknown keys {sorted(set(raw) - known)}")
 
@@ -112,13 +120,19 @@ class DesignerConfig:
         near = raw.get("near_distance", d.near_distance)
         if isinstance(near, bool) or not isinstance(near, (int, float)) or near < 0:
             raise ConfigError("agents config: designer.near_distance must be >= 0")
+        dead_share = raw.get("dead_sharpe_share", d.dead_sharpe_share)
+        if isinstance(dead_share, bool) or not isinstance(dead_share, (int, float)) \
+                or not 0 <= dead_share <= 2:
+            raise ConfigError("agents config: designer.dead_sharpe_share must be in [0, 2]")
         return cls(enabled=enabled, arms_per_batch=pos_int("arms_per_batch"),
                    done_after_alphas=pos_int("done_after_alphas"),
                    explore_arms=pos_int("explore_arms", 0),
                    exploit_arms=pos_int("exploit_arms", 0), exploit_min_share=float(share),
                    min_signal_fields=pos_int("min_signal_fields", 0),
                    weights=weights, decay_by_category=dict(decays),
-                   settings_evidence=pos_int("settings_evidence"), near_distance=float(near))
+                   settings_evidence=pos_int("settings_evidence"), near_distance=float(near),
+                   dead_after_alphas=pos_int("dead_after_alphas", 0),
+                   dead_sharpe_share=float(dead_share))
 
 
 # ---------------------------------------------------------------------------- step 1
@@ -291,11 +305,36 @@ def briefs(name: str | None, description: str | None, category: str | None, data
 # ---------------------------------------------------------------------------- step 4
 
 
+FRESH_LEVERS = (None, "", "critic_revision")
+
+
+def dead_datasets(outcomes: list[dict], region: str, delay: int, bar: float,
+                  config: DesignerConfig) -> dict[str, tuple[int, float]]:
+    """{dataset: (new alphas, best |Sharpe|)} of the datasets dead in this market (method
+    step 5)."""
+    if config.dead_after_alphas <= 0 or not bar:
+        return {}
+    seen: dict[str, list[float]] = {}
+    for o in outcomes:
+        c, r = o["candidate"], o["result"]
+        if c.region != region or c.delay != delay or c.lever not in FRESH_LEVERS \
+                or r is None or r.status != "complete" or not c.dataset:
+            continue
+        seen.setdefault(c.dataset, []).append(_best_sharpe(r) or 0.0)
+    cut = config.dead_sharpe_share * bar
+    return {ds: (len(v), max(v)) for ds, v in seen.items()
+            if len(v) >= config.dead_after_alphas and max(v) < cut}
+
+
 def batch_done(designs: list[dict], fresh: Mapping[str, int],
-               config: DesignerConfig) -> tuple[bool, list[str]]:
-    """(every design of the batch is done, lines saying how far each one is)."""
+               config: DesignerConfig, dead: Mapping | None = None) -> tuple[bool, list[str]]:
+    """(every design of the batch is done, lines saying how far each one is); a dead
+    dataset's design is done."""
     lines, done = [], True
     for d in designs:
+        if d["dataset"] in (dead or {}):
+            lines.append(f"{d['dataset']} dead")
+            continue
         n = fresh.get(d["dataset"], 0)
         if n < config.done_after_alphas:
             done = False
@@ -314,11 +353,12 @@ def latest_batch(designs: list[dict]) -> list[dict]:
 def design_batch(*, region: str, delay: int, candidates: Mapping[str, dict],
                  dataset_text: Mapping[str, dict], field_ids: set[str],
                  outcomes: list[dict], bar: float, base_settings: Mapping,
-                 earlier: set[str], config: DesignerConfig) -> list[dict]:
+                 earlier: set[str], config: DesignerConfig,
+                 dead: Mapping | None = None) -> list[dict]:
     """A new batch of designs for one market (steps 1-3). ``earlier``: datasets designed
-    before in this market (left out while others remain)."""
+    before in this market (left out while others remain); ``dead`` datasets never."""
     pool = {ds: c for ds, c in candidates.items()
-            if c.get("signal_fields", 0) >= config.min_signal_fields}
+            if c.get("signal_fields", 0) >= config.min_signal_fields and ds not in (dead or {})}
     fresh = {ds: c for ds, c in pool.items() if ds not in earlier}
     scored = score_datasets(fresh or pool, outcomes, region, delay, bar, config)
     exploit = exploit_rows(score_datasets(pool, outcomes, region, delay, bar, config), bar,

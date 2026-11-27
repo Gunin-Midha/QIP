@@ -53,6 +53,7 @@ from typing import Mapping, Sequence
 import pandas as pd
 
 from . import breadth
+from . import feasibility
 from .config import ConfigError
 from .fastexpr import FastExprError, FastExprSpec, analyze
 from .generator import GenerationError, ask_json, crowded_fields, field_role, heavily_used
@@ -217,7 +218,7 @@ def blend_base(candidate: CandidateRecord, by_id: Mapping[str, dict]) -> Candida
     """The lineage's last alpha that is not a blend: blends are built on it, so a blend never
     has more than two parts."""
     c = candidate
-    while c.lever in (BLEND_PLAN, "blend_other_dataset", "breadth_blend") \
+    while c.lever in (BLEND_PLAN, "blend_other_dataset", "breadth_blend", "recipe_blend") \
             and c.parent_id in by_id:
         c = by_id[c.parent_id]["candidate"]
     return c
@@ -353,7 +354,8 @@ def partner_candidates(parent: CandidateRecord, parent_result: ResultRecord | No
                 continue
             if c.lever == PARTNER_ALONE:
                 p.alone.append({"expression": c.expression, "sharpe": r.sharpe,
-                                "candidate_id": c.candidate_id})
+                                "candidate_id": c.candidate_id,
+                                "sub_universe_ratio": _r2(feasibility.ratio(r))})
                 continue
             if best is None or abs(r.sharpe) > abs(best["result"].sharpe):
                 best = o
@@ -370,6 +372,7 @@ def partner_candidates(parent: CandidateRecord, parent_result: ResultRecord | No
                     (abs(c) for s in pool_pnl.values()
                      if (c := corr(r.daily_pnl, s, config.min_overlap_days)) is not None),
                     default=None),
+                "sub_universe_ratio": _r2(feasibility.ratio(r)),
                 "sharpe_in_weak_years": round(statistics.mean(
                     [sign * ys[y] for y in weak if y in ys]), 2) if any(
                     y in ys for y in weak) else None,
@@ -378,7 +381,8 @@ def partner_candidates(parent: CandidateRecord, parent_result: ResultRecord | No
                          >= config.min_partner_sharpe)
                         or any(a["sharpe"] >= config.min_partner_sharpe for a in p.alone)
                         or p.in_accept)
-        p.score = _score(p, failing, bar, config.min_field_alphas)
+        p.score = _score(p, failing, bar, config.min_field_alphas,
+                         feasibility.limit_share(parent_result))
         out.append(p)
     proven = sorted([p for p in out if p.proven], key=lambda p: (-p.score, p.dataset))
     untested = sorted([p for p in out if not p.proven], key=lambda p: (-p.score, p.dataset))
@@ -394,8 +398,12 @@ def _note(m: Mapping) -> str:
     return f"{desc} ({', '.join(bits)})" if bits else desc
 
 
+def _r2(x):
+    return None if x is None else round(x, 2)
+
+
 def _score(p: PartnerCandidate, failing: set[str], bar: float,
-           min_field_alphas: int = 5) -> float:
+           min_field_alphas: int = 5, limit_share: float | None = None) -> float:
     """Fit of a partner dataset (module doc, step 1). Usage is its signal fields' median
     BRAIN alphas, not the dataset's total (analyst69: 188,000 alphas in all, its revision
     fields 0-80 each); a near-empty dataset (median below ``min_field_alphas``) gets no
@@ -420,6 +428,14 @@ def _score(p: PartnerCandidate, failing: set[str], bar: float,
         s += max(-1.0, min(1.0, e["sharpe_in_weak_years"] / bar))
     if "sub_universe" in failing and p.coverage is not None:
         s += p.coverage
+    if "sub_universe" in failing and limit_share:
+        # owner 2026-11-27: a partner fixes sub-universe only with large-cap Sharpe of its
+        # own (its measured sub-universe / full Sharpe at or above BRAIN's limit share);
+        # below it, it lowers the blend's ratio (EUR breadth onto a small-cap base)
+        ratios = [x for x in [e.get("sub_universe_ratio")]
+                  + [a.get("sub_universe_ratio") for a in p.alone] if x is not None]
+        if ratios:
+            s += min(1.0, max(ratios) / limit_share) if max(ratios) >= limit_share else -1.0
     return round(s, 3)
 
 

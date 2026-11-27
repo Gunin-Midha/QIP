@@ -41,6 +41,7 @@ from .memory import MemoryStore
 from .pool import Pool
 from .repair import Playbook
 from .research_loop import ResearchLoop, experiment_id
+from .evaluator import FLIP_DOES_NOT_MIRROR
 from .schemas import (SHORT_RESTRICTED_REGIONS, CandidateRecord, DecisionRecord, GateResult,
                       ResultRecord, SchemaError)
 from .simulator import Simulator
@@ -308,9 +309,26 @@ class Pipeline:
         appended (memory is append-only), so the next repair step sees it."""
         out = []
         for row in self.memory.candidate_outcomes():
-            if newly_repairable(row["decision"], row["result"], self.playbook):
+            if (newly_repairable(row["decision"], row["result"], self.playbook)
+                    or self._flip_now_allowed(row["candidate"], row["decision"], row["result"])):
                 out.append(self._evaluate(row["candidate"], row["result"]))
         return out
+
+    def _flip_now_allowed(self, c, d, r) -> bool:
+        """Rejected only because its negative value did not count as a near miss in a
+        short-restricted market, and ``repair.flip_short_restricted`` now allows the flip."""
+        if not (d is not None and d.decision == "reject" and r is not None
+                and r.status == "complete" and r.sharpe is not None and r.sharpe < 0
+                and c.region in SHORT_RESTRICTED_REGIONS
+                and self.config.repair.sign_mirrors(c.region)
+                and any(FLIP_DOES_NOT_MIRROR in x for x in d.reasons)):
+            return False
+        # only when the flip would make it a near miss on every class (else the same reject
+        # would be appended again at every run start)
+        failed = [g for g in d.gate_results if g.passed is False]
+        shares = self.config.for_settings(c.region, c.delay).repair.near_miss_share
+        return all(evaluator.near_miss(failed, cls, shares, r)[0]
+                   for cls in {evaluator.check_class(g.name) for g in failed})
 
     def recheck_pending(self, only: set[str] | None = None) -> tuple[list[Outcome], list[str]]:
         """Fetch BRAIN's result again (one poll of the finished simulation, which re-reads
@@ -382,7 +400,7 @@ class Pipeline:
         decision = evaluator.decide(result, gates, self.playbook, risk_checks, veto, risk_reasons,
                                     config.repair.near_miss_share,
                                     config.repair.risk_neutralized_gap,
-                                    sign_mirrors=candidate.region not in SHORT_RESTRICTED_REGIONS)
+                                    sign_mirrors=config.repair.sign_mirrors(candidate.region))
 
         admitted_by_diversity = None
         if decision.decision == "accept":

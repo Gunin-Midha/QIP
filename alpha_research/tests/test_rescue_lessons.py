@@ -53,7 +53,9 @@ def test_size_tilt_multiplies_by_offset_plus_cap_rank(candidate):
 def test_playbook_orders_the_rescue_levers_first():
     pb = Playbook.load(PLAYBOOK)
     sub = [lv.name for lv in pb.entries["sub_universe"]]
-    assert sub[0] == "size_tilt" and sub.index("liquidity_tilt") > sub.index("rank_transform")
+    # drop_weak_legs first (2026-11-27), then the size tilt (feasibility gates it)
+    assert sub[:2] == ["drop_weak_legs", "size_tilt"]
+    assert sub.index("liquidity_tilt") > sub.index("rank_transform")
     assert sub.index("change_universe") > sub.index("liquidity_tilt")
     assert pb.entries["prod_correlation"][0].name == "blend_other_dataset"
 

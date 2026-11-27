@@ -629,6 +629,12 @@ def analyze(expression: str, spec: FastExprSpec, *,
                 w.err(f"variable {stmt.name!r} has the same name as an operator")
             if stmt.name in spec.reserved_names:
                 w.err(f"variable name {stmt.name!r} is reserved on BRAIN; choose another")
+            # BRAIN refuses a variable named after a datafield ('Attempted to use reserved
+            # variable name: "sales"', 2026-11-27: `sales` is a CHN field id)
+            elif (stmt.name in spec.base_fields or stmt.name in spec.groups
+                  or (w.datafields is not None and stmt.name in w.datafields)):
+                w.err(f"variable name {stmt.name!r} is a datafield name, which BRAIN "
+                      f"reserves; choose another")
             w.visit(stmt.value)
             w.variables.add(stmt.name)  # defined only for later statements
         else:

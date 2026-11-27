@@ -127,6 +127,16 @@ class RepairPolicy:
     # BRAIN's risk-neutralized Sharpe this much above the raw one sends a failed Sharpe to
     # the factor neutralization levers first (evaluator.sharpe_route). None = off.
     risk_neutralized_gap: float | None = None
+    # owner 2026-11-27: try flip_sign in short-restricted markets too (schemas.
+    # SHORT_RESTRICTED_REGIONS, CHN), one simulation per negative near miss, to measure
+    # whether the opposite alpha mirrors there. False = BRAIN's guide (no flips).
+    flip_short_restricted: bool = False
+
+    def sign_mirrors(self, region: str) -> bool:
+        """Treat a negative alpha in ``region`` as its flip (near miss by |value|,
+        sign-first route, flip_sign applicable)."""
+        from .schemas import SHORT_RESTRICTED_REGIONS
+        return region not in SHORT_RESTRICTED_REGIONS or self.flip_short_restricted
 
 
 @dataclass(frozen=True)
@@ -340,6 +350,9 @@ def config_from_dict(raw: Any, source: str = "<dict>") -> Config:
             near_miss[cls] = v
     rn_gap = _num(rp, "repair", "risk_neutralized_gap", lo=0.0) \
         if "risk_neutralized_gap" in rp else None
+    flip_sr = rp.get("flip_short_restricted", False)
+    if not isinstance(flip_sr, bool):
+        raise ConfigError("repair.flip_short_restricted must be true or false")
 
     # optional section: per-region (or region/delay) gate overrides
     rg = raw.get("regions") or {}
@@ -356,7 +369,7 @@ def config_from_dict(raw: Any, source: str = "<dict>") -> Config:
                         for k, (lo, hi) in REGION_GATE_KEYS.items() if k in over}
 
     return Config(gates, risk, diversity, auditor, holdout, simulator, source=source,
-                  repair=RepairPolicy(near_miss, rn_gap), regions=regions)
+                  repair=RepairPolicy(near_miss, rn_gap, flip_sr), regions=regions)
 
 
 POOL_ADMITS = ("accept", "submitted")

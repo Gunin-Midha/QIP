@@ -76,6 +76,15 @@ Method
    the id ``<parent id>_r<generation>``. Exactly one lever per repair. ``variants``
    instead returns one child per applicable lever (ids ``..._r<generation><a, b, ...>``),
    for rescuing an alpha by hand with ``cli repair``.
+6. Feasibility (feasibility.py, owner 2026-11-27): a lever that cannot close the alpha's gap
+   by our own measurements (mechanical levers on a Sharpe gap above
+   ``max_mechanical_sharpe_gain``, a tilt or smaller universe when the sub-universe Sharpe
+   alone cannot support a passing alpha, a blend onto an alpha with no large-cap part) is
+   left out of the wave with a note. When parts of the alpha were measured alone,
+   ``drop_weak_legs`` (mechanical) and ``reweight_legs`` (model) go before every other fix;
+   a blend that fails sub-universe gets its partner tested alone when it never was; a
+   revision-breadth dataset never measured alone in the market is tested alone before it is
+   blended.
 """
 
 from __future__ import annotations
@@ -88,6 +97,7 @@ from typing import Collection, Mapping
 
 from . import blend_planner
 from . import breadth
+from . import feasibility
 from .evaluator import FACTOR_FIRST, SIGN_FIRST
 from .fastexpr import (Assign, Binary, Call, ComplexityLimits, FastExprError, FastExprSpec,
                        Name, Num, Unary, analyze, catalog, catalog_for, parse, render)
@@ -99,7 +109,7 @@ from .lever_stats import (PINNED_LAST, LeverStats, RepairLearningConfig, combo_p
                           successful_examples)
 from .llm import LLMClient, ModelDown
 from . import legs
-from .legs import LEG_LEVER, RECIPE_LEVER, REWEIGHT_LEVER
+from .legs import DROP_LEVER, LEG_LEVER, RECIPE_LEVER, REWEIGHT_LEVER
 from .memory import MemoryStore
 from .prompts import repair_system, repair_user
 from .repair import Lever, Playbook
@@ -139,7 +149,7 @@ LEVER_KINDS = {
     "set_neutralization": "neutralization",
     "change_universe": "universe", "liquidity_tilt": "universe", "size_tilt": "universe",
     "backfill_fields": "data", "flip_sign": "sign",
-    RECIPE_LEVER: "blend",
+    RECIPE_LEVER: "blend", DROP_LEVER: "parts",
 }
 
 
@@ -324,7 +334,7 @@ def _flip_sign(c, step, spec, result=None):
         raise LeverNotApplicable("needs BRAIN's Sharpe to know the sign")
     if result.sharpe >= 0:
         raise LeverNotApplicable(f"Sharpe {result.sharpe} is not negative")
-    if c.region in SHORT_RESTRICTED_REGIONS:
+    if c.region in SHORT_RESTRICTED_REGIONS and not (step or {}).get("allow_restricted"):
         raise LeverNotApplicable(f"short selling is restricted in {c.region}: the opposite "
                                  f"alpha does not flip the performance")
     final = _final(c)[1]
@@ -804,6 +814,8 @@ class RepairAgent:
                  crowding: tuple[float | None, int | None] = (None, None),
                  generator_config=None, lessons: list[dict] | None = None):
         self.playbook = playbook
+        # config.repair.flip_short_restricted (owner 2026-11-27): flip_sign in CHN too
+        self.flip_restricted = False
         self.lessons = lessons or []   # the Lesson Writer's latest (MemoryStore.latest_lessons)
         # {(region, delay) or None: catalog meta} (load_datafield_meta; None = markets
         # without their own): datasets, categories and crowding for blend_other_dataset
@@ -872,6 +884,9 @@ class RepairAgent:
             out.notes.append(f"no repair: {why}")
             return out
         ranked = self.ranked(candidate, decision, result, stats)
+        keep = {lv.name for _, lv in self._feasible(
+            [(decision, lv) for lv, _ in ranked], candidate, decision, result, out)}
+        ranked = [x for x in ranked if x[0].name in keep]
         out.notes.append("lever order: " + ", ".join(f"{lv.name} {sc:g}" for lv, sc in ranked))
         tried = set(self.memory.lineage_levers(candidate.candidate_id)) - self._repeatable()
         self._outcomes = outcomes
@@ -923,6 +938,7 @@ class RepairAgent:
         tried -= self._repeatable()
         self._outcomes = outcomes
         options = self._wave_options(candidate, decision, result, stats, tried, priority)
+        options = self._feasible(options, candidate, decision, result, out)
         # owner 2026-11-25: an alpha failing production correlation always gets a model call;
         # that class's model levers take the wave's model slot first
         # (an alpha in a mechanical-only tier gets no model call, production correlation
@@ -936,19 +952,65 @@ class RepairAgent:
             if self.llm is None:
                 out.notes.append("production correlation needs a model call; no model is "
                                  "configured")
-        parts = self._parts(candidate, outcomes)
-        if not prod and sum(r["result"] is not None for r in parts) >= 2:
-            # the parts were measured alone: the model's rewrite of the combination
-            # (reweight_legs) takes the wave's model slot first
-            first = [x for x in options if x[1].name == REWEIGHT_LEVER]
-            options = first + [x for x in options if x not in first]
+        parts = self._parts(self._part_base(candidate, outcomes), outcomes)
+        parts_first: list = []
+        if sum(r["result"] is not None for r in parts) >= 1:
+            # parts were measured alone (owner 2026-11-27): dropping the weak part
+            # (mechanical) and the model's rewrite of the combination (reweight_legs) go
+            # before every other fix, breadth and planned blends included; in run
+            # rs20261127085437 the EUR lead's parts were measured (one at sub-universe ratio
+            # 0.19) and its next wave was two more breadth blends
+            parts_first = [x for x in options if x[1].name == DROP_LEVER] + (
+                [x for x in options if x[1].name == REWEIGHT_LEVER] if not prod else [])
+            options = parts_first + [x for x in options if x not in parts_first]
         out.notes.append("wave order: " + ", ".join(lv.name for _, lv in options))
         seen = {(candidate.expression, candidate.universe, candidate.decay,
                  candidate.neutralization, candidate.truncation)}
         model_tries = 0
+
+        def take(d, lever) -> None:
+            nonlocal model_tries
+            if not _mechanical(lever.name):
+                if (mech_only or self.llm is None
+                        or model_tries >= self.learning.model_levers_per_wave):
+                    return
+            calls = out.llm_calls
+            child = self._try(candidate, lever, d, result, pool_expressions, events, out)
+            if out.llm_calls > calls:   # the slot is spent only when the model was asked
+                model_tries += 1
+            if child is None:
+                return
+            key = (child.expression, child.universe, child.decay, child.neutralization,
+                   child.truncation)
+            if key in seen:
+                out.notes.append(f"{lever.name}: same experiment as another fix in this wave")
+                return
+            seen.add(key)
+            if self.memory.has_result_for_hash(experiment_hash(child)):
+                out.notes.append(f"{lever.name}: skipped (this experiment is already in memory)")
+                return
+            out.children.append(dataclasses.replace(
+                child, candidate_id=self._free_id(child.candidate_id, out.children)))
+            out.notes.append(f"{lever.name}: applied")
+
+        for d, lever in parts_first:
+            if len(out.children) >= size:
+                break
+            take(d, lever)
+        options = [x for x in options if x not in parts_first]
+        failing_all = failing_classes(decision, result) | {decision.failure_class}
+        sign_first = any(r.startswith(SIGN_FIRST) for r in decision.reasons)
+
+        def info_blocked(name: str) -> str | None:
+            return feasibility.blocked(name, mechanical=False, decision=decision,
+                                       result=result, failing=failing_all,
+                                       sign_first=sign_first,
+                                       config=self.learning.feasibility)
         # owner 2026-11-27: a close lead failing an information class first gets blends
         # with analyst net revision breadth, built by rule (breadth.py, no model call)
-        if self.breadth is not None:
+        if self.breadth is not None and (why := info_blocked(breadth.BREADTH_LEVER)):
+            out.notes.append(f"breadth blend: not feasible: {why}")
+        elif self.breadth is not None and len(out.children) < size:
             for child in self._breadth_blends(candidate, decision, result, outcomes,
                                               size - len(out.children), out):
                 key = (child.expression, child.universe, child.decay,
@@ -963,8 +1025,9 @@ class RepairAgent:
         # owner 2026-11-26: a close lead failing an information class gets a model-planned
         # wave of blends (blend_planner.py); the rest of the wave is mechanical
         if self.blend is not None and not mech_only and len(out.children) < size:
-            failing_all = failing_classes(decision, result) | {decision.failure_class}
             ok, why = blend_planner.eligible(decision, result, failing_all, self.blend.config)
+            if ok and (bad := info_blocked(blend_planner.BLEND_PLAN)):
+                ok, why = False, f"not feasible: {bad}"
             out.notes.append(f"blend plan: {why}")
             if ok and self.llm is not None:
                 calls = out.llm_calls
@@ -986,34 +1049,18 @@ class RepairAgent:
         for d, lever in options:
             if len(out.children) >= size:
                 break
-            if not _mechanical(lever.name):
-                if (mech_only or self.llm is None
-                        or model_tries >= self.learning.model_levers_per_wave):
-                    continue
-            calls = out.llm_calls
-            child = self._try(candidate, lever, d, result, pool_expressions, events, out)
-            if out.llm_calls > calls:   # the slot is spent only when the model was asked
-                model_tries += 1
-            if child is None:
-                continue
-            key = (child.expression, child.universe, child.decay, child.neutralization,
-                   child.truncation)
-            if key in seen:
-                out.notes.append(f"{lever.name}: same experiment as another fix in this wave")
-                continue
-            seen.add(key)
-            if self.memory.has_result_for_hash(experiment_hash(child)):
-                out.notes.append(f"{lever.name}: skipped (this experiment is already in memory)")
-                continue
-            out.children.append(dataclasses.replace(
-                child, candidate_id=self._free_id(child.candidate_id, out.children)))
-            out.notes.append(f"{lever.name}: applied")
+            take(d, lever)
         if prod and model_tries == 0:
             out.notes.append("no model call for production correlation: its model levers "
                              "did not apply (see the notes above)")
-        if not any(r.startswith(SIGN_FIRST) for r in decision.reasons):
+        # part and partner tests only alongside fixes: with no feasible fix the alpha is
+        # not worth the extra simulations (run rs20261127085437: two part tests of a JPN
+        # alpha at Sharpe 1.10 whose fixes were all mechanical)
+        if out.children and not sign_first:
             room = left - len(out.children)
-            for child in self._leg_tests(candidate, outcomes, room, out)[:max(room, 0)]:
+            tests = self._leg_tests(candidate, outcomes, room, out)
+            tests += self._partner_test(candidate, result, outcomes, out)
+            for child in tests[:max(room, 0)]:
                 key = (child.expression, child.universe, child.decay, child.neutralization,
                        child.truncation)
                 if key in seen or self.memory.has_result_for_hash(experiment_hash(child)):
@@ -1066,10 +1113,34 @@ class RepairAgent:
                              "this market")
             return []
         kids = []
+        proven = breadth.accepted_datasets(fams, accepted)
+        min_sharpe = self.blend.config.min_partner_sharpe if self.blend is not None else 0.5
+        checked: dict[str, str] = {}
         for ds, items, w in plan:
             if len(kids) >= left:
                 break
             partner = breadth.partner_expression(items, cfg)
+            if ds not in checked:
+                checked[ds] = self._breadth_proof(ds, c, result, outcomes, meta, proven,
+                                                  min_sharpe, out)
+            if checked[ds] == "skip":
+                continue
+            if checked[ds] == "test":
+                # never measured in this market (owner 2026-11-27): one partner-alone test
+                # instead of blends; JPN analyst44 breadth was blended twice (Sharpe 1.44,
+                # 0.92 from 2.0) before a partner-alone test gave 0.09
+                checked[ds] = "skip"
+                new = dataclasses.replace(
+                    c, expression=_rank_text(partner, self.spec), dataset=ds,
+                    hypothesis=f"Partner-alone test of {ds} net revision breadth "
+                               f"({', '.join(f.item for f in items)}) in {c.region}, before "
+                               f"blending it into {c.candidate_id}.")
+                child = self._child(c, new, blend_planner.PARTNER_ALONE)
+                if child is not None:
+                    out.notes.append(f"breadth blend: {ds} never measured alone in "
+                                     f"{c.region}; partner-alone test first")
+                    kids.append(child)
+                continue
             try:
                 expr = build_blend(base.expression, partner, self.spec, weight=w)
             except (FastExprError, LeverNotApplicable) as exc:
@@ -1294,9 +1365,14 @@ class RepairAgent:
             return self._combo(c, lever, result, out)
         fn = MECHANICAL.get(lever.name)
         if fn is not None:
-            return fn(c, lever.step, self.spec, result)
+            step = lever.step
+            if lever.name == "flip_sign" and self.flip_restricted:
+                step = {**(step or {}), "allow_restricted": True}
+            return fn(c, step, self.spec, result)
         if lever.name == RECIPE_LEVER:
             return self._recipe_blend(c, lever.step, result, out)
+        if lever.name == DROP_LEVER:
+            return self._drop_weak_legs(c, decision, result, out)
         parts = self._parts(c, getattr(self, "_outcomes", None)
                             or self.memory.candidate_outcomes())
         if lever.name == REWEIGHT_LEVER and sum(r["result"] is not None for r in parts) < 2:
@@ -1427,11 +1503,158 @@ class RepairAgent:
             node = o["candidate"]
         return []
 
+    def _feasible(self, options: list, candidate: CandidateRecord, decision: DecisionRecord,
+                  result: ResultRecord | None, out: RepairOutcome) -> list:
+        """``options`` without the levers that cannot close this alpha's gap
+        (feasibility.py), each left out with a note."""
+        cfg = self.learning.feasibility
+        if not cfg.enabled:
+            return options
+        failing = failing_classes(decision, result) | {decision.failure_class}
+        sign_first = any(r.startswith(SIGN_FIRST) for r in decision.reasons)
+        kept = []
+        for d, lever in options:
+            why = feasibility.blocked(lever.name, mechanical=_mechanical(lever.name),
+                                      decision=decision, result=result, failing=failing,
+                                      sign_first=sign_first, config=cfg)
+            if why:
+                out.notes.append(f"{lever.name}: not feasible: {why}")
+            else:
+                kept.append((d, lever))
+        return kept
+
+    def _part_base(self, c: CandidateRecord, outcomes: list[dict]) -> CandidateRecord:
+        """The alpha whose parts ``c`` is made of: for a blend (build_blend shape) its
+        nearest ancestor that is not a blend, else ``c`` itself."""
+        by_id = {o["candidate"].candidate_id: o for o in outcomes}
+        node = c
+        for _ in range(20):
+            if legs.blend_partner(node.expression, self.spec) is None:
+                return node
+            o = by_id.get(node.parent_id) if node.parent_id else None
+            if o is None:
+                return c
+            node = o["candidate"]
+        return c
+
+    def _drop_weak_legs(self, c: CandidateRecord, decision: DecisionRecord,
+                        result: ResultRecord | None, out: RepairOutcome) -> CandidateRecord:
+        """``c`` without its weak parts, by their alone results (legs.part_weakness): for a
+        sub-universe failure the parts with too little large-cap Sharpe, else the parts that
+        add nothing to the part that carries the alpha. A blend is rebuilt on the kept parts
+        with the same partner and weight. Kept parts are combined as rank sums (build_blend
+        at weight 1)."""
+        outcomes = getattr(self, "_outcomes", None) or self.memory.candidate_outcomes()
+        by_id = {o["candidate"].candidate_id: o for o in outcomes}
+        base = self._part_base(c, outcomes)
+        rows = self._parts(base, outcomes)
+        if len(rows) < 2:
+            raise LeverNotApplicable("the alpha has fewer than two parts")
+        failing = failing_classes(decision, result) | {decision.failure_class}
+        sub_mode = "sub_universe" in failing and feasibility.limit_share(result) is not None
+        base_result = result if base is c else (by_id.get(base.candidate_id) or {}).get("result")
+        weak, why = legs.part_weakness(
+            rows, sub_mode=sub_mode, limit_share=feasibility.limit_share(result),
+            whole_sharpe=getattr(base_result, "sharpe", None),
+            config=self.learning.feasibility)
+        if not weak:
+            raise LeverNotApplicable(why)
+        kept = [r["part"] for i, r in enumerate(rows) if i not in weak]
+        expr = kept[0]
+        try:
+            for part in kept[1:]:
+                expr = build_blend(expr, part, self.spec, weight=1.0)
+            if base is not c:
+                bp = legs.blend_partner(c.expression, self.spec)
+                if bp is None:
+                    raise LeverNotApplicable("cannot read the blend's partner")
+                expr = build_blend(expr, bp[0], self.spec, weight=bp[1])
+        except FastExprError as exc:
+            raise LeverNotApplicable(f"cannot rebuild without the weak parts: {exc}") from exc
+        out.notes.append(f"{DROP_LEVER}: dropped part(s) "
+                         f"{', '.join(str(i + 1) for i in weak)} of {len(rows)} ({why})")
+        return dataclasses.replace(
+            c, expression=expr,
+            hypothesis=f"[drop parts {','.join(str(i + 1) for i in weak)}: {why}] "
+                       f"{c.hypothesis or ''}".strip())
+
+    def _breadth_proof(self, ds: str, c: CandidateRecord, result, outcomes: list[dict],
+                       meta: Mapping, proven: set[str], min_sharpe: float,
+                       out: RepairOutcome) -> str:
+        """"blend", "test" (partner-alone first) or "skip" for a breadth dataset, from our
+        alphas in this market that read only that dataset's fields."""
+        rows = []
+        for o in outcomes:
+            k, r = o["candidate"], o["result"]
+            if k.region != c.region or k.delay != c.delay or r is None \
+                    or r.status != "complete" or r.sharpe is None:
+                continue
+            f = feasibility.signal_fields(k.expression, self.spec)
+            if f and all((meta.get(x) or {}).get("dataset") == ds for x in f):
+                rows.append(r)
+        if feasibility.sub_failing(result) and self.learning.feasibility.enabled:
+            share = feasibility.limit_share(result)
+            ratios = [x for r in rows if (x := feasibility.ratio(r)) is not None]
+            if share and ratios and max(ratios) < share:
+                out.notes.append(f"breadth blend: {ds} measured alone in {c.region} with "
+                                 f"sub-universe ratio {max(ratios):.2f} < limit share "
+                                 f"{share:.2f}")
+                return "skip"
+        best = max((abs(r.sharpe) for r in rows), default=None)
+        if best is not None and best >= min_sharpe:
+            return "blend"
+        if ds in proven:
+            return "blend"
+        if not self.learning.feasibility.enabled:
+            return "blend"
+        if best is not None:
+            out.notes.append(f"breadth blend: {ds} alone in {c.region} reached |Sharpe| "
+                             f"{best:.2f} < {min_sharpe:g}; not blended")
+            return "skip"
+        return "test"
+
+    def _partner_test(self, c: CandidateRecord, result: ResultRecord | None,
+                      outcomes: list[dict], out: RepairOutcome) -> list[CandidateRecord]:
+        """A blend failing sub-universe whose partner was never measured alone in this market
+        gets one partner-alone test (its sub-universe ratio decides later blends)."""
+        if not self.learning.feasibility.enabled or not feasibility.sub_failing(result):
+            return []
+        bp = legs.blend_partner(c.expression, self.spec)
+        if bp is None:
+            return []
+        fields = feasibility.signal_fields(bp[0], self.spec)
+        if not fields or feasibility.measured_alone(fields, c.region, c.delay, outcomes,
+                                                    self.spec):
+            return []
+        if any(o["candidate"].lever == blend_planner.PARTNER_ALONE and
+               feasibility.signal_fields(o["candidate"].expression, self.spec) == fields
+               and o["candidate"].region == c.region and o["candidate"].delay == c.delay
+               for o in outcomes):
+            return []   # already queued or tested
+        meta = self._meta(c.region, c.delay)
+        ds = legs._datasets(set(fields), meta, self.spec)
+        new = dataclasses.replace(
+            c, expression=_rank_text(bp[0], self.spec),
+            dataset=sorted(ds)[0] if len(ds) == 1 else c.dataset,
+            hypothesis=f"Partner-alone test of the blend partner of {c.candidate_id}: its "
+                       f"sub-universe ratio says whether it can fix the blend's sub-universe "
+                       f"failure.")
+        child = self._child(c, new, blend_planner.PARTNER_ALONE)
+        if child is None:
+            return []
+        out.notes.append(f"{blend_planner.PARTNER_ALONE}: the blend's partner, never measured "
+                         f"alone in {c.region}")
+        return [child]
+
     def _leg_tests(self, c: CandidateRecord, outcomes: list[dict], room: int,
                    out: RepairOutcome) -> list[CandidateRecord]:
         """One child per part of ``c``, each the part alone (legs.py), once per lineage."""
         n = self.learning.leg_tests
         if n <= 0 or room <= 0 or c.lever == LEG_LEVER:
+            return []
+        if legs.blend_partner(c.expression, self.spec) is not None:
+            # a blend's parts are its base (measured: an ancestor) and its partner
+            # (_partner_test); testing them again repeats those simulations
             return []
         cands = {o["candidate"].candidate_id: o["candidate"] for o in outcomes}
         cands[c.candidate_id] = c
@@ -1475,6 +1698,10 @@ class RepairAgent:
                 continue
             if fields and not expression_fields(rec["partner"], self.spec) <= set(fields) \
                     | set(self.spec.base_fields) | set(self.spec.groups):
+                continue
+            if self.learning.feasibility.enabled and (bad := feasibility.partner_check(
+                    rec["partner"], c.region, c.delay, outcomes, self.spec, result)):
+                out.notes.append(f"{RECIPE_LEVER}: {rec['candidate_id']}'s partner: {bad}")
                 continue
             weight = blend_weight(step, result)
             try:
@@ -1523,9 +1750,19 @@ class RepairAgent:
                               value_share=float(step.get("value_share", 0.0) or 0.0))
 
 
+def _rank_text(expression: str, spec: FastExprSpec) -> str:
+    """``expression`` with its final value wrapped in rank() (unless it is already a rank)."""
+    stmts = parse(expression)
+    final = stmts[-1]
+    if not _is_rank(final):
+        _need_op(spec, "rank")
+        final = Call("rank", (final,), ())
+    return render(stmts[:-1] + (final,))
+
+
 def _mechanical(name: str) -> bool:
     parts = combo_parts(name)
-    return name in MECHANICAL or name == RECIPE_LEVER or bool(
+    return name in MECHANICAL or name in (RECIPE_LEVER, DROP_LEVER) or bool(
         parts and all(x in MECHANICAL for x in parts))
 
 

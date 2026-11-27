@@ -42,7 +42,8 @@ from .schemas import normalize_expression
 LEG_LEVER = "leg_alone"
 REWEIGHT_LEVER = "reweight_legs"
 RECIPE_LEVER = "recipe_blend"
-BLEND_LEVERS = ("blend_other_dataset", "blend_plan", RECIPE_LEVER)
+DROP_LEVER = "drop_weak_legs"
+BLEND_LEVERS = ("blend_other_dataset", "blend_plan", RECIPE_LEVER, "breadth_blend")
 WRAPPERS = ("rank", "group_rank")
 
 
@@ -350,5 +351,69 @@ def tried_partner_texts(candidate, by_id: Mapping[str, dict]) -> set[str]:
     return out
 
 
-__all__ = ["LEG_LEVER", "REWEIGHT_LEVER", "RECIPE_LEVER", "split_legs", "part_results",
+def blend_partner(expression: str, spec) -> tuple[str, float] | None:
+    """(partner signal, weight) of an alpha written by ``repair_agent.build_blend``:
+    ``A + [w *] if_else(is_nan(B), 0.5, B)`` [x tilt] with ``B = rank(partner)`` or
+    ``group_rank(partner, group)``; None for any other shape."""
+    try:
+        stmts = parse(expression)
+    except FastExprError:
+        return None
+    head, final = stmts[:-1], stmts[-1]
+    env = {s.name: s.value for s in head if isinstance(s, Assign)}
+    if isinstance(final, Binary) and final.op == "*" and _is_tilt(final.right, env,
+                                                                    spec.base_fields):
+        final = final.left
+    if not (isinstance(final, Binary) and final.op == "+"):
+        return None
+    part, weight = final.right, 1.0
+    if isinstance(part, Binary) and part.op == "*" and isinstance(part.left, Num):
+        weight, part = float(part.left.text), part.right
+    filled = _resolve(part, env)
+    if not (isinstance(filled, Call) and filled.name == "if_else" and len(filled.args) == 3):
+        return None
+    ranked = _resolve(filled.args[2], env)
+    if not (isinstance(ranked, Call) and ranked.name in WRAPPERS and ranked.args):
+        return None
+    core = ranked.args[0]
+    return render(_prune(head, core) + (core,)), weight
+
+
+def part_weakness(rows: list[dict], *, sub_mode: bool, limit_share: float | None,
+                  whole_sharpe: float | None, config) -> tuple[list[int], str]:
+    """(indexes of weak parts, why) for ``drop_weak_legs`` (feasibility.FeasibilityConfig
+    holds the shares). Sub-universe mode: a measured part whose sub-universe ratio is below
+    ``weak_part_ratio_share`` x BRAIN's limit share (or whose Sharpe is not positive) is weak.
+    Otherwise: when the best measured part alone reaches ``strong_part_share`` x the whole's
+    Sharpe, a measured part below ``weak_part_sharpe_share`` x the best one is weak. At least
+    one measured part must stay."""
+    measured = [(i, r["result"]) for i, r in enumerate(rows) if r["result"] is not None
+                and r["result"].sharpe is not None]
+    if not measured:
+        return [], "no part was measured alone"
+    weak: list[int] = []
+    if sub_mode:
+        if not limit_share:
+            return [], "no sub-universe limit share"
+        cut = config.weak_part_ratio_share * limit_share
+        for i, r in measured:
+            rat = (r.sub_universe_sharpe / r.sharpe
+                   if r.sharpe > 0 and r.sub_universe_sharpe is not None else None)
+            if r.sharpe <= 0 or (rat is not None and rat < cut):
+                weak.append(i)
+        why = f"sub-universe ratio below {cut:.2f}"
+    else:
+        best = max(r.sharpe for _, r in measured)
+        if not whole_sharpe or whole_sharpe <= 0 or best < config.strong_part_share * whole_sharpe:
+            return [], "no part alone carries the alpha"
+        weak = [i for i, r in measured if r.sharpe < config.weak_part_sharpe_share * best]
+        why = f"Sharpe alone below {config.weak_part_sharpe_share:g} x the best part ({best:g})"
+    strong = [i for i, _ in measured if i not in weak]
+    if not weak or not strong:
+        return [], ("every measured part is weak" if weak else "no weak part")
+    return weak, why
+
+
+__all__ = ["LEG_LEVER", "REWEIGHT_LEVER", "RECIPE_LEVER", "DROP_LEVER", "blend_partner",
+           "part_weakness", "split_legs", "part_results",
            "part_lines", "recipes", "recipe_lines", "recipe_from", "tried_partner_texts"]

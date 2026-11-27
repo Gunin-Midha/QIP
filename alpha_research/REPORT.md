@@ -1070,3 +1070,60 @@ by description (`breadth_blend.aggregate_words`). Item order for a breadth blend
 >= 500 BRAIN alphas last, earnings/profit/sales items first, net debt / book value / dividends
 / NAV / FFO never, one horizon per item. One-word field ids in the new catalogs (price, shares,
 cash) count as named in a hypothesis only in backticks.
+
+## Run rs20261127085437 and repair feasibility (2026-11-27, owner)
+
+Run (EUR/CHN/JPN, plan v5 with designed arms, 60 simulations, 59 model calls): one accept,
+JPN other176 + fundamental17 blend planned by the Blend Planner (`rs20261125111614r02a89_001_r1a_r2c`,
+Sharpe 2.04, fitness 1.13, PROD 0.52; flagged: beats its base in 4 of 10 years, mostly 2023).
+EUR: the recipe blend (analyst69 net revision breadth, partner of `eur_37`) lifted three
+parents from Sharpe 1.5-1.8 to 2.6-2.85, and all three failed sub-universe (0.65-1.11 vs
+1.37-1.48). CHN: 14 fresh alphas, best positive 0.68.
+
+What the repairs showed (memory, all runs):
+- BRAIN's sub-universe limit is a share of the alpha's own Sharpe (EUR TOP2500 0.52). The
+  part tests said why the EUR blends failed: the price-to-cash-flow and price-to-intrinsic
+  value parts had sub-universe / full Sharpe 0.09 and 0.19 (all small-cap), the news part
+  0.51, the analyst69 partner 0.58.
+- Children of sub-universe failures: only blends (median +0.48) and neutralizations (5 of
+  13 at +0.14 or more) raised the sub-universe Sharpe; size tilts at most +0.06 (13
+  children), other reshapes near 0. A size tilt cut the full Sharpe (2.73 -> 1.08) and
+  BRAIN's cutoff with it, so our learner counted it as closing the sub-universe gap.
+- Children of Sharpe failures: mechanical levers x0.97 median, never above x1.07 (20);
+  neutralizations x1.10 (x1.3+ only with a high risk-neutralized Sharpe); blends x1.77.
+- JPN analyst44 breadth was blended twice (1.44, 0.92) before a partner-alone test (0.09).
+
+Built (`feasibility.py`, agents.yaml `repair.feasibility`, OQ-27):
+1. `drop_weak_legs` (mechanical, legs.py): rebuilds the alpha without the parts whose alone
+   results show they add nothing (sub-universe: ratio below 0.6 x the limit share; Sharpe:
+   below 0.5 x the best part when that part alone carries the alpha); a blend is rebuilt on
+   the kept parts with its partner and weight (`legs.blend_partner`). First in sub_universe,
+   before reweight_legs in sharpe/fitness/recent_sharpe. When parts are measured it and
+   `reweight_legs` go before breadth and planned blends. A blend failing sub-universe gets its
+   partner tested alone once when never measured; blends get no part tests (their parts are
+   the base and the partner).
+2. Partners by failing check: a partner measured alone (same signal fields, same market)
+   with a sub-universe ratio below the limit share is refused by recipe_blend and breadth;
+   the Blend Planner's score adds the partner's ratio (+ up to 1, -1 below the limit). A
+   breadth dataset never measured alone in the market gets one partner-alone test before any
+   blend; measured below 0.5 |Sharpe| it is not blended. `blend_base` now counts
+   recipe_blend as a blend (blends no longer stack).
+3. Feasibility filter in every wave: a Sharpe gap above x1.10 leaves out mechanical levers
+   (neutralizations only with risk-neutralized Sharpe >= 0.9 x bar); tilts and smaller
+   universes only when the sub-universe Sharpe >= limit share x bar; other reshapes only
+   within 0.10 of that floor; no blend onto an alpha whose own ratio is below 0.5 x the
+   limit share. Part/partner tests run only alongside at least one fix.
+4. Sub-universe learning and distance on the sub-universe Sharpe itself
+   (`lever_stats._sub_floor_slack`): below the floor (limit share x bar) the slack is
+   sub-universe Sharpe minus the floor, at or above it 0; distance adds the floor gap.
+5. Earlier fixes: a variable named after a datafield is a validator error (BRAIN refused
+   `sales`; replay: the 2 such alphas in memory, both refused); Arm Designer dead datasets
+   (`designer.dead_after_alphas` 5, `dead_sharpe_share` 0.3: arms get no slots, design
+   done, never designed again; memory: EUR model307 5 alphas best 0.36, GLB fundamental17 6
+   / 0.36).
+
+Replay of the run's 22 repair fixes: 13 would have been left out (every tilt/universe
+child, the 8 JPN fundamental17 children's fixes, the recipe blend onto the 0.11-ratio
+alpha); the accept's lineage unchanged. On the closest EUR lead (`..r01a215f1_001_r1a`) the
+next wave is now `drop_weak_legs` (news part + analyst69 partner) and an analyst7 breadth
+blend. `tests/test_feasibility.py`. 1019 tests pass.

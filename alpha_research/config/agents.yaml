@@ -111,6 +111,11 @@ designer:
   decay_by_category: {pv: 4, analyst: 5, earnings: 5, fundamental: 6, model: 6, default: 6}
   settings_evidence: 3
   near_distance: 0.6
+  # dead datasets (owner 2026-11-27): 5 new alphas in a market, best |Sharpe| (raw or
+  # risk-neutralized) below 0.3 x bar -> no more slots for its arms, never designed again.
+  # On memory: EUR model307 (5 alphas, best 0.36) and GLB fundamental17 (6, 0.36)
+  dead_after_alphas: 5
+  dead_sharpe_share: 0.3
 lessons:
   after_every_batch: true
   use_model: true
@@ -149,6 +154,22 @@ repair:
   # parts, once per lineage, on top of the wave's fixes (no model call). Then reweight_legs
   # (a model lever) sees what each part did and drops or reweights the weak one. 0 = off.
   leg_tests: 3
+  # Feasibility (feasibility.py, owner 2026-11-27; numbers from memory, builder defaults):
+  # a lever that cannot close the alpha's gap is left out of its wave. Mechanical levers on
+  # a Sharpe failure: median x0.97, never above x1.07 (20 children); neutralizations x1.3+
+  # only where BRAIN's risk-neutralized Sharpe was high; size tilts never raised the
+  # sub-universe Sharpe (13 children, at most +0.06).
+  feasibility:
+    enabled: true
+    max_mechanical_sharpe_gain: 0.10   # Sharpe needing more than x1.10: no mechanical lever
+    rn_support_share: 0.9              # ... a neutralization only if risk-neutralized >= 0.9 x bar
+    tilt_levers: [size_tilt, liquidity_tilt, change_universe]
+    tilt_margin: 1.0                   # tilts only if sub-universe Sharpe >= limit share x bar
+    max_mechanical_sub_gain: 0.10      # other reshapes only within 0.10 of that floor
+    blend_min_parent_ratio_share: 0.5  # no blend onto an alpha whose own sub-universe ratio < 0.5 x limit share
+    weak_part_ratio_share: 0.6         # drop_weak_legs: part ratio below 0.6 x limit share is weak
+    weak_part_sharpe_share: 0.5        # ... or Sharpe alone below 0.5 x the best part
+    strong_part_share: 0.9             # ... when the best part alone has >= 0.9 x the whole's Sharpe
   # Wave size by how close and how real the alpha is (owner 2026-11-23: many fixes only for
   # alphas that are really close and have value). Distance to accept = sum of each failing
   # check's normalized shortfall (lever_stats.distance). In memory on 2026-11-23 both

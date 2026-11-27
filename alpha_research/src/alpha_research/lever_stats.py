@@ -83,6 +83,7 @@ from typing import Iterable
 
 from .config import ConfigError
 from .evaluator import BRAIN_CHECK_TO_CLASS, SIGN_FIRST, check_class
+from .feasibility import FeasibilityConfig, sub_floor
 from .repair import Lever, Playbook
 from .research_loop import lineage_members, lineage_root, simulated
 from .schemas import CandidateRecord, DecisionRecord, ResultRecord
@@ -138,6 +139,8 @@ class RepairLearningConfig:
     # of its parts alone (at most this many parts; 0 = off), once per lineage
     leg_tests: int = 0
     region_prior_strength: float = 2.0   # events the all-region estimate counts for in a region
+    # which levers can close an alpha's gap (feasibility.py, owner 2026-11-27); off by default
+    feasibility: FeasibilityConfig = FeasibilityConfig()
 
     @classmethod
     def from_dict(cls, sec: dict) -> "RepairLearningConfig":
@@ -193,7 +196,8 @@ class RepairLearningConfig:
                    lead_fixes=count("lead_fixes", 0),
                    leg_tests=count("leg_tests", 0),
                    unmeasured_failure_penalty=float(num("unmeasured_failure_penalty", 0, 10)),
-                   region_prior_strength=float(num("region_prior_strength", 0, 1000)))
+                   region_prior_strength=float(num("region_prior_strength", 0, 1000)),
+                   feasibility=FeasibilityConfig.from_dict(sec.get("feasibility")))
 
 
 def _flag(sec: dict, key: str, default: bool) -> bool:
@@ -261,9 +265,13 @@ def slack(failure_class: str, decision: DecisionRecord | None,
     """Smallest margin to passing over the gates of a class (negative = failing). For
     concentration with no configured limit, BRAIN's reported value (lower is better)."""
     vals = []
+    floor = _sub_floor_slack(decision, result) if failure_class == "sub_universe" else None
     if decision is not None:
         for g in decision.gate_results:
             if check_class(g.name) == failure_class:
+                if floor is not None and g.name in SUB_UNIVERSE_GATES:
+                    vals.append(floor)
+                    continue
                 s = _gate_slack(g.name, g.value, g.threshold)
                 if s is not None:
                     vals.append(s)
@@ -271,6 +279,27 @@ def slack(failure_class: str, decision: DecisionRecord | None,
             and result.weight_concentration is not None:
         vals.append(-result.weight_concentration)
     return min(vals) if vals else None
+
+
+SUB_UNIVERSE_GATES = ("sub_universe", "brain:LOW_SUB_UNIVERSE_SHARPE")
+
+
+def _sub_floor_slack(decision: DecisionRecord | None,
+                     result: ResultRecord | None) -> float | None:
+    """Sub-universe slack measured on the sub-universe Sharpe itself (owner 2026-11-27).
+    BRAIN's limit is a share of the alpha's own Sharpe, so cutting the full Sharpe (a size
+    tilt: EUR 2.73 -> 1.08, sub-universe 0.65 -> 0.48) shrank BRAIN's gap and was learned as a
+    sub-universe fix. Here the slack is sub-universe Sharpe minus the smallest one a passing
+    alpha can have (limit share x Sharpe bar) while below it; at or above it only the ratio
+    is left to adjust, and the slack is 0 (a fix then counts only when the check passes).
+    None when the numbers are missing or the Sharpe is not positive."""
+    if result is None or decision is None or decision.decision == "accept" \
+            or result.sub_universe_sharpe is None:
+        return None
+    floor = sub_floor(decision, result)
+    if floor is None:
+        return None
+    return round(min(0.0, result.sub_universe_sharpe - floor), 6)
 
 
 def _shortfall(name: str, value, threshold) -> float | None:
@@ -301,12 +330,19 @@ def distance(decision: DecisionRecord | None, result: ResultRecord | None,
     if decision.decision == "accept":
         return 0.0
     flip = _sign_first(decision)
+    # the sub-universe gap also counts against the smallest sub-universe Sharpe a passing
+    # alpha can have (see _sub_floor_slack): a child that only cut its full Sharpe is not
+    # closer to accept
+    floor = None if flip else sub_floor(decision, result)
+    sub = result.sub_universe_sharpe
     total = 0.0
     for cls in failing_classes(decision, result):
         gaps = [x for g in decision.gate_results
                 if g.passed is False and check_class(g.name) == cls
                 and (x := _shortfall(g.name, *(_mirrored(g) if flip else
                                                (g.value, g.threshold)))) is not None]
+        if cls == "sub_universe" and floor and sub is not None and sub < floor:
+            gaps.append((floor - sub) / floor)
         total += max(gaps) if gaps else unmeasured_penalty
     return round(total, 6)
 

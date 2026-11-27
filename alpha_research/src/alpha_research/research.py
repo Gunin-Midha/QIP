@@ -795,6 +795,7 @@ class ResearchRun:
                                               generator_config.crowded_min_alphas),
                                     generator_config=generator_config,
                                     lessons=self.lessons)
+        self.repairer.flip_restricted = config.repair.flip_short_restricted
         if agents.breadth.enabled:
             self.repairer.breadth = agents.breadth
         if agents.blend.enabled and self.repairer.llm is not None:
@@ -828,6 +829,9 @@ class ResearchRun:
         # Arm Designer (arm_designer.py): plan arms its designed arms replace in this run's
         # markets (no new slots; their queued repairs still run), and the run's designs
         self.inactive: set[tuple] = set()
+        # datasets dead in a market (arm_designer.dead_datasets): {(region, delay): {ds: (n,
+        # best |Sharpe|)}}; their arms get no slots
+        self.dead: dict[tuple, dict] = {}
         # operators no simulated alpha of ours has used: the Generator's spotlight rotates
         # through them (generator.yaml operator_spotlight)
         used_ops: set[str] = set()
@@ -1314,6 +1318,29 @@ class ResearchRun:
                        f"an earlier run stopped waiting: {got}"
                        + (f"; {still} not ready yet" if still else ""))
 
+    def _market_bar(self, region: str, delay: int) -> float:
+        return (self.seen_limits.get((region, delay), {}).get("LOW_SHARPE")
+                or self.pipeline.config.for_settings(region, delay).gates.sharpe_min)
+
+    def _refresh_dead(self, outcomes: list[dict] | None = None) -> None:
+        """Datasets dead in the run's markets (arm_designer.dead_datasets); a line for each
+        newly dead one."""
+        cfg = self.agents.designer
+        if cfg.dead_after_alphas <= 0:
+            return
+        outcomes = outcomes if outcomes is not None else self.memory.candidate_outcomes()
+        markets = {(k[1], k[4]) for k in self.arms if self._in_run(k)}
+        for region, delay in sorted(markets):
+            now = arm_designer.dead_datasets(outcomes, region, delay,
+                                             self._market_bar(region, delay), cfg)
+            old = self.dead.get((region, delay), {})
+            for ds, (n, best) in now.items():
+                if ds not in old:
+                    self._emit(f"--- {ds} in {region} D{delay}: no more slots ({n} new "
+                               f"alphas, best |Sharpe| {best:.2f} < "
+                               f"{cfg.dead_sharpe_share:g} x bar)")
+            self.dead[(region, delay)] = now
+
     def _design_arms(self) -> None:
         """Arm Designer (arm_designer.py) for each market of this run: continue its latest
         batch of designed arms while any of them is not done, else write a new batch (owner
@@ -1322,6 +1349,7 @@ class ResearchRun:
         settings and seeds."""
         cfg = self.agents.designer
         outcomes = self.memory.candidate_outcomes()
+        self._refresh_dead(outcomes)
         markets: dict[tuple, list[tuple]] = {}
         for k in list(self.arms):
             if self._in_run(k) and k not in self.successor:
@@ -1339,15 +1367,14 @@ class ResearchRun:
             status = ""
             if batch:
                 fresh = self.memory.fresh_simulations(region, delay, batch[0]["created_at"])
-                done, lines = arm_designer.batch_done(batch, fresh, cfg)
+                done, lines = arm_designer.batch_done(batch, fresh, cfg,
+                                                      self.dead.get((region, delay)))
                 status = ", ".join(lines)
             if not batch or done:
                 gc = self.generator_config
                 cands = arm_designer.market_candidates(
                     meta, lambda f, m=meta: field_role(f, m, gc))
-                limits = self.seen_limits.get((region, delay), {})
-                bar = limits.get("LOW_SHARPE") or \
-                    self.pipeline.config.for_settings(region, delay).gates.sharpe_min
+                bar = self._market_bar(region, delay)
                 base = {k: getattr(plan.settings, k) for k in (
                     "region", "universe", "delay", "decay", "neutralization", "truncation",
                     "start_date", "end_date")}
@@ -1355,7 +1382,8 @@ class ResearchRun:
                     region=region, delay=delay, candidates=cands,
                     dataset_text=load_dataset_meta(dataset_catalog_for(plan.catalog)),
                     field_ids=set(fields or meta), outcomes=outcomes, bar=bar,
-                    base_settings=base, earlier={d["dataset"] for d in history}, config=cfg)
+                    base_settings=base, earlier={d["dataset"] for d in history}, config=cfg,
+                    dead=self.dead.get((region, delay)))
                 if not new:
                     self._emit(f"--- arms for {region} D{delay}: no dataset qualifies; the "
                                f"plan's arms are used")
@@ -1642,6 +1670,8 @@ class ResearchRun:
 
     def _round(self, r: int) -> None:
         self._round_waves = 0
+        if r > 1 or not self.agents.designer.enabled:   # round 1: _design_arms did it
+            self._refresh_dead()
         slots = min(self.budget.per_round, self.budget.max_simulations - self._committed())
         entry = {"round": r, "arms": []}
         self.log.append(entry)
@@ -1734,7 +1764,8 @@ class ResearchRun:
     def _live_arms(self) -> list[tuple]:
         return [k for k in self.arms if k[3] not in self.counter.down and self._in_run(k)
                 and k not in self.successor and k[3] not in self.no_fit
-                and k not in self.inactive]
+                and k not in self.inactive
+                and k[0] not in self.dead.get((k[1], k[4]), {})]
 
     def _current(self, key: tuple) -> tuple:
         """The arm that now stands for ``key``: itself, or its latest evolved successor."""

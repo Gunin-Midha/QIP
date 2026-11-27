@@ -47,6 +47,8 @@ sharpe:
   # writes a partner with accepted recipes from any market in its prompt (its step is the
   # prod_correlation entry's). In memory blend_other_dataset fixed sub-universe in 3 of 3
   # CHN repairs.
+  - lever: drop_weak_legs           # mechanical (owner 2026-11-27): drop the parts whose
+    step: {}                        # alone results show they add nothing (legs.py)
   - lever: reweight_legs
     step: {}
   - lever: recipe_blend
@@ -74,6 +76,8 @@ fitness:                            # fitness = Sharpe * sqrt(|returns| / max(tu
   # writes a partner with accepted recipes from any market in its prompt (its step is the
   # prod_correlation entry's). In memory blend_other_dataset fixed sub-universe in 3 of 3
   # CHN repairs.
+  - lever: drop_weak_legs           # mechanical (owner 2026-11-27): drop the parts whose
+    step: {}                        # alone results show they add nothing (legs.py)
   - lever: reweight_legs
     step: {}
   - lever: recipe_blend
@@ -118,6 +122,13 @@ self_correlation:
   - lever: model_repair
     step: {}
 sub_universe:                       # the alpha must also work on the larger, liquid names
+  # 2026-11-27 (owner): BRAIN's limit is a share of the alpha's own Sharpe (EUR TOP2500 0.52).
+  # A part measured alone with too little large-cap Sharpe (EUR price-to-cash-flow score:
+  # sub-universe / full Sharpe 0.09) is dropped first; tilts and smaller universes run only
+  # when the sub-universe Sharpe alone could support a passing alpha (feasibility.py): in
+  # memory a size tilt never raised the sub-universe Sharpe (13 children, at most +0.06)
+  - lever: drop_weak_legs
+    step: {}
   - lever: size_tilt                # x (0.25 + rank(cap)), uncentred. EUR reversal rescues
     step: {field: cap, offset: 0.25}  # (2026-11-15): sub-universe / full Sharpe 0.43 -> 0.54
                                     # (BRAIN's cutoff ~0.52 x own Sharpe) and the recent years
@@ -143,6 +154,8 @@ sub_universe:                       # the alpha must also work on the larger, li
   # writes a partner with accepted recipes from any market in its prompt (its step is the
   # prod_correlation entry's). In memory blend_other_dataset fixed sub-universe in 3 of 3
   # CHN repairs.
+  - lever: drop_weak_legs           # mechanical (owner 2026-11-27): drop the parts whose
+    step: {}                        # alone results show they add nothing (legs.py)
   - lever: reweight_legs
     step: {}
   - lever: recipe_blend
@@ -185,6 +198,8 @@ recent_sharpe:                      # BRAIN's LOW_2Y_SHARPE / IS_LADDER_SHARPE: 
   # writes a partner with accepted recipes from any market in its prompt (its step is the
   # prod_correlation entry's). In memory blend_other_dataset fixed sub-universe in 3 of 3
   # CHN repairs.
+  - lever: drop_weak_legs           # mechanical (owner 2026-11-27): drop the parts whose
+    step: {}                        # alone results show they add nothing (legs.py)
   - lever: reweight_legs
     step: {}
   - lever: recipe_blend

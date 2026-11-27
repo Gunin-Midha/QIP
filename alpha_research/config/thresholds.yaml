@@ -100,6 +100,10 @@ repair:
   # Sharpe to the factor neutralization levers first (builder default 2026-11-12, OQ-20;
   # null = off). A negative raw Sharpe that is a near miss goes to flip_sign first.
   risk_neutralized_gap: 0.5
+  # Owner 2026-11-27: flip negative near misses in short-restricted markets (CHN) too, one
+  # simulation each, to measure whether the opposite alpha mirrors there (BRAIN's guide says
+  # it may not). false = no flips there (a negative value counts with its sign).
+  flip_short_restricted: true
 
 # Simulator
 simulator:

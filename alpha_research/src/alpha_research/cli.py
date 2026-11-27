@@ -817,6 +817,8 @@ def _repair(args) -> int:
     try:
         agent = RepairAgent(playbook, spec, memory, datafields=datafields,
                             learning=agents.repair)
+        if getattr(args, "config", None) and Path(args.config).exists():
+            agent.flip_restricted = load_config(args.config).repair.flip_short_restricted
         for cid in args.candidate_id:
             cand = memory.get_candidate(cid)
             decisions = memory.decisions_for(cid)
@@ -1029,6 +1031,8 @@ def build_parser() -> argparse.ArgumentParser:
     rp.add_argument("--fastexpr", default="config/fastexpr.yaml")
     rp.add_argument("--agents", default="config/agents.yaml")
     rp.add_argument("--datafields", default=None, help="datafield catalog to validate against")
+    rp.add_argument("--config", default="config/thresholds.yaml",
+                    help="thresholds (repair.flip_short_restricted)")
     rp.set_defaults(func=_repair)
 
     lv = sub.add_parser("levers", help="what each repair lever has fixed so far, from memory")

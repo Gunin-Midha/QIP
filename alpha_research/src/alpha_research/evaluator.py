@@ -287,6 +287,9 @@ def _risk_neutralized(result: ResultRecord | None, key: str) -> float | None:
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
+FLIP_DOES_NOT_MIRROR = "a flip does not mirror here"
+
+
 def near_miss(failed: list[GateResult], failure_class: str,
               shares: dict | None, result: ResultRecord | None = None, *,
               sign_mirrors: bool = True) -> tuple[bool, str | None]:
@@ -310,7 +313,7 @@ def near_miss(failed: list[GateResult], failure_class: str,
         best = max(size(g.value), size(rn)) if rn is not None else size(g.value)
         if best < need:
             shown = f"{g.value}" + (f" (risk-neutralized {rn})" if rn is not None else "")
-            how = "|value|" if sign_mirrors else "value (a flip does not mirror here)"
+            how = "|value|" if sign_mirrors else f"value ({FLIP_DOES_NOT_MIRROR})"
             return False, (f"{g.name} {shown} is too far from {g.threshold} to repair "
                            f"({how} < {share} x threshold = {need:.4g})")
     return True, None
