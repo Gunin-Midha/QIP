@@ -1,7 +1,7 @@
 # Alpha Generator settings (Phase 3). Technical limits have values. Policy limits are
 # null (= not configured, the check is skipped) until the owner decides (OQ-11).
 generator:
-  prompt_version: gen-v15      # written to CandidateRecord.prompt_version; bump when prompts change
+  prompt_version: gen-v16      # written to CandidateRecord.prompt_version; bump when prompts change
   max_repair_rounds: 1         # times rejected expressions are sent back to the model for a fix
   max_paper_chars: 120000      # longer papers are cut to this many characters (null = no cut)
   max_hypotheses_per_paper: 5  # hypotheses extracted from one paper
@@ -139,23 +139,20 @@ generator:
     analyst: >-
       Revision breadth works best as a net share: (raised minus lowered estimates) divided
       by the number of estimates, averaged over several forecast items (sales, net income,
-      pre-tax profit, cash flow, dividends, EBITDA) rather than one headline item, and
-      combined with recommendation breadth (raised minus lowered recommendations over their
-      count). Ranked within sector, this took a Sharpe 1.2 signal to 1.9-2.3 with fitness
-      up to 2.5. Revisions are priced fast: little or no smoothing (decay 1-2) and 1-week
-      counts helped the most recent years more than longer windows. The single most used
-      item (EBIT upgrades) added recent strength but correlates with production alphas.
-      Compare revisions within sector: industry and subindustry peers cut the Sharpe by a
-      third or more. As a signal on its own, revision size (change in the mean forecast)
-      and fast price parts hurt; as a part blended with a price signal, the trend of the
-      consensus estimate (z-score over about three months) worked well (IND). Where items come as lists (VECTOR fields), average them with vec_avg. Revision
-      breadth also makes a good part to blend with a price signal: alone it can be weak in
-      some years, but it adds information production price alphas do not have. Build it
-      from less-used items: in CHN a retail-flow signal (production correlation 0.93 alone)
-      blended with net revision breadth over four items used by 0-19 BRAIN alphas each, at
-      twice the weight, passed at 0.698 (Sharpe 3.4); at equal weight it stayed at 0.84,
-      and adding a heavily used analyst rating-model score to the breadth part raised it
-      to 0.80 (0.76-0.82 with crowding or statistical neutralization).
+      pre-tax or operating profit, cash flow, EBITDA), ranked within sector (industry peers
+      cut the Sharpe by a third), with little smoothing (decay 1-2; 1-week counts helped
+      recent years). Adding recommendation breadth helped. Skip net debt, book value,
+      dividend and NAV revisions, and industry-level counts of companies with raised
+      estimates (one value per industry). Revision size alone was weak; the consensus trend
+      (z-score over about three months) worked as a blend part (IND). Use vec_avg on VECTOR
+      items. Breadth is best as a part blended with a price or value signal: it adds what
+      production alphas lack. Weight and item usage decide production correlation: CHN
+      retail flow (0.93 alone) passed at 0.698 with breadth over items used by 0-19 BRAIN
+      alphas at twice the weight (equal weight 0.84; adding a heavily used rating score
+      0.80). GBR value + breadth: equal weight on items used by 600-1,000 alphas 0.669
+      (Sharpe 2.95); less-used items 0.686 at equal and 0.537 at twice the weight. Twice the
+      weight on the more used items failed the recent-years check, so stay near equal
+      unless the items are little used.
 
   # Field roles, matched (case-insensitive) at the START of BRAIN's description of a field.
   # id: identifiers, codes, names and raw text, which carry no ranking information. They are
