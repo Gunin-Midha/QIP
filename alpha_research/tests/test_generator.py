@@ -563,3 +563,10 @@ def test_model_may_choose_a_factor_or_no_neutralization_with_a_reason(spec, sett
         "r1 Neutralization CROWDING: the idea should not be a crowding bet"
     assert any("needs a neutralization_reason" in w for w in res.warnings[b.candidate_id])
     assert any("not allowed in USA" in w for w in res.warnings[d.candidate_id])
+
+
+def test_one_word_field_ids_count_as_named_only_in_backticks():
+    from alpha_research.generator import named_fields
+    cat = ["price", "shares", "anl4_eps_mean"]
+    text = "Revisions scaled by price predict returns; use anl4_eps_mean and `shares`."
+    assert named_fields(cat, text) == ["anl4_eps_mean", "shares"]

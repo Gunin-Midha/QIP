@@ -227,3 +227,26 @@ def test_resume_takes_rechecked_repairs_first(memory, config, playbook, candidat
     run._resume_repairs()
     assert started == ["late2"]
 
+
+
+def test_aggregates_balance_sheet_items_horizons_and_crowded_items():
+    m = {}
+    def pair(up, dn, n, desc="Number of analysts who raised the estimate"):
+        m[up] = {**f("anl", n=n), "description": desc}
+        m[dn] = {**f("anl", n=n), "description": desc}
+    # analyst15-style industry aggregates: one value per group, never a family
+    pair("anl_ind_eps_cos_up", "anl_ind_eps_cos_dn", 10,
+         "Number of companies in the industry with raised EPS")
+    pair("est_12m_grm_raisednum_4wks", "est_12m_grm_lowerednum_4wks", 6)
+    pair("est_12m_grm_raisednum_1mth", "est_12m_grm_lowerednum_1mth", 7)    # same item
+    pair("est_12m_ndt_raisednum_4wks", "est_12m_ndt_lowerednum_4wks", 5)     # net debt
+    pair("est_12m_eps_raisednum_4wks", "est_12m_eps_lowerednum_4wks", 3000)  # crowded
+    pair("est_12m_sal_raisednum_4wks", "est_12m_sal_lowerednum_4wks", 40)
+    fams = b.families(m, CFG)
+    assert {x.item for x in fams["anl"]} >= {"est_12m_grm_4wks", "est_12m_ndt_4wks"}
+    assert not any("ind_eps_cos" in x.item for x in fams["anl"])
+    assert [x.item for x in fams["anl"]][-1] == "est_12m_eps_4wks"   # crowded last
+    ds, items, w = b.variants(fams, set(), CFG)[0]
+    assert [x.item for x in items] == ["est_12m_grm_4wks", "est_12m_sal_4wks",
+                                       "est_12m_eps_4wks"]           # one grm, no net debt
+    assert b.item_root("est_12m_grm_1mth") == b.item_root("est_12m_grm_4wks")

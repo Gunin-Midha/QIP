@@ -10,14 +10,18 @@ the revision families in a market's catalog and builds the partner itself.
 
 Method
 1. Families, by field ids, in data categories ``categories`` (analyst: an upside/downside
-   beta or an up-move time is not a revision). A field whose id has an "up" part (``up``, ``raisednum``,
+   beta or an up-move time is not a revision); a pair whose description names an industry,
+   group or sector aggregate (``aggregate_words``; analyst15 counts companies in the
+   industry with raised estimates, one value per group) is not a stock's own revisions. A field whose id has an "up" part (``up``, ``raisednum``,
    ``raised``, ``upgrades``, ... ``breadth.pairs``) whose "down" twin (same id, part
    swapped) is in the same dataset of the catalog is a family's up/down pair; its count
    field is the id with the up part and up to ``max_drop_parts`` parts before it removed
    plus a ``count_suffixes`` suffix (``anl69_best_eps_4wk_up`` -> ``anl69_best_eps_numest``,
    ``est_12m_pre_raisednum_4wks`` -> ``est_12m_pre_num``). Usage = BRAIN alphas on up + down;
-   items least used first, those under ``min_item_alphas`` last (book value and NAV
-   revisions: 0 alphas, estimates that rarely move).
+   items with a ``prefer_items`` part (earnings, profit, sales: every accepted blend used
+   these) first and ``avoid_items`` (net debt, book value, dividends, NAV, FFO) last; within
+   each, least used first, those under ``min_item_alphas`` last. Blends never use the
+   ``avoid_items`` items; items with ``heavy_item_alphas`` or more BRAIN alphas come last.
 2. Partner expression per item: ``(up - dn) / max(count, 1)``, or ``(up - dn) /
    (up + dn + 1)`` without a count field; VECTOR fields in ``vec_avg``, fields with coverage
    below ``backfill_below_coverage`` in ``ts_backfill(x, backfill_days)``. The partner is the
@@ -25,7 +29,7 @@ Method
 3. Variants: datasets of the market other than the alpha's own (``exclude_categories`` left
    out) with at least ``min_items`` families, ordered by: a partner of one of our accepted
    alphas (any market) read that dataset's families; more families; lower median usage.
-   Per dataset: the least-used items at each of ``weights``, then the next least-used items
+   Per dataset (one horizon per item: ``item_root``): the first items at each of ``weights``, then the next least-used items
    at the first weight (the GBR round: least-used items at 2:1 had production correlation
    0.537, crowded items at 1:1 0.669). Combinations already tried along the lineage
    (hypothesis tag) are skipped.
@@ -69,6 +73,20 @@ class BreadthConfig:
     exclude_categories: tuple[str, ...] = ("pv", "risk")
     categories: tuple[str, ...] = ("analyst",)   # data categories whose families count
     min_item_alphas: int = 5      # items read by fewer BRAIN alphas come after the others
+    heavy_item_alphas: int = 500  # items read by this many BRAIN alphas come after the others
+    # a family whose up field's description has one of these is an industry or group
+    # aggregate (analyst15: "number of companies in the industry with raised EPS"): the same
+    # value for every stock of the group, so it cannot rank stocks inside a sector
+    # items whose id has one of these parts go first (every accepted blend used earnings,
+    # profit or sales revisions); items with an ``avoid_items`` part go last (net debt, book
+    # value, dividends, NAV, FFO: estimates that rarely say much about the next weeks)
+    prefer_items: tuple[str, ...] = ("eps", "net", "netprofit", "sales", "sal", "ptp", "pre",
+                                     "ebit", "ebt", "ebitda", "ebs", "opr", "opp", "cps", "pretaxprofit",
+                                     "gps", "grm", "revenue", "rev")
+    avoid_items: tuple[str, ...] = ("debt", "ndt", "ndebt", "bps", "dps", "nav", "tbv",
+                                    "ffo", "ffops", "capex", "ent")
+    aggregate_words: tuple[str, ...] = ("number of companies", "companies in", "industry",
+                                        "group", "sector", "aggregated")
     pairs: tuple[tuple[str, str], ...] = DEFAULT_PAIRS
     count_suffixes: tuple[str, ...] = DEFAULT_COUNT_SUFFIXES
     max_drop_parts: int = 2
@@ -88,7 +106,7 @@ class BreadthConfig:
                 raise ConfigError("agents config: breadth_blend.enabled must be true or false")
             kw["enabled"] = raw["enabled"]
         for k in ("items_per_variant", "min_items", "variants_per_wave", "max_per_lineage",
-                  "backfill_days", "max_drop_parts", "min_item_alphas"):
+                  "backfill_days", "max_drop_parts", "min_item_alphas", "heavy_item_alphas"):
             if k in raw:
                 v = raw[k]
                 if isinstance(v, bool) or not isinstance(v, int) or v < 0:
@@ -101,7 +119,8 @@ class BreadthConfig:
                 if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
                     raise ConfigError(f"agents config: breadth_blend.{k} must be a number >= 0")
                 kw[k] = float(v)
-        for k in ("classes", "exclude_categories", "count_suffixes", "categories"):
+        for k in ("classes", "exclude_categories", "count_suffixes", "categories",
+                  "aggregate_words", "prefer_items", "avoid_items"):
             if k in raw:
                 v = raw[k]
                 if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
@@ -162,6 +181,9 @@ def families(meta: Mapping[str, dict], config: BreadthConfig,
                 dm = meta.get(down) or {}
                 if dm.get("dataset") != ds or down in skip or (f, down) in seen:
                     continue
+                desc = (m.get("description") or "").lower()
+                if any(w in desc for w in config.aggregate_words):
+                    continue
                 seen.add((f, down))
                 count = _count_field(toks, i, ds, meta, config, skip)
                 covs = [c for c in (m.get("coverage"), dm.get("coverage"))
@@ -173,10 +195,29 @@ def families(meta: Mapping[str, dict], config: BreadthConfig,
                     coverage=min(covs) if covs else None,
                     vector="VECTOR" in (m.get("type"), dm.get("type")),
                     category=m.get("category")))
-    for ds in out:   # least used first, but items almost nobody reads (often items whose
-        # estimates rarely change, e.g. book value) after the rest
-        out[ds].sort(key=lambda x: (x.usage < config.min_item_alphas, x.usage, x.item))
+    for ds in out:   # heavily used items last (crowded: higher production correlation);
+        # then earnings/profit/sales items first, balance-sheet and payout items last;
+        # within each, least used first, items almost nobody reads after the rest
+        out[ds].sort(key=lambda x: (x.usage >= config.heavy_item_alphas,
+                                    _item_class(x.item, config),
+                                    x.usage < config.min_item_alphas, x.usage, x.item))
     return out
+
+
+def _item_class(item: str, config: BreadthConfig) -> int:
+    """0 = an earnings/profit/sales item, 2 = a balance-sheet or payout item, 1 = other."""
+    parts = set(item.lower().split("_"))
+    if parts & set(config.avoid_items):
+        return 2
+    return 0 if parts & set(config.prefer_items) else 1
+
+
+HORIZON = re.compile(r"^\d+(w|wk|wks|week|weeks|m|mth|mths|month|months|d|y)$")
+
+
+def item_root(item: str) -> str:
+    """The item without its horizon parts: est_12m_grm_4wks and est_12m_grm_1mth are one item."""
+    return "_".join(p for p in item.lower().split("_") if not HORIZON.match(p))
 
 
 def _count_field(toks, i, ds, meta, config, skip) -> str | None:
@@ -239,7 +280,14 @@ def variants(fams: Mapping[str, list[Family]], own: set, config: BreadthConfig, 
     k = config.items_per_variant
     out = []
     for ds in order:
-        fs = ok[ds]
+        fs, roots = [], set()
+        for x in ok[ds]:   # one horizon per item: the first (least used) in order; never
+            # an ``avoid_items`` item (net debt, book value, dividends, NAV, FFO)
+            if item_root(x.item) not in roots and _item_class(x.item, config) < 2:
+                roots.add(item_root(x.item))
+                fs.append(x)
+        if len(fs) < config.min_items:
+            continue
         low = fs[:k]
         plan = [(low, w) for w in config.weights]
         nxt = fs[k:2 * k]

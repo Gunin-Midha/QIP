@@ -782,9 +782,18 @@ def field_role(name: str, meta: dict, config: "GeneratorConfig | None") -> str:
 def named_fields(catalog: Collection[str], text: str, exclude: Collection[str] = ()) -> list[str]:
     """Catalog fields written out in the task text, in the order they appear. ``exclude``:
     base fields and groups, which plain words match (high, low, returns, sector) and which
-    the prompt offers on their own lines anyway."""
-    found = {m.group(): m.start() for m in re.finditer(r"[A-Za-z_][A-Za-z0-9_]*", text)
-             if m.group() in catalog and m.group() not in exclude}
+    the prompt offers on their own lines anyway. An id that is one plain lowercase word
+    counts only in backticks."""
+    found = {}
+    for m in re.finditer(r"[A-Za-z_][A-Za-z0-9_]*", text):
+        w = m.group()
+        if w not in catalog or w in exclude or w in found:
+            continue
+        # a one-word id (price, shares, cash: catalogs downloaded 2026-11-27 have ~50) is
+        # an ordinary word in a hypothesis; it counts as named only when written `like_this`
+        if w.isalpha() and w.islower() and f"`{w}`" not in text:
+            continue
+        found[w] = m.start()
     return sorted(found, key=found.get)
 
 

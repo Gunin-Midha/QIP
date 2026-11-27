@@ -1059,3 +1059,14 @@ Built:
 
 Config `breadth_blend:` and `blend_plan.min_field_alphas/family_items` in agents.yaml (OQ-26).
 `tests/test_breadth.py`. 998 tests pass.
+
+## Catalogs to 60 datasets; breadth item rules (2026-11-27)
+
+After the download (60 datasets per D1 market) every market has stock-level revision
+families: analyst69 (AMR, ASI, CHN, GLB), analyst7 (DEU, EUR, GBR, USA), analyst44 (IND,
+JPN). analyst15's up/down pairs are industry or group aggregates ("number of companies in the
+industry with raised EPS"), one value per group, useless inside a sector-neutral book: skipped
+by description (`breadth_blend.aggregate_words`). Item order for a breadth blend: items with
+>= 500 BRAIN alphas last, earnings/profit/sales items first, net debt / book value / dividends
+/ NAV / FFO never, one horizon per item. One-word field ids in the new catalogs (price, shares,
+cash) count as named in a hypothesis only in backticks.
