@@ -1023,3 +1023,39 @@ Files `candidates/rescue_20261126_leads.json` (12) and `candidates/rescue_202611
 - Blending analyst7 net revision breadth (pre-tax, net income) at 0.5: Sharpe 2.56, fitness 2.74, PROD 0.763. At 1:1: Sharpe 2.95, fitness 3.14, sub-universe 1.44 (limit 1.40); at 2:1 2023 Sharpe falls to 0.67 and IS_LADDER_SHARPE fails (the breadth signal fades in recent years; the value part carries them). STATISTICAL neutralization failed sub-universe and the ladder. Without the model's ready-made region value rank: Sharpe 2.88, risk-neutralized 1.90 (highest). Breadth on less-used items (operating profit, GAAP EPS, gross margin; 30-150 BRAIN alphas against 1,012 and 604 for pre-tax and net income): Sharpe 2.20 (1:1) and 2.00 (2:1). PROD values of the four passing variants were still pending at the end of the day.
 - GBR overnight-vs-intraday reversal: the analyst breadth blend without size tilt reached Sharpe 2.18, fitness 1.19 and fails only IS_LADDER_SHARPE (1.17; 2022-23 weak); the same with the EUR accept's size tilt fell to 1.23. Longer windows (20) and decay 10 lifted fitness only to 0.78 and 0.84.
 - IND analyst4 sales dispersion: alone Sharpe 0.22; with the net-profit estimate trend instead of the reversal 0.52; reversal at 15% 1.00. The 30% reversal part carries the alpha and is also what fails the robust universe (truncation 0.05 lifted it only 0.74 -> 0.78). Family dropped. Testing each part alone (now the `leg_alone` lever) found this in one simulation.
+
+## Breadth blends, partner scoring, late-check repairs (2026-11-27, owner)
+
+Why the pipeline never made the fixes that led to accepts: of ~320 pipeline repair children,
+0 were blends (blend_other_dataset, blend_plan, recipe_blend), and the repair model was asked
+5 times in all (4 restore_recent_performance, 1 model_repair). Five of the seven accepts were
+hand blends with analyst net revision breadth. Causes: (1) until 2026-11-26 blends were only
+in the prod_correlation playbook entry, and BRAIN reports PROD_CORRELATION hours after the
+simulation, so the leads were routed as Sharpe / sub-universe / recent-Sharpe failures and got
+mechanical fixes (GBR value lead, distance 0.03: flip, then 8 neutralization/hump/smoothing
+children); (2) the Blend Planner (built after the last run) scored datasets by their total
+BRAIN alphas, so near-empty datasets ranked first and analyst69 (the partner of the EUR and CHN
+accepts) ranked 11th-15th, behind a cap of 3 untested datasets; (3) it listed fields one at a
+time, fewest alphas first: analyst69 metadata (`anl69_analyst_market_status`), analyst7
+dispersion fields, never the up/down/count revision fields. The model was not the bottleneck.
+
+Built:
+1. `breadth.py`: revision families found by field id in analyst datasets of the market (up
+   token + its down twin + a count field: `anl69_best_eps_4wk_up/_dn/_numest`,
+   `est_12m_pre_raisednum_4wks/_lowerednum_4wks/_num`); partner = mean over items of
+   (up - dn) / max(count, 1) (vec_avg for VECTOR, ts_backfill below coverage 0.5).
+2. Mechanical lever `breadth_blend` first in the repair wave of a lead within 0.4 of accept
+   failing prod/self correlation, Sharpe, recent Sharpe or sub-universe: least-used items at
+   weights 1 and 2, then the next items; datasets an accepted blend read first; built with
+   `build_blend` on the lineage's last non-blend alpha; tag `[breadth partner=.. items=..
+   weight=..]`; at most 2 per wave and 4 per lineage. No model call.
+3. Blend Planner: usage = median BRAIN alphas of the dataset's signal fields (no bonus below
+   `min_field_alphas` 5), +1 for revision families, +1 and proven when an accepted alpha's
+   partner reads the dataset (any market); the 3 least-used families' fields listed first
+   with a "revision family" note, then fields with >= 5 alphas. Prompt blend-v2.
+   Replay: EUR analyst69 11th untested -> 1st proven; CHN analyst69 now offered (proven).
+4. Repairs decided by a recheck of late BRAIN checks are resumed first at run start, and
+   `repair.recheck_every_rounds` (2) rechecks during a run and starts their wave at once.
+
+Config `breadth_blend:` and `blend_plan.min_field_alphas/family_items` in agents.yaml (OQ-26).
+`tests/test_breadth.py`. 998 tests pass.

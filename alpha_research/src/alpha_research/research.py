@@ -77,6 +77,7 @@ import yaml
 from . import arm_designer
 from .arm_designer import DesignerConfig
 from .blend_planner import BLEND_PLAN, BlendConfig, BlendPlanner, blend_base, stability_flag
+from .breadth import BreadthConfig
 from .brain_client import BrainClient, BrainLoginRequired, SimulationQuotaExhausted
 from .config import Config, ConfigError
 from .critic import Critic, DebateJudge, ReviewOutcome, SparseFieldRule, review_and_debate
@@ -265,6 +266,10 @@ class AgentsConfig:
     stall_model_calls: int | None = None
     designer: DesignerConfig = field(default_factory=DesignerConfig)   # arm_designer.py
     blend: BlendConfig = field(default_factory=BlendConfig)   # blend_planner.py
+    breadth: BreadthConfig = field(default_factory=BreadthConfig)   # breadth.py
+    # alphas pending on BRAIN's checks are fetched again every this many rounds during a
+    # run (0 = only at the start); one decided repair starts its wave at once
+    recheck_every_rounds: int = 0
     region_floor_share: float | None = None   # each region's minimum share of a round
     max_region_share: float | None = None     # no region above this share while others are below
     regions_per_run: int | None = None        # rotation: work on this many regions per run
@@ -436,6 +441,9 @@ def agents_config_from_dict(raw) -> AgentsConfig:
         sparse=_sparse_rule(secs["critic"]),
         designer=DesignerConfig.from_dict(raw.get("designer")),
         blend=BlendConfig.from_dict(raw.get("blend_plan")),
+        breadth=BreadthConfig.from_dict(raw.get("breadth_blend")),
+        recheck_every_rounds=(_pos_int(secs["repair"], "repair", "recheck_every_rounds", lo=0)
+                              if "recheck_every_rounds" in secs["repair"] else 0),
         price_categories=_categories(secs["critic"], "price_volume_categories"),
         lessons=LessonsConfig.from_dict(raw.get("lessons")),
     )
@@ -787,6 +795,8 @@ class ResearchRun:
                                               generator_config.crowded_min_alphas),
                                     generator_config=generator_config,
                                     lessons=self.lessons)
+        if agents.breadth.enabled:
+            self.repairer.breadth = agents.breadth
         if agents.blend.enabled and self.repairer.llm is not None:
             # the reviewer: critic models from another maker than the planner (repair model)
             planner_maker = provider_of(m.repair)
@@ -1059,7 +1069,10 @@ class ResearchRun:
             starts_row = (float("inf") if dist is None else dist, c.candidate_id, key, row,
                           priority)
             self._resume_rows.append(starts_row)
-        self._resume_rows.sort(key=lambda t: (t[0], t[1]))
+        # repairs a recheck of BRAIN's late checks just decided (a PROD_CORRELATION value
+        # that came hours after the simulation) go first: they are the closest leads
+        fresh = {i["candidate_id"] for i in self.rechecked if i.get("decision") == "repair"}
+        self._resume_rows.sort(key=lambda t: (t[1] not in fresh, t[0], t[1]))
         for _, _, key, row, priority in self._resume_rows:
             if sum(1 for i in self.resumed if i.get("children")) >= cfg.max_resume:
                 break
@@ -1196,7 +1209,7 @@ class ResearchRun:
                        + ", ".join(f"{_short_id(o.candidate_id)} -> {o.decision} / "
                                    f"{o.failure_class}" for o in outs))
 
-    def _recheck_pending(self) -> None:
+    def _recheck_pending(self, start_waves: bool = False) -> None:
         """Alphas decided pending because BRAIN had not finished a check (PROD_CORRELATION
         PENDING, SELF_CORRELATION ERROR) are fetched again and decided
         (``Pipeline.recheck_pending``); a decided one credits its arm, as a pending decision
@@ -1218,6 +1231,20 @@ class ResearchRun:
                 self.director.update(key, o.decision == "accept")
             self.rechecked.append({"candidate_id": o.candidate_id, "decision": o.decision,
                                    "failure_class": o.failure_class})
+            if start_waves and o.decision == "repair" and key is not None and self._in_run(key):
+                # during a run: the repair wave starts now (at the start, _resume_repairs
+                # takes these first)
+                d = o.decision_record or (self.memory.decisions_for(o.candidate_id) or [None])[-1]
+                res = o.result or (self.memory.results_for(o.candidate_id) or [None])[-1]
+                rep = self._start_wave(key, c, d, res)
+                self.resumed.append({"parent": o.candidate_id, "arm": arm_label(key),
+                                     "notes": rep.notes, "rechecked": True,
+                                     **({"children": [x.candidate_id for x in rep.children],
+                                         "fixes": [x.lever for x in rep.children]}
+                                        if rep.children else {})})
+                if rep.children:
+                    self._emit(f"    {_short_id(o.candidate_id)}: {len(rep.children)} fixes: "
+                               + ", ".join(x.lever for x in rep.children))
         if outs or still:
             got = ", ".join(f"{_short_id(o.candidate_id)} -> {o.decision} / {o.failure_class}"
                             for o in outs) or "none"
@@ -1542,6 +1569,9 @@ class ResearchRun:
                 self.stop_reason = why
                 break
             try:
+                every = self.agents.recheck_every_rounds
+                if every and r > 1 and (r - 1) % every == 0:
+                    self._recheck_pending(start_waves=True)
                 self._round(r)
             except LLMUnavailable as exc:  # budget used up, or the model failed
                 self.stop_reason = str(exc)

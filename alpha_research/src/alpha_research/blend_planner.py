@@ -16,7 +16,13 @@ Method
    "partner alone" tests of it. Scored for the failure: fewer BRAIN alphas, lower PnL
    correlation with the alpha and the pool, own |Sharpe|, strength in the weak years
    (recent Sharpe), coverage (sub-universe). A dataset is *proven* when an alpha of ours on
-   it reached |Sharpe| >= ``min_partner_sharpe``, or a partner-alone test of it did.
+   it reached |Sharpe| >= ``min_partner_sharpe``, a partner-alone test of it did, or a
+   partner part of one of our accepted alphas (any market) reads it. Since 2026-11-27
+   (analyst69, the partner of two accepts, ranked 11th-15th): usage is the median BRAIN
+   alphas of the dataset's signal fields, with no bonus below ``min_field_alphas`` (near
+   empty is unknown, not unused signal); revision families (breadth.py) and a role in an
+   accept add to the score; the ``family_items`` least-used families' up/down/count fields
+   are listed first, then fields with at least ``min_field_alphas`` alphas.
 2. One planning call (the repair model): the alpha with BRAIN's numbers, the lineage's
    tried fixes, the candidates with their evidence, the pairings already tried in this
    market and their results, the lessons. It returns blend variants (partner signal, weight,
@@ -46,6 +52,7 @@ from typing import Mapping, Sequence
 
 import pandas as pd
 
+from . import breadth
 from .config import ConfigError
 from .fastexpr import FastExprError, FastExprSpec, analyze
 from .generator import GenerationError, ask_json, crowded_fields, field_role, heavily_used
@@ -77,6 +84,11 @@ class BlendConfig:
     min_mechanism_chars: int = 40
     stable_year_share: float = 0.5
     review: bool = True
+    # fields (and datasets, by their fields' median) read by fewer BRAIN alphas than this
+    # are listed after the others and get no usage bonus: near-empty means unknown, not
+    # unused signal (analyst69's least-used fields are metadata such as market status)
+    min_field_alphas: int = 5
+    family_items: int = 3        # revision families (breadth.py) listed first, per dataset
 
     @classmethod
     def from_dict(cls, raw) -> "BlendConfig":
@@ -95,7 +107,8 @@ class BlendConfig:
                     raise ConfigError(f"agents config: blend_plan.{k} must be true or false")
                 kw[k] = raw[k]
         for k in ("max_candidates", "fields_per_candidate", "max_partners_per_lineage",
-                  "partner_alone_per_wave", "min_overlap_days", "min_mechanism_chars"):
+                  "partner_alone_per_wave", "min_overlap_days", "min_mechanism_chars",
+                  "min_field_alphas", "family_items"):
             if k in raw:
                 v = raw[k]
                 if isinstance(v, bool) or not isinstance(v, int) or v < 0:
@@ -134,6 +147,9 @@ class PartnerCandidate:
     alone: list[dict] = field(default_factory=list)   # partner-alone tests
     proven: bool = False
     score: float = 0.0
+    field_alphas: float | None = None       # median BRAIN alphas of its signal fields
+    families: int = 0                       # revision families (breadth.py)
+    in_accept: bool = False                 # a partner of one of our accepted alphas
 
 
 @dataclass
@@ -201,7 +217,8 @@ def blend_base(candidate: CandidateRecord, by_id: Mapping[str, dict]) -> Candida
     """The lineage's last alpha that is not a blend: blends are built on it, so a blend never
     has more than two parts."""
     c = candidate
-    while c.lever in (BLEND_PLAN, "blend_other_dataset") and c.parent_id in by_id:
+    while c.lever in (BLEND_PLAN, "blend_other_dataset", "breadth_blend") \
+            and c.parent_id in by_id:
         c = by_id[c.parent_id]["candidate"]
     return c
 
@@ -290,13 +307,42 @@ def partner_candidates(parent: CandidateRecord, parent_result: ResultRecord | No
         p.fields.append((f, m))
     parent_pnl = parent_result.daily_pnl if parent_result is not None else None
     weak = weak_years(parent_result, "recent_sharpe" in failing)
+    fams = breadth.families(meta, breadth.BreadthConfig(),
+                            skip=set(spec.base_fields) | set(spec.groups))
+    # datasets a partner part of one of our accepted alphas (any market: field ids are the
+    # same in every market) reads: proven by that accept
+    in_accept = set()
+    for o in outcomes:
+        c, d = o["candidate"], o["decision"]
+        if d is None or d.decision != "accept":
+            continue
+        words = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", c.expression or ""))
+        in_accept |= {ds for f in words
+                      if (ds := (meta.get(f) or {}).get("dataset")) and ds != c.dataset
+                      and f not in spec.base_fields}
     out = []
     for ds, p in per.items():
-        p.fields.sort(key=lambda fm: (fm[1].get("alpha_count") or 0, fm[0]))
+        n_alphas = [fm[1].get("alpha_count") or 0 for fm in p.fields]
+        p.field_alphas = statistics.median(n_alphas) if n_alphas else None
+        listed = {f for f, _ in p.fields}
+        usable = [x for x in fams.get(ds, []) if x.up in listed and x.down in listed]
+        p.families = len(usable)
+        fam_note: dict[str, str] = {}   # the least-used families' fields, listed first
+        for fam in usable[:config.family_items]:
+            for role, x in (("up", fam.up), ("down", fam.down), ("count", fam.count)):
+                if x in listed and x not in fam_note:
+                    fam_note[x] = f"revision family {fam.item} ({role}); "
+        p.in_accept = ds in in_accept
+        order = list(fam_note)
+        p.fields.sort(key=lambda fm: (order.index(fm[0]) if fm[0] in fam_note else len(order),
+                                      (fm[1].get("alpha_count") or 0) < config.min_field_alphas,
+                                      fm[1].get("alpha_count") or 0, fm[0]))
         covs = [fm[1]["coverage"] for fm in p.fields
                 if isinstance(fm[1].get("coverage"), (int, float))]
         p.coverage = round(statistics.median(covs), 2) if covs else None
-        p.fields = [(f, _note(m)) for f, m in p.fields[:config.fields_per_candidate]]
+        keep = len(fam_note) + (config.fields_per_candidate // 2 if fam_note
+                                else config.fields_per_candidate)
+        p.fields = [(f, fam_note.get(f, "") + _note(m)) for f, m in p.fields[:keep]]
         # our evidence: strongest complete alpha mainly on this dataset here (not this lineage)
         best = None
         for o in outcomes:
@@ -330,8 +376,9 @@ def partner_candidates(parent: CandidateRecord, parent_result: ResultRecord | No
             }
         p.proven = bool((best is not None and abs(best["result"].sharpe)
                          >= config.min_partner_sharpe)
-                        or any(a["sharpe"] >= config.min_partner_sharpe for a in p.alone))
-        p.score = _score(p, failing, bar)
+                        or any(a["sharpe"] >= config.min_partner_sharpe for a in p.alone)
+                        or p.in_accept)
+        p.score = _score(p, failing, bar, config.min_field_alphas)
         out.append(p)
     proven = sorted([p for p in out if p.proven], key=lambda p: (-p.score, p.dataset))
     untested = sorted([p for p in out if not p.proven], key=lambda p: (-p.score, p.dataset))
@@ -347,11 +394,21 @@ def _note(m: Mapping) -> str:
     return f"{desc} ({', '.join(bits)})" if bits else desc
 
 
-def _score(p: PartnerCandidate, failing: set[str], bar: float) -> float:
+def _score(p: PartnerCandidate, failing: set[str], bar: float,
+           min_field_alphas: int = 5) -> float:
+    """Fit of a partner dataset (module doc, step 1). Usage is its signal fields' median
+    BRAIN alphas, not the dataset's total (analyst69: 188,000 alphas in all, its revision
+    fields 0-80 each); a near-empty dataset (median below ``min_field_alphas``) gets no
+    usage bonus. Revision families and a partner role in one of our accepts add to it."""
     e = p.evidence or {}
     s = 0.0
-    if p.brain_alphas is not None:
-        s += 1.0 / (1.0 + p.brain_alphas / 500.0) * (2.0 if "prod_correlation" in failing else 1.0)
+    if p.field_alphas is not None and p.field_alphas >= min_field_alphas:
+        s += 1.0 / (1.0 + p.field_alphas / 500.0) * (2.0 if "prod_correlation" in failing
+                                                       else 1.0)
+    if p.families:
+        s += 1.0
+    if p.in_accept:
+        s += 1.0
     if e.get("sharpe") is not None and bar:
         s += min(1.0, abs(e["sharpe"]) / bar)
     if e.get("pnl_corr_with_alpha") is not None:

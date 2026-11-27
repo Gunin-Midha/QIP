@@ -87,13 +87,14 @@ from dataclasses import dataclass, field
 from typing import Collection, Mapping
 
 from . import blend_planner
+from . import breadth
 from .evaluator import FACTOR_FIRST, SIGN_FIRST
 from .fastexpr import (Assign, Binary, Call, ComplexityLimits, FastExprError, FastExprSpec,
                        Name, Num, Unary, analyze, catalog, catalog_for, parse, render)
 from .generator import (GenerationError, ask_json, crowded_fields, dataset_category, field_role,
                         heavily_used)
 from .lever_stats import (PINNED_LAST, LeverStats, RepairLearningConfig, combo_parts,
-                          failing_classes, mechanical_only, wave_size,
+                          distance, failing_classes, mechanical_only, wave_size,
                           family_budget, needs, rank_levers, repair_events,
                           successful_examples)
 from .llm import LLMClient, ModelDown
@@ -823,6 +824,8 @@ class RepairAgent:
         # {region: {alpha id: daily PnL}} of our submitted pool alphas
         self.blend = None
         self.pool_pnl: dict[str, dict] = {}
+        # revision-breadth blends by rule (breadth.py): a BreadthConfig, None = off
+        self.breadth = None
 
     def evidence(self) -> tuple[list, LeverStats, list]:
         """Repair events, lever statistics and the outcome rows, read fresh from memory."""
@@ -943,16 +946,30 @@ class RepairAgent:
         seen = {(candidate.expression, candidate.universe, candidate.decay,
                  candidate.neutralization, candidate.truncation)}
         model_tries = 0
+        # owner 2026-11-27: a close lead failing an information class first gets blends
+        # with analyst net revision breadth, built by rule (breadth.py, no model call)
+        if self.breadth is not None:
+            for child in self._breadth_blends(candidate, decision, result, outcomes,
+                                              size - len(out.children), out):
+                key = (child.expression, child.universe, child.decay,
+                       child.neutralization, child.truncation)
+                if key in seen or self.memory.has_result_for_hash(experiment_hash(child)):
+                    out.notes.append(f"{child.lever}: same experiment as another fix or "
+                                     f"one in memory")
+                    continue
+                seen.add(key)
+                out.children.append(dataclasses.replace(
+                    child, candidate_id=self._free_id(child.candidate_id, out.children)))
         # owner 2026-11-26: a close lead failing an information class gets a model-planned
         # wave of blends (blend_planner.py); the rest of the wave is mechanical
-        if self.blend is not None and not mech_only:
+        if self.blend is not None and not mech_only and len(out.children) < size:
             failing_all = failing_classes(decision, result) | {decision.failure_class}
             ok, why = blend_planner.eligible(decision, result, failing_all, self.blend.config)
             out.notes.append(f"blend plan: {why}")
             if ok and self.llm is not None:
                 calls = out.llm_calls
                 for child in self._planned_blends(candidate, decision, result, failing_all,
-                                                  outcomes, size, out):
+                                                  outcomes, size - len(out.children), out):
                     key = (child.expression, child.universe, child.decay,
                            child.neutralization, child.truncation)
                     if key in seen or self.memory.has_result_for_hash(experiment_hash(child)):
@@ -1010,6 +1027,69 @@ class RepairAgent:
             out.notes.append("repair exhausted: every lever for the failing classes was "
                              "tried or did not apply")
         return out
+
+    def _breadth_blends(self, c: CandidateRecord, decision: DecisionRecord,
+                        result: ResultRecord | None, outcomes: list[dict], room: int,
+                        out: RepairOutcome) -> list[CandidateRecord]:
+        """Blends with analyst net revision breadth (breadth.py), built on the lineage's last
+        non-blend alpha: at most ``variants_per_wave`` and ``max_per_lineage``."""
+        cfg = self.breadth
+        failing = failing_classes(decision, result) | {decision.failure_class}
+        ok, why = breadth.eligible(decision, result, failing, cfg, distance)
+        out.notes.append(f"breadth blend: {why}")
+        if not ok or room <= 0:
+            return []
+        by_id = {o["candidate"].candidate_id: o for o in outcomes}
+        root = blend_planner.lineage_root(c, by_id)
+        lineage = [o["candidate"] for o in outcomes
+                   if o["candidate"].candidate_id.startswith(root)]
+        done = sum(1 for k in lineage if k.lever == breadth.BREADTH_LEVER)
+        left = min(room, cfg.variants_per_wave, cfg.max_per_lineage - done)
+        if left <= 0:
+            out.notes.append(f"breadth blend: {done} already in this lineage "
+                             f"(max_per_lineage {cfg.max_per_lineage})")
+            return []
+        meta = self._meta(c.region, c.delay)
+        fams = breadth.families(meta, cfg, skip=set(self.spec.base_fields) | set(self.spec.groups))
+        base = blend_planner.blend_base(c, by_id)
+        try:
+            used = set(analyze(base.expression, self.spec).fields_used)
+        except FastExprError:
+            used = set()
+        own = {base.dataset, c.dataset} | {(meta.get(f) or {}).get("dataset") for f in used}
+        accepted = [o["candidate"].expression for o in outcomes
+                    if o["decision"] is not None and o["decision"].decision == "accept"]
+        plan = breadth.variants(fams, own, cfg, proven=breadth.accepted_datasets(fams, accepted),
+                                tried=breadth.tried_tags(k.hypothesis for k in lineage))
+        if not plan:
+            out.notes.append("breadth blend: no revision families in another dataset of "
+                             "this market")
+            return []
+        kids = []
+        for ds, items, w in plan:
+            if len(kids) >= left:
+                break
+            partner = breadth.partner_expression(items, cfg)
+            try:
+                expr = build_blend(base.expression, partner, self.spec, weight=w)
+            except (FastExprError, LeverNotApplicable) as exc:
+                out.notes.append(f"breadth blend: cannot build with {ds}: {exc}")
+                continue
+            new = dataclasses.replace(
+                c, expression=expr,
+                hypothesis=f"{breadth.tag(ds, items, w)} {base.hypothesis or ''} Blended with "
+                           f"{ds} net revision breadth (up minus down estimate revisions over "
+                           f"the estimate count) on {', '.join(f.item for f in items)}: news "
+                           f"analysts are acting on that production alphas built on the "
+                           f"alpha's own data do not hold.".strip())
+            child = self._child(c, new, breadth.BREADTH_LEVER)
+            if child is None:
+                out.notes.append(f"breadth blend with {ds} failed validation")
+                continue
+            out.notes.append(f"{breadth.BREADTH_LEVER}: {ds} x{w:g} on "
+                             f"{', '.join(f.item for f in items)}")
+            kids.append(child)
+        return kids
 
     def _planned_blends(self, c: CandidateRecord, decision: DecisionRecord,
                         result: ResultRecord | None, failing: set[str], outcomes: list[dict],

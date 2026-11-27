@@ -75,6 +75,27 @@ blend_plan:
   min_mechanism_chars: 40
   stable_year_share: 0.5
   review: true
+  min_field_alphas: 5               # fields/datasets read by fewer BRAIN alphas: listed last, no usage bonus
+  family_items: 3                   # revision families listed first per partner dataset
+# Breadth blends (breadth.py, owner 2026-11-27): five of our seven accepts were the near miss
+# blended with analyst net revision breadth ((up - down) / count, a few less-used items),
+# all made by hand; the pipeline never wrote one. A lead within max_distance of accept that
+# fails one of `classes` gets these blends first in its repair wave, built by rule (no model
+# call): revision families found by field id in `categories` datasets of its market, the
+# least-used items (items under min_item_alphas last) at each weight, then the next items.
+breadth_blend:
+  enabled: true
+  classes: [prod_correlation, self_correlation, sharpe, recent_sharpe, sub_universe]
+  max_distance: 0.4
+  items_per_variant: 3
+  min_items: 2
+  weights: [1, 2]
+  variants_per_wave: 2
+  max_per_lineage: 4
+  backfill_below_coverage: 0.5
+  backfill_days: 20
+  categories: [analyst]
+  min_item_alphas: 5
 designer:
   enabled: true
   arms_per_batch: 4
@@ -109,7 +130,8 @@ repair:
   prior: [1, 1]                    # Beta prior per (failure class, lever)
   examples_in_prompt: 3            # past repairs that worked, shown to the repair model
   resume_from_memory: true         # at start, re-repair parents whose child was never simulated
-  max_resume: 3                    # ... at most this many, closest to accept first
+  max_resume: 3                    # ... at most this many, closest to accept first (repairs a recheck just decided first)
+  recheck_every_rounds: 2          # alphas waiting on BRAIN's late checks (PROD_CORRELATION) fetched again every 2 rounds; a new repair starts its wave at once (0 = run start only)
   max_share_per_round: 1.0         # queued repairs take up to this share of a round's slots first
   # Repair waves (owner 2026-11-23): a near miss gets fixes_per_wave different fixes (one
   # per kind of change first) simulated together; when all are back, the next wave starts

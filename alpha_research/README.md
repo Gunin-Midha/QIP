@@ -767,6 +767,17 @@ screenshot values (aggregate plus yearly rows for 2019 to 2023).
 - Every candidate that reaches BRAIN registers a variant for the auditor, including
   failures, as section 10.1 requires.
 
+## Breadth blends (2026-11-27)
+
+A close lead (within 0.4 of accept) that fails production/self correlation, Sharpe, recent
+Sharpe or sub-universe first gets blends with analyst net revision breadth, built by rule
+(`breadth.py`, no model call): revision families (up/down/count fields) are found by field id
+in the market's analyst datasets, the least-used items are averaged as (up - down) /
+max(count, 1), and the blend is rank(alpha) + weight x rank(partner) at weights 1 and 2.
+Settings: `breadth_blend:` in `config/agents.yaml`. The Blend Planner now scores partner
+datasets by their fields' usage and lists revision families first. Repairs found by
+rechecking BRAIN's late checks go first; `repair.recheck_every_rounds` rechecks during a run.
+
 ## Open questions (owner to answer)
 
 - **OQ-1 Margin definition.** BRAIN's reported margin is about half the naive

@@ -30,7 +30,7 @@ PROMPT_VERSIONS = {
     "repair": "repair-v11",
     "strategy": "strategy-v7",
     "lessons": "lessons-v3",
-    "blend_plan": "blend-v1",
+    "blend_plan": "blend-v2",
     "blend_review": "blend-review-v1",
 }
 
@@ -534,6 +534,7 @@ Rules:
 - "partner_alone": a test of a partner from an untested candidate simulated by itself, so its direction and strength are known before any blend uses it. At most one.
 - Use the evidence: prefer partners whose PnL correlates little with the alpha and with our submitted alphas, that are strong in the alpha's weak years when recent Sharpe fails, and pairings that worked in this market. Do not repeat a pairing or partner that failed.
 - Keep speeds similar: a slow partner blended with a fast alpha mostly averages away.
+- Fields marked "revision family <item> (up/down/count)" are analyst estimate revisions. Net revision breadth, (up - down) / max(count, 1) averaged over two to four less-used items, was the partner in most of our accepted blends; the pipeline also tries that form by rule, so use the families for a different construction or different items.
 
 {DATA_RULE}
 
