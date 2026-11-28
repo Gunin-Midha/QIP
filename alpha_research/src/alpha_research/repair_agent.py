@@ -144,7 +144,7 @@ LEVER_KINDS = {
     "increase_decay": "smoothing", "speed_up": "smoothing", "lengthen_ts_window": "smoothing",
     "wrap_in_smoothing": "smoothing", "hump": "smoothing",
     "rank_transform": "shape", "winsorize": "shape", "volatility_scale": "shape",
-    "relative_price_change": "shape",
+    "relative_price_change": "shape", "emphasize_tails": "shape",
     "tighten_truncation": "shape",
     "set_neutralization": "neutralization",
     "change_universe": "universe", "liquidity_tilt": "universe", "size_tilt": "universe",
@@ -319,6 +319,24 @@ def _rank_transform(c, step, spec, result=None):
         raise LeverNotApplicable("expression is already ranks (rank/group_rank or a "
                                  "combination of them)")
     return _with_final(c, Call("rank", (final,), ()))
+
+
+def _emphasize_tails(c, step, spec, result=None):
+    """signed_power(rank(x) - 0.5, power): more weight on the strongest views, less on the
+    middle, so the same ideas earn more per unit of turnover. For a fitness failure whose
+    weak part is returns (feasibility.returns_weak; failure review 2026-11-27: e.g. EUR
+    Sharpe 1.99 / fitness 0.82 at returns 3.85%, turnover 23%, where every fitness lever only
+    cut turnover). An expression that is already ranks is centred as it is."""
+    _need_op(spec, "signed_power")
+    power = step.get("power", 2)
+    head, final = _final(c)
+    if isinstance(final, Call) and final.name == "signed_power":
+        raise LeverNotApplicable("expression is already a signed_power(...)")
+    env = {s.name: s.value for s in head if isinstance(s, Assign)}
+    if not _rank_shaped(final, env):
+        _need_op(spec, "rank")
+        final = Call("rank", (final,), ())
+    return _with_final(c, Call("signed_power", (Binary("-", final, Num("0.5")), _num(power)), ()))
 
 
 def _volatility_scale(c, step, spec, result=None):
@@ -543,6 +561,7 @@ MECHANICAL = {
     "wrap_in_smoothing": _wrap_in_smoothing,
     "hump": _hump,
     "rank_transform": _rank_transform,
+    "emphasize_tails": _emphasize_tails,
     "volatility_scale": _volatility_scale,
     "flip_sign": _flip_sign,
     "set_neutralization": _set_neutralization,

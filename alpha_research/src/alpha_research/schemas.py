@@ -85,6 +85,7 @@ FAILURE_CLASSES = (
     "weak_year",
     "recent_sharpe",      # BRAIN's LOW_2Y_SHARPE / IS_LADDER_SHARPE (consultant level)
     "prod_correlation",   # BRAIN's PROD_CORRELATION: too close to production alphas
+    "investability",      # BRAIN's LOW_INVESTABILITY_CONSTRAINED_SHARPE (ASI, JPN)
     "incomplete",
     "other",
 )

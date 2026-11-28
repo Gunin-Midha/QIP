@@ -164,6 +164,9 @@ class Pipeline:
         self._width = max((len(self._name(c.candidate_id)) for c in candidates), default=0)
         self._open: str | None = None   # candidate whose "fetching" line is not finished
         self._tty = bool(getattr(self.out, "isatty", lambda: False)())
+        # dashboard: a live.LiveStatus that sees each batch, BRAIN's progress and decisions
+        self.live = None
+        self._console_status_at: float | None = None
 
     def _name(self, cid: str) -> str:
         lever = getattr(self, "_levers", {}).get(cid)
@@ -248,6 +251,8 @@ class Pipeline:
         live = self.out is not None
         if live:
             self._begin_batch([c for _, c in to_run])
+        if self.live is not None:
+            self.live.batch([c for _, c in to_run])
         streaming = on_outcome is not None
         index = {c.candidate_id: i for i, c in to_run}
 
@@ -262,6 +267,8 @@ class Pipeline:
             outcome = self._evaluate(candidate, result)
             if candidate.candidate_id in index:
                 outcomes[index[candidate.candidate_id]] = outcome
+            if self.live is not None:
+                self.live.decided(candidate, outcome)
             on_outcome(candidate, outcome)
 
         def extra(free: int) -> list[CandidateRecord]:
@@ -272,18 +279,22 @@ class Pipeline:
                     on_outcome(c, dup)
                     continue
                 out.append(c)
+            if self.live is not None and out:
+                self.live.batch(out)
             if live and out:
                 self._levers.update({c.candidate_id: c.lever for c in out})
                 self._width = max([self._width] + [len(self._name(c.candidate_id)) for c in out])
             return out
 
+        watched = self.live is not None
         results = self.simulator.run_many(
             [c for _, c in to_run],
             on_done=self._progress if live and len(to_run) > 1 and not streaming else None,
-            on_status=self._status if live else None,
-            on_ready=self._fetching if live else None,
+            on_status=self._on_status if (live or watched) else None,
+            on_ready=self._on_ready if (live or watched) else None,
             on_result=decide if streaming else None,
-            more=extra if streaming and more is not None else None)
+            more=extra if streaming and more is not None else None,
+            status_every=self._status_every() if watched else None)
         if live:
             self._close_line()
         if not streaming:
@@ -291,7 +302,37 @@ class Pipeline:
                 if result.status != "invalid":
                     self.auditor.register_variant(candidate.family, candidate.candidate_id)
                 outcomes[i] = self._evaluate(candidate, result)
+                if self.live is not None:
+                    self.live.decided(candidate, outcomes[i])
         return outcomes  # type: ignore[return-value]
+
+    LIVE_STATUS_SECONDS = 15.0   # how often BRAIN's progress reaches the dashboard
+    live = None                  # dashboard's live.LiveStatus (set per instance)
+    _console_status_at = None
+
+    def _status_every(self) -> float:
+        console = self.config.simulator.progress_every_seconds
+        return min(self.LIVE_STATUS_SECONDS, console) if console else self.LIVE_STATUS_SECONDS
+
+    def _on_status(self, snap: dict) -> None:
+        """BRAIN's progress: to the dashboard every time, to the console only at
+        ``simulator.progress_every_seconds`` (null = never)."""
+        if self.live is not None:
+            self.live.status_snapshot(snap)
+        every = self.config.simulator.progress_every_seconds
+        if self.out is None or not every:
+            return
+        now = self.simulator.clock()
+        if self._console_status_at is None or now - self._console_status_at >= every \
+                or self.live is None:
+            self._console_status_at = now
+            self._status(snap)
+
+    def _on_ready(self, candidate_id: str) -> None:
+        if self.live is not None:
+            self.live.fetching(candidate_id)
+        if self.out is not None:
+            self._fetching(candidate_id)
 
     def _duplicate(self, candidate: CandidateRecord, seen: set) -> bool:
         h = experiment_id(candidate)

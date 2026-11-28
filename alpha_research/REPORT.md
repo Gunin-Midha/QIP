@@ -1157,3 +1157,119 @@ fiscal-period codes. Effects:
 Not verified on BRAIN: a densified matrix code as a group argument (BRAIN's own docs use
 `densify` on grouping fields). Replay over memory: 3 alphas misused a code (the three above), none
 used one correctly. `tests/test_category_fields.py`. 1035 tests pass.
+
+
+## Investability class and empty-alpha guard (2026-11-27, owner)
+
+From the failure review: which failures block strong alphas across lineages and markets,
+not in one alpha.
+
+**Investability.** BRAIN's LOW_INVESTABILITY_CONSTRAINED_SHARPE (ASI, JPN) failed 43 times
+in 19 lineages, 17 of them alphas with |Sharpe| >= 1.2. BRAIN's limit is ~0.7 x the
+alpha's own Sharpe. Over the 58 ASI/JPN alphas with Sharpe >= 0.8 the constrained / full
+ratio falls with turnover (correlation -0.68): all 27 under 15% turnover passed (median
+ratio 0.95), 7 of 24 between 30% and 70%. Mapped to sub_universe, it got a smaller
+universe (ratio -0.05), factor neutralizations (-0.12..0) and backfill (+0.01); smoothing
+gave +0.11 (2 repairs), a blend with another dataset +0.15 (1). It is now its own class
+`investability` with slowing levers first (smoothing, decay, longer windows, hump), then a
+liquidity tilt, a blend and the model. Its slack is measured on the ratio
+((value - limit) / Sharpe), so a child that only cuts its Sharpe is not learned as a fix.
+
+**Empty alphas.** 4 results in memory had turnover 0, Sharpe 0 and no position in any year
+(IND model39 x2, IND, CHN model307). Each added a vec_* part to the rest of the signal
+without a value for missing data, so NaN + x = NaN blanked every stock and day; the
+catalog said coverage 0.69-1.0 and the fields had 0 BRAIN alphas. Now such a result is
+stored as failed (`empty alpha: ...`), decided reject / incomplete, not used as evidence
+about the dataset, and tried once more with the vector parts filled by their middle value
+(0.5 for a rank, 0 for a z-score). The fill is not applied before BRAIN: on memory it
+would have rewritten 78 alphas, 74 of which BRAIN simulated with positions (among them the
+submitted CHN breadth blend), and it changes what such an alpha trades where the vector is
+missing.
+
+## Model losses, returns lever, CHN/IND rescue file (2026-11-28, owner)
+
+Run `rs20261127153052` (ASI/CHN/AMR, 52 simulations, 0 accepts) stopped on the BRAIN login
+reserve with every model down, so its lessons were rules only. How each was lost and the fix:
+
+| Model | Lost to | Now |
+|---|---|---|
+| Nemotron Lightning, Ernie | one empty reply each (reasoning used the 16k cap) | `EmptyReply`: retried once at 2x the cap (max 32,768); the call fails, the model goes down only after 3 empty replies in a row |
+| Qwen (Groq) | 429 "Request too large ... output tokens per minute (OTPM): Limit 1000, Requested 1371", first waited 20 s as a rate limit, then down | `too_large` reads a too-large 429 (`output_only`), no wait; `RequestFitClient` retries under the limit and keeps it for later calls; `pace.output_tokens_per_minute` configures it, `PacedClient` paces output tokens |
+| gpt-oss (Groq) | tokens-per-day 429 asking for 13 min (above the 60 s retry limit) | `RateLimited`: a stated wait up to 30 min pauses the model (`CallCounter.is_up`); fallbacks, critic choice and live arms skip it; the round waits if every generator model left is paused |
+| Gemini Flash | 20 requests/day (16 h wait) | unchanged: down for the run |
+
+`CallFailed` is the common base ("this call failed, the model stays up"); `RequestTooLarge`,
+`EmptyReply` and `RateLimited` derive from it, and all are `ModelDown` subclasses, so agents
+that fall back to rules on ModelDown work unchanged. Report: `empty_replies`, `rate_limit_pauses`.
+
+**Returns lever (failure review item 1).** BRAIN's fitness is Sharpe x sqrt(|returns| /
+max(turnover, 12.5%)). LOW_RETURNS (25 CHN failures) mapped to `other` and had no levers; it now
+maps to `fitness`. `feasibility.returns_weak`: LOW_RETURNS fails, or even turnover at the 12.5%
+floor (same Sharpe and returns) would give less than `returns_margin` (1.2, cuts also lose
+returns) x the fitness bar. For a fitness failure whose Sharpe and turnover pass, a returns-weak
+alpha gets no turnover cuts (increase_decay, lengthen_ts_window, wrap_in_smoothing, hump) and the
+new mechanical lever `emphasize_tails` (`signed_power(rank(x) - 0.5, 2)`; an expression that is
+already ranks is centred as it is); a turnover-weak one gets the cuts and not the tails lever.
+Over memory: 32 fitness failures with Sharpe and turnover passing, 14 returns-weak (EUR reversal
+variants at returns 3.8-4.3%, ASI at 4.3%).
+
+**Best open alphas from runs 2026-11-25..27** (non-accepted, lineages not closed by an accept):
+- IND `rs20261126082238r05a289f2_002`: industry value momentum x fundamental17 tbea change,
+  Sharpe 2.29, fitness 1.56, turnover 21%, fails only robust-universe Sharpe 0.87 / 1.0 (2021
+  -0.29, 2022 0.51). Never repaired; IND is not in the next rotation (DEU, GLB, JPN have the
+  fewest simulations). In IND only analyst blends raised robust-universe Sharpe (accept 1.01 ->
+  1.36). Rescue: analyst44 net revision breadth (EPS GAAP, ROE, pre-tax profit counts) at
+  weight 1 and 2, the accepted IND blend's EPS-trend partner (self-correlation risk with
+  `LLKQ7Kpe`), INDUSTRY.
+- CHN negatives -5.23 / -3.39 / -2.23 (retail rebalancing, model39 momentum, csi1800a specific
+  returns): no flip tried yet; their flips answer whether CHN flips mirror
+  (`repair.flip_short_restricted`). Rescue: three flips and the -5.23 one at decay 10 (turnover
+  80%).
+- Left out: EUR recipe blends (Sharpe 2.7-2.85, sub-universe ratio 0.23-0.27 vs limit share 0.52:
+  no large-cap part; tilts only cut Sharpe), ASI VWAP-gap lineage (best fixes either fail the
+  Japan check or the IS ladder 1.21 / 1.58; 3 generations and 16 children), ASI reversal +
+  breadth (IS ladder 0.17).
+
+File: `candidates/rescue_20261128_chn_ind.json` (8 alphas, all validated against their market
+catalogs, none in memory).
+
+### Rescue results and cross-region leads (2026-11-28, later)
+
+| Alpha | Sharpe | Fitness | Turnover | Robust | PROD | Decision |
+|---|---|---|---|---|---|---|
+| IND + analyst44 breadth, w1 | 3.43 | 3.49 | 16% | 1.44 | 0.712 (BRAIN PASS) | accept |
+| IND + EPS-trend partner | 3.21 | 2.90 | 18% | 1.22 | 0.641 | accept |
+| IND + analyst44 breadth, w2 | 3.31 | 3.86 | 12% | 1.41 | 0.81 | repair / prod_correlation |
+| IND, INDUSTRY | 2.38 | 1.60 | 22% | 1.02 | 0.685 | repair / recent_sharpe (ladder 1.52) |
+| CHN flips (-5.23, -3.39, -2.23; decay 10) | 0.47, 0.07, 0.96; 0.39 | <= 0.6 | | | | reject |
+
+The two IND accepts correlate 0.73 (daily PnL) and 0.32 / 0.46 with the submitted IND alpha
+`LLKQ7Kpe`. CHN flips do not mirror (BRAIN's guide was right): `repair.flip_short_restricted`
+back to false. Weight 2 on a breadth partner that includes a heavily used item (pre-tax profit,
+1,595 BRAIN alphas) raised PROD_CORRELATION 0.71 -> 0.81; `breadth.variants` now offers the
+heavier weight only when every item is below `heavy_item_alphas`.
+
+Why the pipeline had not made these: the IND lead's wave was queued in run rs20261126082238 and
+lost when the run stopped on the login reserve, and IND was not in the rotation for the next
+three runs (repairs resume only for the run's regions); the CHN parents got wave size 0 because
+LOW_RETURNS mapped to `other` (fixed earlier today). New: `repair.cross_region_distance` (0.15)
+and `cross_region_leads` (2): at run start the closest open repairs of regions outside the
+rotation start a wave; their arms take repairs only (no new alphas), and follow-up waves of
+those lineages continue.
+
+## Dashboard (2026-11-28, owner)
+
+Owner: track runs on a web page instead of the terminal, this Mac only, Grafana style.
+- `live.py`: each `cli research` / `cli run` writes `<data-dir>/live/<run id>.json` on every
+  console line, batch, BRAIN status (every 15 s while alphas run, separate from the console's
+  `simulator.progress_every_seconds`, still null) and decision; the file is replaced whole; it
+  carries the process id, so a killed run shows as "lost".
+- `dashboard_data.py`: memory opened read-only; rows read incrementally by id (first load of
+  622 candidates / 668 results 0.27 s, then milliseconds); runs from reports, live files, runs
+  without a report, hand batches by date; pool from `pool` + `pool_events`, accepted alphas not
+  submitted with a flag when a sibling of their lineage is already submitted.
+- `dashboard.py` + `dashboard.html`: stdlib server on 127.0.0.1, refuses non-local Host
+  headers; Grafana-like dark page (stat panels with sparklines, bar gauges, stacked bars, sortable
+  tables, inspect drawer).
+Hard rule 1 now allows this one server module; the definition-of-done greps exclude
+`*dashboard*`.

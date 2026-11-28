@@ -11,6 +11,7 @@
     python -m alpha_research.cli compare --data-dir data
     python -m alpha_research.cli repair --data-dir data --candidate-id ID --out rescue.json
     python -m alpha_research.cli levers --data-dir data
+    python -m alpha_research.cli dashboard [--data-dir data] [--port 8050]
     python -m alpha_research.cli models --host nvidia --filter llama | --check
 
 Exit codes: 0 success, 2 config error, 3 schema error, 4 no fixture for a candidate,
@@ -45,6 +46,7 @@ from .config import ConfigError, load_config
 from .fastexpr import FastExprSpec, catalog
 from .generator import (AlphaGenerator, GenerationError, GenerationSettings, Source,
                         load_datafield_meta, load_datafields, load_generator_config)
+from .live import LiveStatus
 from .llm import HOSTS, LLMUnavailable, ScriptedLLMClient, list_models, make_real_client
 from .memory import MemoryStore, default_data_dir
 from .orchestrator import run_rounds
@@ -95,9 +97,18 @@ def _run(args) -> int:
         vclock = VirtualClock()  # fixture runs never wait in real time
         sleep, clock = vclock.sleep, vclock.clock
     memory = MemoryStore(args.data_dir)
+    live = None
     try:
         pipeline = Pipeline(config, playbook, client, memory, sleep=sleep,
                             clock=clock, out=sys.stdout)
+        if not args.no_live:   # the dashboard's live page (cli dashboard)
+            total = len(entries)
+            live = LiveStatus(args.data_dir,
+                              "batch" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"),
+                              kind="batch",
+                              state=lambda: {"file": str(args.candidates), "total": total,
+                                             "client": args.client})
+            pipeline.live = live
         pipeline.run([e.candidate for e in entries])
         ids = {e.candidate.candidate_id for e in entries}
         waiting = [r["candidate"].candidate_id for r in memory.candidate_outcomes()
@@ -108,7 +119,12 @@ def _run(args) -> int:
                   "(PROD_CORRELATION can take hours): run `cli recheck` later")
         if not args.no_lessons:
             _write_lessons(memory, args, "batch" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"))
+        if live is not None:
+            live.finish("finished", f"{len(entries)} candidate(s) done")
+            live = None
     finally:
+        if live is not None:
+            live.finish("stopped", "stopped before the batch finished")
         memory.close()
     return EXIT_OK
 
@@ -687,6 +703,16 @@ def _unattended(session) -> None:
         session.ask_credentials = None
 
 
+def _dashboard(args) -> int:
+    """Local, read-only web dashboard (dashboard.py): live runs, alphas, runs, pool."""
+    from .dashboard import serve   # the server module is only loaded for this command
+    if not (Path(args.data_dir) / "memory.sqlite").exists():
+        print(f"note: no memory in {args.data_dir} yet; the dashboard will be empty",
+              file=sys.stderr)
+    serve(args.data_dir, port=args.port, open_browser=not args.no_browser)
+    return EXIT_OK
+
+
 def _research(args) -> int:
     config = load_config(args.config)
     config.require_holdout()  # before logging in or calling the model
@@ -727,6 +753,8 @@ def _research(args) -> int:
                           playbook=playbook, spec=spec, generator_config=gen_config,
                           memory=memory, datafields=datafields, field_meta=field_meta,
                           markets=markets, seeds=seeds, seed=args.seed, out=sys.stdout)
+        if not args.no_live:   # the dashboard's live page (cli dashboard)
+            run.attach_live(LiveStatus(args.data_dir, run.run_id))
         report = run.run(args.rounds, catch_interrupt=True)   # staged Ctrl-C (ResearchRun.run)
         path = write_report(report, args.report or Path(args.data_dir) / f"{report['run_id']}.json")
     finally:
@@ -908,6 +936,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--candidates", required=True)
     run.add_argument("--no-caffeinate", action="store_true",
                      help="with --client real: do not keep the Mac awake while it runs")
+    run.add_argument("--no-live", action="store_true",
+                     help="do not write the dashboard's live status (<data-dir>/live/)")
     run.add_argument("--config", default="config/thresholds.yaml")
     run.add_argument("--playbook", default="config/repair_playbook.yaml")
     run.add_argument("--data-dir", default=str(default_data_dir()))
@@ -965,6 +995,13 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--llm-script", help="JSON list of replies for --llm scripted (offline)")
     gen.set_defaults(func=_generate)
 
+    db = sub.add_parser("dashboard", help="local web dashboard of runs and alphas "
+                        "(this Mac only, read-only)")
+    db.add_argument("--data-dir", default="data")
+    db.add_argument("--port", type=int, default=8050)
+    db.add_argument("--no-browser", action="store_true", help="do not open the browser")
+    db.set_defaults(func=_dashboard)
+
     rs = sub.add_parser("research", help="closed research loop: Director, Generator, "
                         "Pre-Filter, Critic, Debate, BRAIN, Repair, Strategy Evolution")
     rs.add_argument("--plan", required=True, help="research plan YAML (arms, hypotheses, papers)")
@@ -979,6 +1016,8 @@ def build_parser() -> argparse.ArgumentParser:
     rs.add_argument("--seed", type=int, default=None)
     rs.add_argument("--no-caffeinate", action="store_true",
                     help="do not keep the Mac awake while the run goes (default: caffeinate)")
+    rs.add_argument("--no-live", action="store_true",
+                    help="do not write the dashboard's live status (<data-dir>/live/)")
     rs.add_argument("--report", default=None, help="report JSON (default: <data-dir>/<run id>.json)")
     rs.add_argument("--config", default="config/thresholds.yaml")
     rs.add_argument("--playbook", default="config/repair_playbook.yaml")

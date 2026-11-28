@@ -60,6 +60,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import logging
 import math
 import re
 import signal
@@ -80,17 +81,20 @@ from .blend_planner import BLEND_PLAN, BlendConfig, BlendPlanner, blend_base, st
 from .breadth import BreadthConfig
 from .brain_client import BrainClient, BrainLoginRequired, SimulationQuotaExhausted
 from .config import Config, ConfigError
-from .critic import Critic, DebateJudge, ReviewOutcome, SparseFieldRule, review_and_debate
+from .critic import (Critic, DebateJudge, ReviewOutcome, SparseFieldRule, nan_guarded,
+                     review_and_debate)
 from .compare import arm_models, model_comparison
 from .fastexpr import FastExprSpec, analyze, catalog, catalog_for
 from .generator import (AlphaGenerator, GenerationError, GenerationSettings, GeneratorConfig,
                         Source, dataset_appeal, dataset_catalog_for, dataset_category,
                         dataset_facts, field_role, load_dataset_meta)
-from .llm import LLMClient, LLMUnavailable, ModelDown, RequestTooLarge, provider_of
+from .llm import (CallFailed, EmptyReply, LLMClient, LLMUnavailable, ModelDown, RateLimited,
+                  RequestTooLarge, provider_of)
 from .memory import MemoryStore
 from .orchestrator import Orchestrator, balance_slots, consolidate
 from . import power_pool
 from .pipeline import Pipeline
+from .research_loop import assign_lineage
 from .prompts import PROMPT_VERSIONS, bar_text, brain_context
 from .prefilter import PreFilter, PrefilterConfig
 from .repair import Playbook
@@ -99,12 +103,14 @@ from .lever_stats import LeverStats, RepairLearningConfig, distance, repair_even
 from .quality import generation_quality
 from .repair_agent import RepairAgent
 from .schemas import (GROUP_NEUTRALIZATIONS, NO_REGULAR_SIMULATION, REGION_SETTINGS,
-                      CandidateRecord, experiment_hash)
+                      CandidateRecord, SchemaError, experiment_hash)
+from .simulator import EMPTY_ALPHA
 from .strategy import (StrategyConfig, StrategyEvolution, brain_limits,
                        prod_correlation_fields, region_notes, signal_evidence, arm_history,
                        arm_failures)
 
 DECIDED = ("accept", "reject", "repair")
+FILL_LEVER = "fill_missing_values"   # an empty alpha tried once more (_retry_empty)
 # fewest catalog fields a generator prompt lists after too-large refusals (each halves the
 # list, from generator.yaml max_datafields_in_prompt); below this the hypothesis has too few
 # fields to choose from, so the model writes no alphas for the rest of the run instead
@@ -115,16 +121,38 @@ class LLMBudgetExhausted(LLMUnavailable):
     pass
 
 
+log = logging.getLogger(__name__)
+
+EMPTY_REPLIES_DOWN = 3       # empty replies in a row (after the cap retry) before a model is down
+PAUSE_MAX_SECONDS = 1800.0   # a 429 asking for at most this long pauses the model, not downs it
+
+
 class CallCounter:
     """One model-call budget shared by every agent and every model."""
 
-    def __init__(self, max_calls: int | None):
+    def __init__(self, max_calls: int | None, *, clock: Callable[[], float] = time.monotonic,
+                 pause_max_seconds: float = PAUSE_MAX_SECONDS):
         self.max_calls = max_calls
         self.calls = 0
         self.by_model: dict[str, int] = {}
         self.down: dict[str, str] = {}   # model -> why it is out for the rest of the run
         self.too_large: dict[str, int] = {}   # model -> calls refused as too large
+        self.empty: dict[str, int] = {}       # model -> empty replies (call failed, model up)
+        self.empty_streak: dict[str, int] = {}
+        self.paused: dict[str, float] = {}    # model -> clock time its pause ends
+        self.pauses: dict[str, int] = {}      # model -> pauses so far
         self.stopped: str | None = None   # set by Ctrl-C: no new model calls (lessons aside)
+        self.clock = clock
+        self.pause_max_seconds = pause_max_seconds
+
+    def pause_left(self, model: str) -> float:
+        """Seconds until a paused model may be called again (0 = not paused)."""
+        until = self.paused.get(model)
+        return max(0.0, until - self.clock()) if until is not None else 0.0
+
+    def is_up(self, model: str) -> bool:
+        """Neither down for the run nor paused right now."""
+        return model not in self.down and self.pause_left(model) <= 0
 
 
 class BudgetedLLM:
@@ -149,6 +177,9 @@ class BudgetedLLM:
         c = self.counter
         if self.model in c.down:
             raise ModelDown(self.model, c.down[self.model])
+        if (left := c.pause_left(self.model)) > 0:
+            raise RateLimited(self.model, f"paused for {left:.0f}s more after a rate limit",
+                              left)
         if c.stopped:
             raise LLMBudgetExhausted(c.stopped)
         if c.max_calls is not None and c.calls >= c.max_calls:
@@ -156,16 +187,38 @@ class BudgetedLLM:
         c.calls += 1
         c.by_model[self.model] = c.by_model.get(self.model, 0) + 1
         try:
-            return self.inner.complete(system, user, max_output=max_output)
+            reply = self.inner.complete(system, user, max_output=max_output)
         except RequestTooLarge:   # the request, not the model: it stays up
             c.too_large[self.model] = c.too_large.get(self.model, 0) + 1
             raise
+        except EmptyReply as exc:
+            # one empty reply is this call's failure; several in a row mean the model
+            # cannot answer at its cap (run rs20261127153052 lost two models to one each)
+            c.empty[self.model] = c.empty.get(self.model, 0) + 1
+            streak = c.empty_streak[self.model] = c.empty_streak.get(self.model, 0) + 1
+            if streak >= EMPTY_REPLIES_DOWN:
+                c.down[self.model] = f"{streak} empty replies in a row: {exc.reason}"
+                raise ModelDown(self.model, c.down[self.model]) from exc
+            raise
+        except RateLimited as exc:
+            # a stated wait up to pause_max_seconds pauses the model (Groq's daily limit
+            # asked for 13 minutes in run rs20261127153052); a longer one (a daily quota)
+            # takes it out for the run
+            if exc.wait <= c.pause_max_seconds:
+                c.paused[self.model] = c.clock() + exc.wait + 1
+                c.pauses[self.model] = c.pauses.get(self.model, 0) + 1
+                log.warning("%s paused for %.0fs: %s", self.model, exc.wait + 1, exc.reason)
+                raise
+            c.down[self.model] = exc.reason
+            raise ModelDown(self.model, exc.reason) from exc
         except ModelDown as exc:
             c.down[self.model] = exc.reason
             raise
         except LLMUnavailable as exc:
             c.down[self.model] = str(exc)
             raise ModelDown(self.model, str(exc)) from exc
+        c.empty_streak[self.model] = 0
+        return reply
 
 
 class FallbackLLM:
@@ -176,7 +229,7 @@ class FallbackLLM:
         self.models = models
 
     def _live(self) -> list[BudgetedLLM]:
-        return [m for m in self.models if m.model not in m.counter.down]
+        return [m for m in self.models if m.counter.is_up(m.model)]
 
     @property
     def model(self) -> str:
@@ -184,7 +237,7 @@ class FallbackLLM:
         return (live or self.models)[0].model
 
     def complete(self, system: str, user: str, *, max_output: int = 4096) -> str:
-        tried, big = 0, 0
+        tried, big, failed = 0, 0, 0
         for m in self._live():
             tried += 1
             try:
@@ -192,11 +245,17 @@ class FallbackLLM:
             except RequestTooLarge:   # try a model with a larger limit; this one stays up
                 big += 1
                 continue
+            except CallFailed:   # empty reply or a pause: this model stays up
+                failed += 1
+                continue
             except ModelDown:
                 continue
         names = ", ".join(m.model for m in self.models)
         if tried and big == tried:
             raise RequestTooLarge(names, "too large for every model of this agent")
+        if failed or big:
+            raise CallFailed(names, "this call failed on every model of this agent "
+                                    "that is up")
         raise ModelDown(names, "every model for this agent is down")
 
 
@@ -371,13 +430,14 @@ def models_config_from_dict(sec) -> ModelsConfig:
         raise ConfigError("agents config: models.max_output must map model ids to "
                           "integers >= 256")
     pace = sec.get("pace") or {}
-    keys = {"calls_per_minute", "tokens_per_minute"}
+    keys = {"calls_per_minute", "tokens_per_minute", "output_tokens_per_minute"}
     if not isinstance(pace, dict) or not all(
             isinstance(m, str) and isinstance(v, dict) and v and set(v) <= keys
             and all(isinstance(x, int) and not isinstance(x, bool) and x >= 1 for x in v.values())
             for m, v in pace.items()):
         raise ConfigError("agents config: models.pace must map model ids to "
-                          "{calls_per_minute, tokens_per_minute} positive integers")
+                          "{calls_per_minute, tokens_per_minute, output_tokens_per_minute} "
+                          "positive integers")
     pick = sec.get("critic_pick", "balanced")
     if pick not in ("balanced", "first"):
         raise ConfigError("agents config: models.critic_pick must be balanced or first")
@@ -730,7 +790,8 @@ class ResearchRun:
         self._progress_calls = 0                  # model calls at that moment
         agents.check_models()
         self.models = agents.models
-        self.counter = CallCounter(budget.max_llm_calls)
+        self.counter = CallCounter(budget.max_llm_calls, clock=clock)
+        self._sleep = sleep
         self._llm_factory = llm_factory
         self._llms: dict[str, BudgetedLLM] = {}
         self.memory = memory
@@ -845,6 +906,10 @@ class ResearchRun:
         # (OQ-3), then decided in order (_flush)
         self.sim_queue: list[tuple[tuple, CandidateRecord, dict, bool]] = []
         self._in_flight = 0   # alphas of the current batch not decided yet (budget counts them)
+        # empty alphas tried once more with missing vector values filled (_retry_empty);
+        # they join the running batch first, else the next one
+        self.fill_queue: list[tuple[tuple, CandidateRecord, dict]] = []
+        self.empty_retries: list[dict] = []
         self._round_waves = 0  # repair waves started this round (repair.waves_per_round)
         # the round's new-alpha slots not generated yet, {arm: slots} in allocation order;
         # _run_fresh works through them, and a BRAIN slot freed mid-batch takes the next
@@ -862,6 +927,9 @@ class ResearchRun:
         self.stop_reason: str | None = None
         self.stop_requested = False        # first Ctrl-C: finish what is on BRAIN, then stop
         self.interrupts = 0                # Ctrl-C presses during run(catch_interrupt=True)
+        self.live = None                   # dashboard: live.LiveStatus (attach_live)
+        self.current_round = 0
+        self.max_rounds = None
         self.dropped_on_stop: list[str] = []   # screened alphas not sent to BRAIN after Ctrl-C
         self.resumed: list[dict] = []
         self.power_pool: list[dict] = []   # Power Pool candidates this run (recorded only)
@@ -879,6 +947,9 @@ class ResearchRun:
         self.overfitting_flags: list[dict] = []   # deflated-Sharpe misses, recorded only
         self.warm_started = self._warm_start()
         self.region_sims, self.run_regions = self._pick_regions()
+        # arms outside the rotation that may run repairs of a close lead (no new alphas)
+        self.lead_arms: set[tuple] = set()
+        self.cross_region: list[dict] = []
 
     # ------------------------------------------------------------------ setup
 
@@ -923,14 +994,14 @@ class ResearchRun:
             return None, []
         g = provider_of(key[3])
         eligible = [c for c in self.models.critic
-                    if provider_of(c) != g and c not in self.counter.down]
+                    if provider_of(c) != g and self.counter.is_up(c)]
         if self.models.critic_pick == "balanced" and eligible:
             primary = min(eligible, key=lambda c: (self.counter.by_model.get(c, 0),
                                                    eligible.index(c)))
         else:
             primary = eligible[0] if eligible else None
         shadows = ([cm for cm in self.critics
-                    if cm not in (primary, None) and cm not in self.counter.down]
+                    if cm not in (primary, None) and self.counter.is_up(cm)]
                    if self.models.shadow_critics else [])
         return primary, shadows
 
@@ -990,9 +1061,51 @@ class ResearchRun:
     def _in_run(self, key: tuple) -> bool:
         return self.run_regions is None or key[1] in self.run_regions
 
+    def _repair_ok(self, key: tuple) -> bool:
+        """The arm may run repair waves: its region is in this run, or it holds a close
+        lead from another region (``repair.cross_region_distance``)."""
+        return self._in_run(key) or key in self.lead_arms
+
     def _emit(self, text: str) -> None:
         if self.out is not None:
             print(text, file=self.out, flush=True)
+        if self.live is not None:
+            self.live.event(text)
+
+    def attach_live(self, live) -> None:
+        """Report to the dashboard: console lines, batches, BRAIN's progress, decisions and
+        ``live_state`` (live.py)."""
+        self.live = live
+        live.state = self.live_state
+        self.pipeline.live = live
+
+    def live_state(self) -> dict:
+        """The run's numbers for the dashboard's live page."""
+        c = self.counter
+        models = {}
+        for m in self.models.all_models():
+            if m in c.down:
+                st, why = "down", c.down[m]
+            elif c.pause_left(m) > 0:
+                st, why = "paused", f"{c.pause_left(m):.0f}s left"
+            else:
+                st, why = "up", None
+            models[m] = {"status": st, "reason": why, "calls": c.by_model.get(m, 0),
+                         "too_large": c.too_large.get(m, 0), "empty": c.empty.get(m, 0),
+                         "generator": m in self.models.generator}
+        quota = getattr(self.client, "quota", None)
+        quota = quota if isinstance(quota, dict) and quota else None
+        return {"round": self.current_round, "rounds": self.max_rounds,
+                "regions": self.run_regions,
+                "simulations": {"used": self.sims_used, "committed": self._committed(),
+                                "max": self.budget.max_simulations},
+                "model_calls": {"used": c.calls, "max": c.max_calls},
+                "models": models, "stop_reason": self.stop_reason,
+                "stop_requested": self.stop_requested,
+                "repair_waves_open": sum(1 for w in self.waves.values() if not w.get("done")),
+                "cross_region_leads": [i["parent"] for i in self.cross_region
+                                       if i.get("children")],
+                "brain_quota": quota}
 
     def _generator(self, key: tuple) -> AlphaGenerator:
         plan = self.arms[key]
@@ -1063,16 +1176,46 @@ class ResearchRun:
             if start is not None:
                 c, d, res, priority, _ = start
                 starts.append(({"candidate": c, "decision": d, "result": res}, parent, priority))
+        outside = []
         for row, origin, priority in roots + starts:
             c = row["candidate"]
             key = self._arm_of(c, models.get(c.candidate_id) or
                                models.get(origin["candidate"].candidate_id))
-            if key is None or not self._in_run(key):
+            if key is None:
                 continue
             dist = distance(row["decision"], row["result"], cfg.unmeasured_failure_penalty)
+            if not self._in_run(key):
+                # a close lead of a region outside the rotation (owner 2026-11-28): the
+                # closest few go on now instead of waiting for their region's turn
+                if (cfg.cross_region_distance is not None and dist is not None
+                        and dist <= cfg.cross_region_distance):
+                    outside.append((dist, c.candidate_id, key, row, priority))
+                continue
             starts_row = (float("inf") if dist is None else dist, c.candidate_id, key, row,
                           priority)
             self._resume_rows.append(starts_row)
+        outside.sort(key=lambda t: (t[0], t[1]))
+        leads = 0
+        for dist, cid, key, row, priority in outside:
+            if leads >= cfg.cross_region_leads:
+                break
+            c = row["candidate"]
+            self.lead_arms.add(key)
+            rep = self._start_wave(key, c, row["decision"], row["result"], priority)
+            item = {"parent": cid, "arm": arm_label(key), "distance": round(dist, 3),
+                    "notes": rep.notes}
+            if rep.children:
+                item["children"] = [x.candidate_id for x in rep.children]
+                item["fixes"] = [x.lever for x in rep.children]
+                leads += 1
+            else:
+                self.lead_arms.discard(key)
+            self.cross_region.append(item)
+        for i in self.cross_region:
+            if i.get("children"):
+                self._emit(f"--- close lead outside this run's regions ({i['arm'].split('/')[1]}, "
+                           f"distance {i['distance']}): {_short_id(i['parent'])}, "
+                           f"{len(i['fixes'])} fixes: {', '.join(i['fixes'])}")
         # repairs a recheck of BRAIN's late checks just decided (a PROD_CORRELATION value
         # that came hours after the simulation) go first: they are the closest leads
         fresh = {i["candidate_id"] for i in self.rechecked if i.get("decision") == "repair"}
@@ -1235,7 +1378,8 @@ class ResearchRun:
                 self.director.update(key, o.decision == "accept")
             self.rechecked.append({"candidate_id": o.candidate_id, "decision": o.decision,
                                    "failure_class": o.failure_class})
-            if start_waves and o.decision == "repair" and key is not None and self._in_run(key):
+            if start_waves and o.decision == "repair" and key is not None \
+                    and self._repair_ok(key):
                 # during a run: the repair wave starts now (at the start, _resume_repairs
                 # takes these first)
                 d = o.decision_record or (self.memory.decisions_for(o.candidate_id) or [None])[-1]
@@ -1489,8 +1633,10 @@ class ResearchRun:
 
         Open repairs and anything left unfinished are picked up at the next run's start."""
         restore = None
+        self.max_rounds = rounds
         if catch_interrupt and threading.current_thread() is threading.main_thread():
             restore = signal.signal(signal.SIGINT, self._on_interrupt)
+        finished = False
         try:
             hard = False
             try:
@@ -1509,8 +1655,14 @@ class ResearchRun:
             lessons = self._learn(use_model=not hard)
             report = self.report()   # after the Lesson Writer, so its model call is counted
             report["lessons"] = lessons
+            finished = True
+            if self.live is not None:
+                self.live.finish("stopped" if (hard or self.stop_requested) else "finished",
+                                 self.stop_reason)
             return report
         finally:
+            if self.live is not None and not finished:
+                self.live.finish("stopped", self.stop_reason or "stopped with an error")
             if restore is not None:
                 signal.signal(signal.SIGINT, restore)
 
@@ -1650,7 +1802,7 @@ class ResearchRun:
         while cap > 0 and waves < limit and progress:
             progress = False
             for key, queue in self.repair_queue.items():
-                if not queue or cap <= 0 or waves >= limit or not self._in_run(key):
+                if not queue or cap <= 0 or waves >= limit or not self._repair_ok(key):
                     continue
                 wid = self.wave_of.get(queue[0].candidate_id)
                 size = 1 if wid is None else sum(
@@ -1670,6 +1822,7 @@ class ResearchRun:
 
     def _round(self, r: int) -> None:
         self._round_waves = 0
+        self.current_round = r
         if r > 1 or not self.agents.designer.enabled:   # round 1: _design_arms did it
             self._refresh_dead()
         slots = min(self.budget.per_round, self.budget.max_simulations - self._committed())
@@ -1711,6 +1864,16 @@ class ResearchRun:
                 self.stop_reason = "simulation budget used up"
                 self._fresh_left = {}
                 return
+        if not live and (wait := self._pause_wait()) is not None:
+            # every generator model left is paused on a rate limit: wait it out, then
+            # allocate this round's new alphas again
+            self._emit(f"--- every generator model is paused on a rate limit; waiting "
+                       f"{wait:.0f}s")
+            self._sleep(wait)
+            live = self._live_arms()
+            alloc = self._allocate(slots, live) if slots > 0 and live else {}
+            entry["allocation"] = {arm_label(k): n for k, n in alloc.items()}
+            self._set_fresh(r, alloc, entry, "")
         if not live:
             self.stop_reason = "every generator model is down: " + "; ".join(
                 f"{m}: {why}" for m, why in {**self.counter.down, **self.no_fit}.items())
@@ -1762,7 +1925,7 @@ class ResearchRun:
         return alloc
 
     def _live_arms(self) -> list[tuple]:
-        return [k for k in self.arms if k[3] not in self.counter.down and self._in_run(k)
+        return [k for k in self.arms if self.counter.is_up(k[3]) and self._in_run(k)
                 and k not in self.successor and k[3] not in self.no_fit
                 and k not in self.inactive
                 and k[0] not in self.dead.get((k[1], k[4]), {})]
@@ -1794,7 +1957,7 @@ class ResearchRun:
         while self._fresh_left and not self._stalled():
             key = next(iter(self._fresh_left))
             n = self._fresh_left.pop(key)   # popped first: a flush inside may take others
-            if key[3] in self.counter.down:  # went down earlier in this pass
+            if not self.counter.is_up(key[3]):  # went down or paused earlier in this pass
                 lost += n
                 continue
             arm_log = {"arm": arm_label(key), "slots": n}
@@ -1827,7 +1990,7 @@ class ResearchRun:
                 break
             key = next(iter(self._fresh_left))
             n = self._fresh_left.pop(key)
-            if key[3] in self.counter.down:
+            if not self.counter.is_up(key[3]):
                 self._fresh_lost += n
                 continue
             arm_log = {"arm": arm_label(key), "slots": n, "fresh_mid_batch": True}
@@ -1885,6 +2048,14 @@ class ResearchRun:
         """An alpha went to BRAIN or came back from it: the loop guard's clock restarts."""
         self._progress_at = self._clock()
         self._progress_calls = self.counter.calls
+
+    def _pause_wait(self) -> float | None:
+        """Seconds until the first paused generator model may be called again, when the
+        arms of a paused model would be live then; None if no generator model is paused."""
+        left = [self.counter.pause_left(m) for m in self.models.generator
+                if m not in self.counter.down and m not in self.no_fit]
+        left = [x for x in left if x > 0]
+        return min(left) + 1 if left else None
 
     def _stalled(self) -> bool:
         """The loop guard (owner 2026-11-26, after a round looped through 9 refill passes
@@ -1957,6 +2128,11 @@ class ResearchRun:
                         continue
                     log["generation_error"] = str(exc)
                     lost = need
+                except CallFailed as exc:
+                    # an empty reply or a rate-limit pause: these slots go back to the
+                    # Director; the model stays up (it is down only after repeated failures)
+                    log["generation_error"] = str(exc)
+                    lost = need
                 except ModelDown as exc:  # the arm gets no more slots; the run goes on
                     log["generation_error"] = str(exc)
                     self._emit(f"{exc}; its arms get no more slots, these go to live arms")
@@ -2024,7 +2200,7 @@ class ResearchRun:
     def _committed(self) -> int:
         """Simulations used plus alphas queued for or running on BRAIN: what the budget
         checks count."""
-        return self.sims_used + len(self.sim_queue) + self._in_flight
+        return self.sims_used + len(self.sim_queue) + len(self.fill_queue) + self._in_flight
 
     def _simulate(self, key: tuple, cand: CandidateRecord, log: dict, *,
                   credit: bool = True) -> None:
@@ -2043,7 +2219,8 @@ class ResearchRun:
         repair wave. When a slot frees, ready repair waves are screened and added to the
         running batch (``_top_up``), within the simulation budget. A model failure in one
         repair does not stop the others' bookkeeping; the first is raised at the end."""
-        queued, self.sim_queue = self.sim_queue, []
+        fills, self.fill_queue = self.fill_queue, []
+        queued, self.sim_queue = [(k, c, lg, True) for k, c, lg in fills] + self.sim_queue, []
         if not queued:
             return
         if self.stop_requested:   # Ctrl-C: nothing new goes to BRAIN
@@ -2090,11 +2267,19 @@ class ResearchRun:
     def _top_up(self, free: int) -> list[tuple[tuple, CandidateRecord, dict]]:
         """Ready repair waves for ``free`` freed BRAIN slots (whole waves when they fit),
         screened like any repair, within the simulation budget: (arm, alpha, arm log)."""
-        cap = min(free, self.budget.max_simulations - self._committed())
+        cap = min(free, self.budget.max_simulations - self._committed() + len(self.fill_queue))
         if cap <= 0:
             return []
         out = []
-        for key, cands in (self._take_repairs(cap).items()
+        while self.fill_queue and len(out) < cap:   # empty-alpha retries first
+            out.append(self.fill_queue.pop(0))
+        fills = len(out)
+        if fills:
+            self._emit(f"--- BRAIN: {fills} empty alpha(s) again with missing values filled: "
+                       f"{', '.join(_short_id(c.candidate_id) for _, c, _ in out)}")
+        if cap - fills <= 0:
+            return out
+        for key, cands in (self._take_repairs(cap - fills).items()
                            if self.agents.repair.fill_freed_slots else ()):
             arm_log = {"arm": arm_label(key), "slots": len(cands), "repairs_mid_batch": True}
             if self.log:
@@ -2104,13 +2289,56 @@ class ResearchRun:
             for c in go[room:]:            # over budget: their place in the wave is closed
                 self._wave_done(c.candidate_id)
             out += [(key, c, arm_log) for c in go[:room]]
-        if out:
-            self._emit(f"--- BRAIN: {len(out)} repair fix(es) join the running batch: "
-                       f"{', '.join(_short_id(c.candidate_id) for _, c, _ in out)}")
+        if len(out) > fills:
+            self._emit(f"--- BRAIN: {len(out) - fills} repair fix(es) join the running batch: "
+                       f"{', '.join(_short_id(c.candidate_id) for _, c, _ in out[fills:])}")
         if len(out) < cap:   # then the round's new alphas not generated yet
             out += self._fresh_for_freed(
                 cap - len(out), self.budget.max_simulations - self._committed() - len(out))
         return out
+
+    def _retry_empty(self, key: tuple, cand: CandidateRecord, outcome,
+                     log: dict) -> CandidateRecord | None:
+        """An alpha BRAIN returned empty (no positions in any year; ``simulator.empty_alpha``)
+        goes to BRAIN once more with each vec_* part given its middle value where the vector
+        has none (``critic.nan_guarded``), as child ``<id>_n1`` (lever
+        ``fill_missing_values``). Alphas that came back with positions are never rewritten:
+        on memory the fill would have changed 74 working alphas, among them the submitted
+        CHN breadth blend. Returns the queued child, or None."""
+        r = outcome.result
+        if r is None or r.status != "failed" or cand.lever == FILL_LEVER \
+                or self.stop_requested \
+                or not any(str(n).startswith(EMPTY_ALPHA) for n in r.notes):
+            return None
+        expression, filled, unfixed = nan_guarded(cand.expression)
+        note = {"candidate_id": cand.candidate_id, "filled": filled, "unfilled": unfixed}
+        if not filled:
+            note["status"] = "no vec_* part to fill"
+            self.empty_retries.append(note)
+            return None
+        fields = catalog_for(self._mtyped, self._typed, cand.region, cand.delay)
+        if not analyze(expression, self.spec, datafields=fields,
+                       limits=self.generator_config.limits).ok:
+            note["status"] = "filled expression not valid"
+            self.empty_retries.append(note)
+            return None
+        child = assign_lineage(dataclasses.replace(cand, expression=expression), cand,
+                               lever=FILL_LEVER)
+        child = dataclasses.replace(child, candidate_id=f"{cand.candidate_id}_n1",
+                                    hypothesis=f"{cand.hypothesis} [missing values filled: "
+                                               f"{', '.join(filled)}]")
+        try:
+            child.validate()
+        except SchemaError as exc:
+            note["status"] = f"invalid: {exc}"
+            self.empty_retries.append(note)
+            return None
+        note.update(status="queued", child=child.candidate_id)
+        self.empty_retries.append(note)
+        self.fill_queue.append((key, child, log))
+        self._emit(f"  {_short_id(cand.candidate_id)}: BRAIN held no positions (empty alpha); "
+                   f"queued once more with missing values filled ({', '.join(filled)})")
+        return child
 
     def _after_simulation(self, key: tuple, cand: CandidateRecord, log: dict, credit: bool,
                           outcome) -> None:
@@ -2145,6 +2373,10 @@ class ResearchRun:
                 item["blend_flag"] = bflag
                 self.blend_flags.append({"candidate_id": cand.candidate_id, "flag": bflag})
                 self._emit(f"  flag: {_short_id(cand.candidate_id)}: {bflag}")
+        retry = self._retry_empty(key, cand, outcome, log)
+        if retry is not None:
+            item["empty_retry"] = retry.candidate_id
+            credit = False   # an expression bug, not the arm's idea: the retry is credited
         in_wave = cand.candidate_id in self.wave_of
         if outcome.decision in DECIDED and credit and not in_wave:  # a wave: one credit at its end
             self.director.update(self._current(key), outcome.decision == "accept")
@@ -2228,7 +2460,7 @@ class ResearchRun:
         # least crowded (dataset, market) first, so the cap keeps those (BRAIN's tip for
         # production correlation, 2026-11-25); the hypotheses' order breaks ties
         markets.sort(key=lambda m: dataset_appeal(facts.get((m[1], m[2]), {}).get(m[0])))
-        models = [m for m in self.models.generator if m not in self.counter.down]
+        models = [m for m in self.models.generator if m not in self.counter.down]  # paused ok
         picks = [(*mk, models[(i + p) % len(models)]) for p in range(len(models))
                  for i, mk in enumerate(markets)] if models else []
         for ds, region, delay, plan, model in picks[:self.agents.strategy.max_new_arms]:
@@ -2269,6 +2501,7 @@ class ResearchRun:
             "run_id": self.run_id,
             "stop_reason": self.stop_reason,
             "dropped_on_stop": self.dropped_on_stop,
+            "empty_retries": self.empty_retries,
             # BRAIN's daily simulation limit after the last submit (X-Ratelimit-* headers)
             "brain_quota": dict(getattr(self.client, "quota", None) or {}),
             "power_pool_candidates": self.power_pool,
@@ -2284,6 +2517,8 @@ class ResearchRun:
             # calls refused as too large per model, and what the size client measured
             # (characters per token, largest prompt) for models with a per-minute token limit
             "too_large_calls": dict(self.counter.too_large),
+            "empty_replies": dict(self.counter.empty),
+            "rate_limit_pauses": dict(self.counter.pauses),
             "generator_field_cap": dict(self.field_cap),
             "generator_no_fit": dict(self.no_fit),
             "prompt_tokens": self.token_stats(),
@@ -2306,6 +2541,7 @@ class ResearchRun:
             "reevaluated": self.reevaluated,
             "rechecked_pending": self.rechecked,
             "resumed_repairs": self.resumed,
+            "cross_region_leads": self.cross_region,
             "repair_waves": self.wave_log,
             "overfitting_flags": self.overfitting_flags,
             "seeds": self.seed_notes,

@@ -144,3 +144,58 @@ def test_without_rotation_every_region_is_in_the_run(memory, config, playbook):
     run = rotating_run(memory, config, playbook, k=None)
     assert run.run_regions is None
     assert rotating_run(memory, config, playbook, k=4).run_regions is None
+
+
+def _lead(memory, candidate, cid, region, tvr):
+    from alpha_research.schemas import DecisionRecord, GateResult
+    universe, neut = MARKETS[region]
+    memory.put_candidate(candidate(candidate_id=cid, region=region, universe=universe,
+                                   neutralization=neut, decay=4,
+                                   expression=f"rank(ts_zscore(volume, {len(cid) + 3}))",
+                                   prompt_version="gen-v17", model="claude-test"))
+    memory.put_result(ResultRecord(cid, "complete", sharpe=1.7, turnover=tvr))
+    memory.put_decision(DecisionRecord(cid, "repair", "turnover", gate_results=[
+        GateResult("turnover_range", False, tvr, (0.01, 0.7), "")]))
+
+
+def test_a_close_lead_outside_the_rotation_is_resumed(memory, config, playbook, candidate):
+    # owner 2026-11-28: an IND lead at distance 0.13 waited two days for IND's turn
+    from alpha_research.lever_stats import distance
+    _lead(memory, candidate, "chn_near", "CHN", 0.75)
+    _lead(memory, candidate, "jpn_far", "JPN", 2.0)
+    run = rotating_run(memory, config, playbook)
+    assert set(run.run_regions) == {"USA", "EUR"}
+    d = {o["candidate"].candidate_id: distance(o["decision"], o["result"])
+         for o in memory.candidate_outcomes()}
+    assert d["chn_near"] < d["jpn_far"]
+    cut = (d["chn_near"] + d["jpn_far"]) / 2
+    run.agents = dataclasses.replace(run.agents, repair=dataclasses.replace(
+        run.agents.repair, cross_region_distance=cut, cross_region_leads=2))
+    run._resume_repairs()
+    assert [i["parent"] for i in run.cross_region] == ["chn_near"]
+    assert run.cross_region[0]["children"]
+    chn = next(k for k in run.lead_arms)
+    assert chn[1] == "CHN" and not run._in_run(chn) and run._repair_ok(chn)
+    taken = run._take_repairs(10)
+    assert chn in taken                                      # its wave can go to BRAIN
+    assert chn not in run._live_arms()                       # but no new alphas there
+
+
+def test_cross_region_leads_can_be_switched_off(memory, config, playbook, candidate):
+    _lead(memory, candidate, "chn_near", "CHN", 0.75)
+    run = rotating_run(memory, config, playbook)
+    run.agents = dataclasses.replace(run.agents, repair=dataclasses.replace(
+        run.agents.repair, cross_region_distance=10.0, cross_region_leads=0))
+    run._resume_repairs()
+    assert run.cross_region == [] and run.lead_arms == set()
+
+
+def test_cross_region_settings_load():
+    raw = yaml.safe_load((ROOT / "config" / "agents.yaml").read_text())
+    rep = agents_config_from_dict(raw).repair
+    assert rep.cross_region_distance == 0.15 and rep.cross_region_leads == 2
+    raw["repair"]["cross_region_distance"] = None
+    assert agents_config_from_dict(raw).repair.cross_region_distance is None
+    raw["repair"]["cross_region_leads"] = -1
+    with pytest.raises(ConfigError, match="cross_region_leads"):
+        agents_config_from_dict(raw)

@@ -170,7 +170,14 @@ class ModelDown(LLMUnavailable):
         self.reason = reason
 
 
-class RequestTooLarge(ModelDown):
+class CallFailed(ModelDown):
+    """One call failed for a reason that is not the model being out for the run: the
+    request did not fit (RequestTooLarge), the reply was empty (EmptyReply), or the host
+    asked for a pause (RateLimited). Agents fall back for this call, a FallbackLLM tries
+    its next model, and BudgetedLLM does not mark the model down for it (see there)."""
+
+
+class RequestTooLarge(CallFailed):
     """A request larger than the model's per-minute token limit (the host's HTTP 413, or our
     own check before sending). The model works; the request does not fit. Callers treat it
     as ModelDown for this one call (agents fall back to their rules, a FallbackLLM tries the
@@ -184,6 +191,30 @@ class RequestTooLarge(ModelDown):
         LLMUnavailable.__init__(self, f"{model}: request too large: {reason}")
         self.model, self.reason = model, f"request too large: {reason}"
         self.requested, self.limit, self.input_only = requested, limit, input_only
+        self.output_only = False
+
+
+class EmptyReply(CallFailed):
+    """The model replied with no text (a reasoning model that thought until its output cap
+    ran out: finish_reason length). Run rs20261127153052 lost Nemotron Lightning and Ernie
+    for the rest of the run to one empty reply each; now the call fails, OutputCapClient
+    retries once with a larger cap, and BudgetedLLM marks the model down only after
+    EMPTY_REPLIES_DOWN empty replies in a row. ``at_cap``: the reply stopped on the cap."""
+
+    def __init__(self, model: str, reason: str, at_cap: bool = False):
+        LLMUnavailable.__init__(self, f"{model}: {reason}")
+        self.model, self.reason, self.at_cap = model, reason, at_cap
+
+
+class RateLimited(CallFailed):
+    """HTTP 429 with a stated wait longer than RATE_LIMIT_MAX_WAIT_SECONDS (``wait``
+    seconds). BudgetedLLM pauses the model for that long when the wait is short enough
+    (Groq's tokens-per-day limit asked for 13 minutes in run rs20261127153052 and took
+    gpt-oss out for the rest of it), else marks it down (Gemini's daily quota: 16 hours)."""
+
+    def __init__(self, model: str, reason: str, wait: float):
+        LLMUnavailable.__init__(self, f"{model}: {reason}")
+        self.model, self.reason, self.wait = model, reason, wait
 
 
 _TOO_LARGE_RE = re.compile(r"Limit (\d+), Requested (\d+)")
@@ -191,14 +222,29 @@ _TOO_LARGE_RE = re.compile(r"Limit (\d+), Requested (\d+)")
 
 def too_large(model: str, status: int, msg: str | None) -> RequestTooLarge | None:
     """A RequestTooLarge for a host's HTTP 413 reply (Groq: "... tokens per minute (TPM):
-    Limit 8000, Requested 11002"), else None."""
-    if status != 413:
+    Limit 8000, Requested 11002"), or a 429 that says the request is too large (Groq's
+    output tokens per minute: "Request too large ... (OTPM): Limit 1000, Requested 1371",
+    run rs20261127153052), else None. ``output_only``: the limit is on the output cap."""
+    text = msg or ""
+    if status != 413 and not (status == 429 and "too large" in text.lower()):
         return None
-    m = _TOO_LARGE_RE.search(msg or "")
-    return RequestTooLarge(model, msg or "HTTP 413",
-                           requested=int(m.group(2)) if m else None,
-                           limit=int(m.group(1)) if m else None,
-                           input_only="ITPM" in (msg or "") or "input tokens" in (msg or ""))
+    m = _TOO_LARGE_RE.search(text)
+    exc = RequestTooLarge(model, msg or f"HTTP {status}",
+                          requested=int(m.group(2)) if m else None,
+                          limit=int(m.group(1)) if m else None,
+                          input_only="ITPM" in text or "input tokens" in text)
+    exc.output_only = "OTPM" in text or "output tokens" in text
+    return exc
+
+
+def _rate_limited(model: str, status: int, data, raw: bytes, msg: str | None):
+    """A RateLimited for a 429 that states its wait, else None."""
+    if status != 429:
+        return None
+    wait = rate_limit_wait(data, raw)
+    if wait is None:
+        return None
+    return RateLimited(model, f"model call failed: HTTP 429: {msg or 'no message'}", wait)
 
 
 class LLMClient(Protocol):
@@ -250,7 +296,7 @@ class AnthropicLLMClient:
             raise LLMUnavailable(f"model call failed: {type(exc).__name__}: {exc}") from exc
         text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
         if not text.strip():
-            raise LLMUnavailable("model returned an empty reply")
+            raise EmptyReply(self.model, "model returned an empty reply")
         return text
 
 
@@ -320,7 +366,8 @@ def _post_json(transport: Transport, sleep: Callable[[float], None], url: str, b
             data = json.loads(raw) if raw else {}
         except (json.JSONDecodeError, UnicodeDecodeError):
             data = {}
-        if status == 429 and rate_limited < RATE_LIMIT_RETRIES:
+        too_big = status == 429 and b"too large" in (raw or b"")[:2000].lower()
+        if status == 429 and rate_limited < RATE_LIMIT_RETRIES and not too_big:
             wait = rate_limit_wait(data, raw)
             if wait is None and not unstated_retried:
                 unstated_retried = True
@@ -369,6 +416,9 @@ class GeminiLLMClient:
                                        self._timeout, self.model)
         if status != 200:
             msg = (data.get("error") or {}).get("message") if isinstance(data, dict) else None
+            paused = _rate_limited(self.model, status, data, raw, msg)
+            if paused is not None:
+                raise paused
             raise LLMUnavailable(f"model call failed: HTTP {status}: {msg or 'no message'}")
         usage = (data.get("usageMetadata") or {}) if isinstance(data, dict) else {}
         self.last_usage = usage.get("totalTokenCount")
@@ -385,7 +435,8 @@ class GeminiLLMClient:
             finish = first.get("finishReason")
             hint = ("; thinking used the whole output cap, raise this model's cap in "
                     "models.max_output in config/agents.yaml" if finish == "MAX_TOKENS" else "")
-            raise LLMUnavailable(f"model returned an empty reply (finishReason {finish}){hint}")
+            raise EmptyReply(self.model, f"model returned an empty reply (finishReason "
+                             f"{finish}){hint}", at_cap=finish == "MAX_TOKENS")
         return text
 
 
@@ -433,6 +484,9 @@ class ChatCompletionsLLMClient:
             big = too_large(self.model, status, msg)
             if big is not None:
                 raise big
+            paused = _rate_limited(self.model, status, data, raw, msg)
+            if paused is not None:
+                raise paused
             raise LLMUnavailable(f"model call failed: HTTP {status}: {msg or 'no message'}")
         usage = (data.get("usage") or {}) if isinstance(data, dict) else {}
         self.last_usage = usage.get("total_tokens")   # what the host counts, reasoning included
@@ -446,7 +500,8 @@ class ChatCompletionsLLMClient:
             finish = first.get("finish_reason")
             hint = ("; reasoning used the whole output cap, raise this model's cap in "
                     "models.max_output in config/agents.yaml" if finish == "length" else "")
-            raise LLMUnavailable(f"model returned an empty reply (finish_reason {finish}){hint}")
+            raise EmptyReply(self.model, f"model returned an empty reply (finish_reason "
+                             f"{finish}){hint}", at_cap=finish == "length")
         return text
 
 
@@ -490,18 +545,41 @@ class OutputCapClient:
     for: reasoning models spend part of the cap thinking, so they need a larger one than
     the agents' default (``models.max_output`` in config/agents.yaml)."""
 
-    def __init__(self, inner: LLMClient, max_output: int):
+    def __init__(self, inner: LLMClient, max_output: int,
+                 retry_max_output: int | None = None):
         self.inner = inner
         self.max_output = max_output
+        # one retry at a larger cap when the reply came back empty at the cap
+        self.retry_max_output = (min(2 * max_output, EMPTY_RETRY_MAX_OUTPUT)
+                                 if retry_max_output is None else retry_max_output)
         self.model = inner.model
         self.provider = getattr(inner, "provider", provider_of(inner.model))
 
     def complete(self, system: str, user: str, *, max_output: int = 4096) -> str:
-        return self.inner.complete(system, user, max_output=self.max_output)
+        try:
+            return self.inner.complete(system, user, max_output=self.max_output)
+        except EmptyReply as exc:
+            if not exc.at_cap or self.retry_max_output <= self.max_output:
+                raise
+            log.warning("%s: empty reply at its %d-token cap; retrying once with %d",
+                        self.model, self.max_output, self.retry_max_output)
+            try:
+                return self.inner.complete(system, user, max_output=self.retry_max_output)
+            except EmptyReply:
+                raise
+            except CallFailed:
+                raise
+            except LLMUnavailable as again:   # e.g. the host refuses so large a cap
+                raise EmptyReply(self.model, f"{exc.reason}; retry at "
+                                 f"{self.retry_max_output} failed: {again}") from again
 
     @property
     def last_usage(self):
         return getattr(self.inner, "last_usage", None)
+
+    @property
+    def last_prompt_tokens(self):
+        return getattr(self.inner, "last_prompt_tokens", None)
 
 
 class RequestFitClient:
@@ -519,9 +597,9 @@ class RequestFitClient:
     whose numbers show the prompt fits with a smaller cap is retried once with that cap.
     ``stats()`` reports what was measured."""
 
-    def __init__(self, inner: LLMClient, tokens_per_minute: int, *,
+    def __init__(self, inner: LLMClient, tokens_per_minute: int | None, *,
                  chars_per_token: float = 3.3, margin: int = 200, min_output: int = 1024,
-                 min_measure: int = 500):
+                 min_measure: int = 500, output_tokens_per_minute: int | None = None):
         self.inner = inner
         self.model = inner.model
         self.provider = getattr(inner, "provider", provider_of(inner.model))
@@ -531,6 +609,9 @@ class RequestFitClient:
         self.measured: float | None = None      # smallest measured characters per token
         self.max_prompt_tokens: int | None = None
         self.refused = 0
+        # largest output cap the host accepts (Groq's OTPM: configured in models.pace, or
+        # learned from its "Request too large ... (OTPM): Limit L" reply)
+        self.output_limit = output_tokens_per_minute
 
     @property
     def ratio(self) -> float:
@@ -540,8 +621,13 @@ class RequestFitClient:
         return int((len(system) + len(user)) / self.ratio) + 1
 
     def fit(self, system: str, user: str, max_output: int) -> int:
-        room = self.tokens_per_minute - self.estimate(system, user) - self.margin
-        return max(min(max_output, room), min(max_output, self.min_output))
+        cap = max_output
+        if self.tokens_per_minute is not None:
+            room = self.tokens_per_minute - self.estimate(system, user) - self.margin
+            cap = max(min(max_output, room), min(max_output, self.min_output))
+        if self.output_limit is not None:
+            cap = min(cap, self.output_limit)
+        return cap
 
     def _measure(self, chars: int, tokens) -> None:
         if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < self.min_measure:
@@ -553,7 +639,7 @@ class RequestFitClient:
     def complete(self, system: str, user: str, *, max_output: int = 4096) -> str:
         chars = len(system) + len(user)
         cap = self.fit(system, user, max_output)
-        if self.measured is not None:
+        if self.measured is not None and self.tokens_per_minute is not None:
             need = self.estimate(system, user) + min(max_output, self.min_output) + self.margin
             if need > self.tokens_per_minute:
                 self.refused += 1
@@ -562,13 +648,27 @@ class RequestFitClient:
                                       f"does not fit {self.tokens_per_minute} tokens a minute",
                                       requested=need, limit=self.tokens_per_minute)
         if cap < max_output:
-            log.info("%s: output cap %d -> %d so the request fits its %d tokens a minute",
-                     self.model, max_output, cap, self.tokens_per_minute)
+            log.info("%s: output cap %d -> %d so the request fits its per-minute limits",
+                     self.model, max_output, cap)
         try:
             reply = self.inner.complete(system, user, max_output=cap)
         except RequestTooLarge as exc:
             self.refused += 1
             if exc.requested is None:
+                raise
+            if exc.output_only:
+                # the host limits the output cap itself: remember it, retry once under it
+                limit = exc.limit
+                if not limit or limit >= cap or limit < 256:
+                    raise
+                self.output_limit = limit
+                log.warning("%s: output cap %d refused (limit %d); retrying with %d",
+                            self.model, cap, limit, limit)
+                cap = limit
+                reply = self.inner.complete(system, user, max_output=cap)
+                self._measure(chars, getattr(self.inner, "last_prompt_tokens", None))
+                return reply
+            if self.tokens_per_minute is None:
                 raise
             prompt = exc.requested if exc.input_only else exc.requested - cap
             self._measure(chars, prompt)
@@ -586,8 +686,7 @@ class RequestFitClient:
             if cap < max_output and "empty reply" in str(exc):
                 self.refused += 1
                 raise RequestTooLarge(self.model, f"output cap lowered to {cap} (from "
-                                      f"{max_output}) so the prompt fits "
-                                      f"{self.tokens_per_minute} tokens a minute, and the "
+                                      f"{max_output}) to fit the per-minute limits, and the "
                                       f"reply was empty: {exc}") from exc
             raise
         self._measure(chars, getattr(self.inner, "last_prompt_tokens", None))
@@ -595,12 +694,17 @@ class RequestFitClient:
 
     def stats(self) -> dict:
         return {"tokens_per_minute": self.tokens_per_minute,
+                "output_limit": self.output_limit,
                 "chars_per_token": None if self.measured is None else round(self.measured, 2),
                 "max_prompt_tokens": self.max_prompt_tokens, "refused": self.refused}
 
     @property
     def last_usage(self):
         return getattr(self.inner, "last_usage", None)
+
+    @property
+    def last_prompt_tokens(self):
+        return getattr(self.inner, "last_prompt_tokens", None)
 
 
 class PacedClient:
@@ -614,25 +718,30 @@ class PacedClient:
     def __init__(self, inner: LLMClient, calls_per_minute: int | None = None,
                  tokens_per_minute: int | None = None, *,
                  clock: Callable[[], float] = time.monotonic,
-                 sleep: Callable[[float], None] = time.sleep, window: float = 60.0):
+                 sleep: Callable[[float], None] = time.sleep, window: float = 60.0,
+                 output_tokens_per_minute: int | None = None):
         self.inner = inner
         self.model = inner.model
         self.provider = getattr(inner, "provider", provider_of(inner.model))
         self.calls_per_minute = calls_per_minute
         self.tokens_per_minute = tokens_per_minute
+        self.output_tokens_per_minute = output_tokens_per_minute
         self._clock, self._sleep, self._window = clock, sleep, window
-        self._log: list[tuple[float, int]] = []   # (time sent, tokens)
+        self._log: list[tuple[float, int, int]] = []   # (time sent, tokens, output tokens)
         self._reply_tokens = 1500.0               # running estimate of a reply's size
 
-    def _room(self, est: int) -> float:
-        """Seconds to wait before a call of ``est`` tokens fits (0 = send now)."""
+    def _room(self, est: int, est_out: int = 0) -> float:
+        """Seconds to wait before a call of ``est`` tokens (``est_out`` of them output)
+        fits (0 = send now)."""
         now = self._clock()
-        self._log = [(t, n) for t, n in self._log if now - t < self._window]
+        self._log = [e for e in self._log if now - e[0] < self._window]
         if not self._log:
             return 0.0
         full = ((self.calls_per_minute is not None and len(self._log) >= self.calls_per_minute)
                 or (self.tokens_per_minute is not None
-                    and sum(n for _, n in self._log) + est > self.tokens_per_minute))
+                    and sum(e[1] for e in self._log) + est > self.tokens_per_minute)
+                or (self.output_tokens_per_minute is not None
+                    and sum(e[2] for e in self._log) + est_out > self.output_tokens_per_minute))
         if not full:
             return 0.0
         return max(0.5, self._log[0][0] + self._window - now + 0.5)
@@ -640,8 +749,10 @@ class PacedClient:
     def complete(self, system: str, user: str, *, max_output: int = 4096) -> str:
         prompt = (len(system) + len(user)) // 4
         est = prompt + int(self._reply_tokens)
+        est_out = (min(max_output, self.output_tokens_per_minute)
+                   if self.output_tokens_per_minute is not None else 0)
         waited = 0.0
-        while (wait := self._room(est)) > 0:
+        while (wait := self._room(est, est_out)) > 0:
             if not waited:
                 log.warning("%s: pacing to its free-tier limit; waiting %.0fs", self.model, wait)
             self._sleep(wait)
@@ -651,9 +762,14 @@ class PacedClient:
         used = getattr(self.inner, "last_usage", None)
         if not isinstance(used, int) or used <= 0:
             used = prompt + len(reply) // 4
+        sent_prompt = getattr(self.inner, "last_prompt_tokens", None)
+        out = used - (sent_prompt if isinstance(sent_prompt, int) else prompt)
         self._reply_tokens = 0.7 * self._reply_tokens + 0.3 * max(used - prompt, 0)
-        self._log.append((sent, used))
+        self._log.append((sent, used, max(out, 0)))
         return reply
+
+
+EMPTY_RETRY_MAX_OUTPUT = 32768   # largest cap OutputCapClient retries an empty reply with
 
 
 def make_real_client(model: str, max_output: int | None = None,
@@ -662,13 +778,16 @@ def make_real_client(model: str, max_output: int | None = None,
     call's output cap, ``pace`` ({calls_per_minute, tokens_per_minute}) paces its calls.
     Kept here so no other module has to name a provider."""
     client = _real_client(model)
-    if pace and pace.get("tokens_per_minute"):   # innermost: no wrapper may raise the cap again
-        client = RequestFitClient(client, pace["tokens_per_minute"])
+    if pace and (pace.get("tokens_per_minute") or pace.get("output_tokens_per_minute")):
+        # innermost: no wrapper may raise the cap again
+        client = RequestFitClient(client, pace.get("tokens_per_minute"),
+                                  output_tokens_per_minute=pace.get("output_tokens_per_minute"))
     if max_output:
         client = OutputCapClient(client, max_output)
     if pace:
         client = PacedClient(client, pace.get("calls_per_minute"),
-                             pace.get("tokens_per_minute"))
+                             pace.get("tokens_per_minute"),
+                             output_tokens_per_minute=pace.get("output_tokens_per_minute"))
     return client
 
 

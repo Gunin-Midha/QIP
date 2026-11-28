@@ -27,7 +27,7 @@ PROMPT_VERSIONS = {
     "prefilter": "prefilter-v3",
     "critic": "critic-v6",
     "judge": "judge-v4",
-    "repair": "repair-v11",
+    "repair": "repair-v12",
     "strategy": "strategy-v7",
     "lessons": "lessons-v3",
     "blend_plan": "blend-v2",
@@ -402,6 +402,9 @@ CLASS_MEANING = {
     "prod_correlation": "PnL too correlated with BRAIN's production alphas (not visible to us)",
     "recent_sharpe": "Sharpe of the last in-sample years below the limit: the signal faded",
     "sub_universe": "too little Sharpe in the more liquid sub-universe",
+    "investability": ("too little Sharpe once BRAIN's trading limits apply (investability-"
+                      "constrained Sharpe below its share of the alpha's own Sharpe): the "
+                      "alpha trades too fast for the names it holds; slow it down"),
     "concentration": "too much weight in a few stocks",
     "drawdown": "drawdown too deep",
 }

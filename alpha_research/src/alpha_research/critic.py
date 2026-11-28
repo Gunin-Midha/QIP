@@ -231,6 +231,167 @@ def backfilled(expression: str, names: Collection[str], lookback: int) -> str:
     return render(out)
 
 
+# ---------------------------------------------------------------------------
+# missing vector values (empty-alpha guard)
+# ---------------------------------------------------------------------------
+
+_RANK_LIKE = ("rank", "group_rank", "ts_rank")                  # in [0, 1], median 0.5
+_CENTRED = ("zscore", "group_zscore", "ts_zscore", "normalize", "group_neutralize")  # mean 0
+_ARITH_CALLS = {"add": "+", "subtract": "-", "multiply": "*"}
+
+
+def _is_const(node) -> bool:
+    return isinstance(node, Num) or (isinstance(node, Unary) and isinstance(node.operand, Num))
+
+
+def _guarded(node) -> bool:
+    """``if_else(is_nan(...), ...)``: the author already chose a value for missing data."""
+    return isinstance(node, Call) and node.name == "if_else" and bool(node.args) \
+        and _has_call(node.args[0], ("is_nan",))
+
+
+def _has_call(node, names) -> bool:
+    if isinstance(node, Call):
+        return node.name in names or any(_has_call(a, names) for a in
+                                         (*node.args, *(v for _, v in node.kwargs)))
+    return any(_has_call(getattr(node, a), names) for a in ("operand", "left", "right")
+               if getattr(node, a, None) is not None and not isinstance(getattr(node, a), str))
+
+
+def _vector_fields(node, env: dict) -> set:
+    """Fields read through a vec_* call under ``node`` with no is_nan fill around them
+    (variables resolved through ``env``: name -> such fields)."""
+    if _guarded(node):
+        return set()
+    if isinstance(node, Name):
+        return set(env.get(node.name, ()))
+    if isinstance(node, Call):
+        out = set()
+        if node.name.startswith("vec_"):
+            out |= {a.name for a in node.args if isinstance(a, Name) and a.name not in env}
+        for a in (*node.args, *(v for _, v in node.kwargs)):
+            out |= _vector_fields(a, env)
+        return out
+    out = set()
+    for a in ("operand", "left", "right"):
+        child = getattr(node, a, None)
+        if child is not None and not isinstance(child, str):
+            out |= _vector_fields(child, env)
+    return out
+
+
+def _neutral(node, values: dict) -> str | None:
+    """The value a part takes for a stock with no data: the median of a rank, the mean of a
+    z-score; None when its scale is unknown (then no fill is written)."""
+    if isinstance(node, Name) and node.name in values:
+        return _neutral(values[node.name], values)
+    if isinstance(node, Call):
+        if node.name in _RANK_LIKE:
+            return "0.5"
+        if node.name in _CENTRED:
+            return "0"
+    return None
+
+
+def _fill_part(part, values: dict, product: bool):
+    """``part`` with its core (constant factors and a minus sign stripped) wrapped in
+    if_else(is_nan(core), neutral, core), or None when no neutral value is known (a zero
+    in a product would remove the other factors as surely as NaN)."""
+    if isinstance(part, Unary) and part.op == "-":
+        inner = _fill_part(part.operand, values, product)
+        return None if inner is None else Unary("-", inner)
+    if isinstance(part, Binary) and part.op == "*":
+        if _is_const(part.left):
+            inner = _fill_part(part.right, values, product)
+            return None if inner is None else Binary("*", part.left, inner)
+        if _is_const(part.right):
+            inner = _fill_part(part.left, values, product)
+            return None if inner is None else Binary("*", inner, part.right)
+    if isinstance(part, Call) and part.name == "multiply" and len(part.args) == 2:
+        for i in (0, 1):
+            if _is_const(part.args[i]):
+                inner = _fill_part(part.args[1 - i], values, product)
+                if inner is None:
+                    return None
+                args = list(part.args)
+                args[1 - i] = inner
+                return Call("multiply", tuple(args), part.kwargs)
+    neutral = _neutral(part, values)
+    if neutral is None or (product and neutral == "0"):
+        return None
+    return Call("if_else", (Call("is_nan", (part,), ()), Num(neutral), part), ())
+
+
+def nan_guarded(expression: str) -> tuple[str, list[str], list[str]]:
+    """Give every vec_* part that is added to or multiplied with another signal a value for
+    stocks the vector does not cover. NaN + x is NaN, so one unfilled part blanks the whole
+    alpha wherever it is missing; BRAIN then holds no positions at all (4 empty alphas in
+    memory, IND and CHN, 2026-11-27; their catalog coverage said 0.69-1.0). The filled
+    value is the part's own middle (0.5 for a rank, 0 for a z-score), so the other parts
+    trade alone where the vector has no value, as in repair_agent.build_blend.
+
+    Returns (expression, fields filled, fields left unfilled because the part's scale is
+    unknown). The expression is unchanged when nothing was filled."""
+    try:
+        stmts = parse(expression)
+    except FastExprError:
+        return expression, [], []
+    env: dict[str, set] = {}       # variable -> unfilled vector fields it carries
+    values: dict[str, object] = {}  # variable -> its expression (for the neutral value)
+    filled: list[str] = []
+    unfixed: list[str] = []
+
+    def walk(node):
+        if isinstance(node, Call):
+            node = Call(node.name, tuple(walk(a) for a in node.args),
+                        tuple((k, walk(v)) for k, v in node.kwargs))
+            if node.name in _ARITH_CALLS and len(node.args) >= 2 and not node.kwargs:
+                args = fix(list(node.args), node.name == "multiply")
+                node = Call(node.name, tuple(args), node.kwargs)
+            return node
+        if isinstance(node, Unary):
+            return Unary(node.op, walk(node.operand))
+        if isinstance(node, Binary):
+            node = Binary(node.op, walk(node.left), walk(node.right))
+            if node.op in ("+", "-", "*"):
+                left, right = fix([node.left, node.right], node.op == "*")
+                node = Binary(node.op, left, right)
+            return node
+        return node
+
+    def fix(parts: list, product: bool) -> list:
+        tainted = [_vector_fields(p, env) for p in parts]
+        if not any(tainted) or not any(not t and not _is_const(p)
+                                       for p, t in zip(parts, tainted)):
+            return parts   # no vector part, or nothing else that a NaN would blank
+        out = []
+        for p, t in zip(parts, tainted):
+            if not t:
+                out.append(p)
+                continue
+            new = _fill_part(p, values, product)
+            if new is None:
+                unfixed.extend(sorted(t - set(unfixed)))
+                out.append(p)
+            else:
+                filled.extend(sorted(t - set(filled)))
+                out.append(new)
+        return out
+
+    new_stmts = []
+    for st in stmts:
+        if isinstance(st, Assign):
+            value = walk(st.value)
+            env[st.name] = _vector_fields(value, env)
+            values[st.name] = value
+            new_stmts.append(Assign(st.name, value))
+        else:
+            new_stmts.append(walk(st))
+    if not filled:
+        return expression, [], unfixed
+    return render(tuple(new_stmts)), filled, [f for f in unfixed if f not in filled]
+
+
 PRICE_ONLY_ISSUE = ("reads only price/volume data: such signals are the most common "
                     "production alphas and tend to fail PROD_CORRELATION; a part from another "
                     "dataset (analyst, fundamental, model) at about equal weight lowers it")

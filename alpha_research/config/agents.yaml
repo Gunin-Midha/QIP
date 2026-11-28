@@ -136,6 +136,11 @@ repair:
   examples_in_prompt: 3            # past repairs that worked, shown to the repair model
   resume_from_memory: true         # at start, re-repair parents whose child was never simulated
   max_resume: 3                    # ... at most this many, closest to accept first (repairs a recheck just decided first)
+  # close leads of regions outside this run's rotation are resumed anyway (owner 2026-11-28:
+  # an IND alpha at distance 0.13 waited two days for IND's turn); their arms take repairs
+  # only, no new alphas. null distance or 0 leads = off
+  cross_region_distance: 0.15
+  cross_region_leads: 2
   recheck_every_rounds: 2          # alphas waiting on BRAIN's late checks (PROD_CORRELATION) fetched again every 2 rounds; a new repair starts its wave at once (0 = run start only)
   max_share_per_round: 1.0         # queued repairs take up to this share of a round's slots first
   # Repair waves (owner 2026-11-23): a near miss gets fixes_per_wave different fixes (one
@@ -323,6 +328,11 @@ models:
   # 8,000 tokens a minute for gpt-oss, 7,000 for Qwen; Gemini free Flash about 10 calls a
   # minute; OpenRouter free models 20 calls a minute): check console.groq.com (Settings ->
   # Limits) and aistudio.google.com/rate-limit, and lower a value if 429s still appear.
+  # Keys: calls_per_minute, tokens_per_minute, output_tokens_per_minute (Groq's OTPM; the
+  # output cap is kept under it; also learned from the host's "Request too large ... (OTPM)"
+  # reply, run rs20261127153052). A 429 that asks to wait at most 30 min pauses the model
+  # (research.PAUSE_MAX_SECONDS), longer takes it out for the run; an empty reply is retried
+  # once at twice the cap and takes the model out only after 3 in a row.
   pace:
     groq:gpt-oss-120b: {calls_per_minute: 30, tokens_per_minute: 8000}
     groq:qwen/qwen3.8-27b: {calls_per_minute: 30, tokens_per_minute: 7000}

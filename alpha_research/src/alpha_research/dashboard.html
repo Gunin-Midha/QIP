@@ -1,0 +1,714 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QIP Alpha Research</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+:root {
+  --bg: #111217; --panel: #181b1f; --panel2: #22252b; --border: rgba(204,204,220,0.12);
+  --border-strong: rgba(204,204,220,0.2); --text: #ccccdc; --text-weak: rgba(204,204,220,0.65);
+  --text-faint: rgba(204,204,220,0.45); --green: #73bf69; --yellow: #fade2a; --red: #f2495c;
+  --orange: #ff9830; --blue: #5794f2; --purple: #b877d9; --link: #6e9fff;
+  --mono: "Roboto Mono", ui-monospace, Menlo, monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text);
+  font: 13px/1.5 Inter, -apple-system, "Helvetica Neue", Arial, sans-serif; }
+a { color: var(--link); text-decoration: none; cursor: pointer; }
+a:hover { text-decoration: underline; }
+button, select, input { font: inherit; color: var(--text); }
+
+/* ---- top bar ---- */
+.topbar { height: 48px; display: flex; align-items: center; gap: 12px; padding: 0 16px;
+  background: var(--panel); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 20; }
+.logo { width: 24px; height: 24px; border-radius: 50%;
+  background: conic-gradient(from 200deg, #f05a28, #fbca0a, #f05a28); position: relative; flex: none; }
+.logo::after { content: ""; position: absolute; inset: 6px; border-radius: 50%; background: var(--panel); }
+.crumbs { display: flex; align-items: center; gap: 8px; color: var(--text-weak); white-space: nowrap; }
+.crumbs b { color: var(--text); font-weight: 500; }
+.crumbs .sep { color: var(--text-faint); }
+.spacer { flex: 1; }
+.tb-btn { height: 32px; padding: 0 12px; display: inline-flex; align-items: center; gap: 6px;
+  background: var(--panel2); border: 1px solid var(--border-strong); border-radius: 2px; cursor: pointer; }
+.tb-btn:hover { border-color: rgba(204,204,220,0.35); }
+.tb-group { display: inline-flex; }
+.tb-group .tb-btn:first-child { border-radius: 2px 0 0 2px; }
+.tb-group .tb-btn + .tb-btn, .tb-group select { border-left: none; border-radius: 0 2px 2px 0; }
+select.tb-btn { appearance: none; padding-right: 26px;
+  background: var(--panel2) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23ccccdc'/%3E%3C/svg%3E") no-repeat right 9px center; }
+.updated { color: var(--text-faint); font-size: 12px; white-space: nowrap; }
+
+/* ---- dashboard nav (tabs) and variables ---- */
+.subbar { display: flex; align-items: center; gap: 16px; padding: 8px 16px 0; flex-wrap: wrap; }
+.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border); width: 100%; }
+.tab { padding: 8px 14px; color: var(--text-weak); cursor: pointer; border-bottom: 2px solid transparent;
+  margin-bottom: -1px; display: flex; gap: 6px; align-items: center; }
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--text); border-bottom: 2px solid; border-image: linear-gradient(90deg, #f05a28, #fbca0a) 1; }
+.badge { font-size: 11px; padding: 0 6px; border-radius: 8px; background: var(--panel2); color: var(--text-weak); }
+.badge.live { background: rgba(115,191,105,0.15); color: var(--green); }
+.vars { display: flex; gap: 8px; flex-wrap: wrap; padding: 12px 16px 0; align-items: center; }
+.var { display: inline-flex; height: 32px; }
+.var label { display: flex; align-items: center; padding: 0 8px; background: var(--panel2);
+  border: 1px solid var(--border-strong); border-right: none; border-radius: 2px 0 0 2px;
+  color: #6e9fff; font-weight: 500; white-space: nowrap; }
+.var select, .var input { height: 32px; background: var(--bg); border: 1px solid var(--border-strong);
+  border-radius: 0 2px 2px 0; padding: 0 8px; min-width: 120px; }
+.var select { appearance: none; padding-right: 26px;
+  background: var(--bg) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23ccccdc'/%3E%3C/svg%3E") no-repeat right 9px center; }
+.var input:focus, .var select:focus { outline: 1px solid var(--blue); }
+
+/* ---- grid and panels ---- */
+.grid { display: grid; grid-template-columns: repeat(24, 1fr); gap: 8px; padding: 12px 16px 24px; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 2px;
+  display: flex; flex-direction: column; min-width: 0; }
+.ph { height: 32px; display: flex; align-items: center; gap: 6px; padding: 0 8px; flex: none; }
+.ph h3 { margin: 0; font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ph .info { color: var(--text-faint); cursor: help; font-size: 12px; }
+.ph .right { margin-left: auto; color: var(--text-faint); font-size: 12px; white-space: nowrap; }
+.pb { padding: 4px 8px 8px; flex: 1; min-height: 0; position: relative; overflow: auto; }
+.row-title { grid-column: span 24; display: flex; align-items: center; gap: 8px; font-size: 15px;
+  font-weight: 500; padding: 8px 0 0; color: var(--text); }
+.row-title::before { content: "⌄"; color: var(--text-faint); font-size: 14px; }
+.s2 { grid-column: span 2 } .s3 { grid-column: span 3 } .s4 { grid-column: span 4 } .s6 { grid-column: span 6 }
+.s8 { grid-column: span 8 } .s9 { grid-column: span 9 } .s10 { grid-column: span 10 } .s12 { grid-column: span 12 }
+.s14 { grid-column: span 14 } .s15 { grid-column: span 15 } .s16 { grid-column: span 16 } .s24 { grid-column: span 24 }
+@media (max-width: 1100px) { .s2,.s3,.s4 { grid-column: span 6 } .s6,.s8,.s9,.s10 { grid-column: span 12 }
+  .s12,.s14,.s15,.s16 { grid-column: span 24 } }
+
+/* stat */
+.stat { height: 116px; }
+.stat .pb { display: flex; flex-direction: column; justify-content: center; align-items: center; overflow: hidden; padding-top: 0; }
+.stat .v { font-size: 34px; font-weight: 500; line-height: 1.1; position: relative; z-index: 1; white-space: nowrap; }
+.stat .sub { color: var(--text-weak); font-size: 12px; position: relative; z-index: 1; white-space: nowrap; }
+.stat canvas.spark { position: absolute; left: 0; right: 0; bottom: 0; height: 36px !important; width: 100% !important; opacity: 0.55; }
+
+/* bar gauge (Grafana "gradient" mode) */
+.bg-row { display: grid; grid-template-columns: 90px 1fr 70px; align-items: center; gap: 8px; height: 26px; }
+.bg-row .lbl { color: var(--text-weak); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bg-track { height: 18px; background: rgba(204,204,220,0.06); position: relative; }
+.bg-fill { height: 100%; }
+.bg-val { text-align: right; font-weight: 500; font-variant-numeric: tabular-nums; }
+.stack { display: flex; height: 18px; background: rgba(204,204,220,0.06); }
+.stack div { height: 100%; }
+
+/* tables */
+table.gt { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.gt th { position: sticky; top: 0; background: var(--panel); text-align: left; font-weight: 500; color: #6e9fff;
+  padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; cursor: pointer; user-select: none; }
+.gt th.sorted::after { content: " ↓"; color: var(--text-faint); }
+.gt th.sorted.asc::after { content: " ↑"; }
+.gt td { padding: 5px 8px; border-bottom: 1px solid rgba(204,204,220,0.07); white-space: nowrap; }
+.gt tr.click:hover td { background: rgba(204,204,220,0.06); cursor: pointer; }
+.gt td.num { text-align: right; }
+.gt td.wrap { white-space: normal; min-width: 220px; max-width: 380px; color: var(--text-weak); }
+.mono { font-family: var(--mono); font-size: 12px; }
+.pill { display: inline-block; padding: 0 8px; border-radius: 2px; font-size: 12px; font-weight: 500; line-height: 20px; }
+.p-accept, .p-up, .p-running, .p-finished.ok { background: rgba(115,191,105,0.18); color: var(--green); }
+.p-repair, .p-paused, .p-pending { background: rgba(250,222,42,0.14); color: var(--yellow); }
+.p-reject, .p-down, .p-lost { background: rgba(242,73,92,0.16); color: var(--red); }
+.p-finished, .p-stopped, .p-duplicate, .p-none, .p-noreport { background: rgba(204,204,220,0.1); color: var(--text-weak); }
+.p-submitted { background: rgba(87,148,242,0.18); color: var(--blue); }
+.chip { display: inline-block; font-size: 11px; padding: 0 6px; margin: 1px 3px 1px 0; border-radius: 2px;
+  background: rgba(242,73,92,0.12); color: #ff7383; font-family: var(--mono); }
+.chip.warn { background: rgba(250,222,42,0.1); color: var(--yellow); }
+.c-green { color: var(--green) } .c-yellow { color: var(--yellow) } .c-red { color: var(--red) }
+.c-orange { color: var(--orange) } .c-blue { color: var(--blue) } .c-weak { color: var(--text-weak) } .c-faint { color: var(--text-faint) }
+.prog { width: 120px; height: 14px; background: rgba(204,204,220,0.08); display: inline-block; vertical-align: middle; }
+.prog div { height: 100%; background: linear-gradient(90deg, #3d71d9, #5794f2); }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--green); margin-right: 6px;
+  box-shadow: 0 0 0 0 rgba(115,191,105,0.6); animation: pulse 1.6s infinite; }
+@keyframes pulse { 70% { box-shadow: 0 0 0 7px rgba(115,191,105,0); } 100% { box-shadow: 0 0 0 0 rgba(115,191,105,0); } }
+
+/* logs panel */
+.logs { font-family: var(--mono); font-size: 12px; line-height: 1.6; }
+.logs div { white-space: pre-wrap; word-break: break-word; padding-left: 8px; border-left: 3px solid transparent; }
+.logs .t { color: var(--text-faint); margin-right: 10px; }
+.logs .lv-info { border-left-color: rgba(87,148,242,0.5); }
+.logs .lv-ok { border-left-color: var(--green); }
+.logs .lv-warn { border-left-color: var(--yellow); }
+.logs .lv-err { border-left-color: var(--red); }
+
+.empty { color: var(--text-faint); padding: 24px; text-align: center; }
+.notice { grid-column: span 24; padding: 10px 14px; border: 1px solid var(--border); border-left: 3px solid var(--blue);
+  background: var(--panel); color: var(--text-weak); }
+.notice.err { border-left-color: var(--red); }
+
+/* inspect drawer */
+.drawer-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.45); z-index: 40; display: none; }
+.drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(1100px, 92vw); background: var(--panel);
+  border-left: 1px solid var(--border-strong); z-index: 41; display: none; flex-direction: column; }
+.drawer.open, .drawer-bg.open { display: flex; }
+.dh { padding: 16px 20px 0; border-bottom: 1px solid var(--border); }
+.dh h2 { margin: 0 0 4px; font-size: 18px; font-weight: 500; font-family: var(--mono); word-break: break-all; }
+.dh .meta { color: var(--text-weak); margin-bottom: 10px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.dclose { position: absolute; right: 16px; top: 14px; background: none; border: none; font-size: 22px; color: var(--text-weak); cursor: pointer; }
+.dbody { flex: 1; overflow: auto; padding: 12px 20px 24px; }
+.code { font-family: var(--mono); font-size: 12px; background: var(--bg); border: 1px solid var(--border);
+  padding: 10px 12px; white-space: pre-wrap; word-break: break-word; border-radius: 2px; }
+.kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+.kv div { background: var(--bg); border: 1px solid var(--border); padding: 6px 10px; }
+.kv span { display: block; color: var(--text-faint); font-size: 11px; }
+.kv b { font-weight: 500; font-size: 15px; }
+.tree ul { list-style: none; margin: 0; padding-left: 18px; border-left: 1px dashed var(--border-strong); }
+.tree > ul { border-left: none; padding-left: 0; }
+.tree li { margin: 3px 0; }
+.tree .node { display: inline-flex; gap: 8px; align-items: center; padding: 2px 6px; border-radius: 2px; }
+.tree .node.me { background: rgba(87,148,242,0.15); outline: 1px solid rgba(87,148,242,0.5); }
+h4 { margin: 16px 0 6px; font-size: 13px; font-weight: 500; color: var(--text); }
+.chartbox { position: relative; }
+.more { text-align: center; padding: 8px; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="logo"></div>
+  <div class="crumbs">Home <span class="sep">›</span> Dashboards <span class="sep">›</span> <b>QIP Alpha Research</b>
+    <span class="sep">›</span> <span id="crumb-tab">Live</span></div>
+  <div class="spacer"></div>
+  <span class="updated" id="updated">–</span>
+  <select class="tb-btn" id="range" title="Time range (simulation time)">
+    <option value="1">Last 24 hours</option><option value="7">Last 7 days</option>
+    <option value="30">Last 30 days</option><option value="0" selected>All time</option>
+  </select>
+  <div class="tb-group">
+    <button class="tb-btn" id="refresh-btn" title="Refresh">↻ Refresh</button>
+    <select class="tb-btn" id="interval" title="Auto refresh">
+      <option value="0">Off</option><option value="5">5s</option><option value="10" selected>10s</option>
+      <option value="30">30s</option><option value="60">1m</option>
+    </select>
+  </div>
+</div>
+<div class="subbar">
+  <div class="tabs" id="tabs">
+    <div class="tab" data-tab="live">Live <span class="badge" id="live-badge">–</span></div>
+    <div class="tab" data-tab="overview">Overview</div>
+    <div class="tab" data-tab="alphas">Alphas <span class="badge" id="alpha-badge">–</span></div>
+    <div class="tab" data-tab="runs">Runs</div>
+    <div class="tab" data-tab="pool">Pool &amp; submissions</div>
+    <div class="tab" data-tab="works">What works</div>
+  </div>
+</div>
+<div id="vars" class="vars"></div>
+<div id="main" class="grid"></div>
+
+<div class="drawer-bg" id="drawer-bg"></div>
+<div class="drawer" id="drawer">
+  <button class="dclose" id="dclose" title="Close (Esc)">×</button>
+  <div class="dh" id="dh"></div>
+  <div class="dbody" id="dbody"></div>
+</div>
+
+<script>
+"use strict";
+// ------------------------------------------------------------------ helpers
+const $ = (s, el = document) => el.querySelector(s);
+const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const C = { green: "#73bf69", yellow: "#fade2a", red: "#f2495c", orange: "#ff9830", blue: "#5794f2",
+  purple: "#b877d9", text: "#ccccdc", grid: "rgba(204,204,220,0.08)", weak: "rgba(204,204,220,0.65)" };
+const SHARPE_BAR = 1.58;
+const fmt = (v, d = 2) => v == null || Number.isNaN(v) ? "–" : Number(v).toFixed(d);
+const pct = (v, d = 1) => v == null ? "–" : (v * 100).toFixed(d) + "%";
+const modelName = m => String(m || "").replace(/:free$/, "").split("/").pop().replace(/^groq:/, "");
+const short = id => String(id || "").replace(/^rs\d{14}/, "");
+const pill = (v, extra = "") => v ? `<span class="pill p-${String(v).replace(/[^a-z]/gi, "")} ${extra}">${esc(v)}</span>` : `<span class="c-faint">–</span>`;
+const sharpeCls = v => v == null ? "c-faint" : v >= SHARPE_BAR ? "c-green" : v >= 1 ? "c-orange" : v > -1 ? "c-weak" : "c-red";
+const fitCls = v => v == null ? "c-faint" : v >= 1 ? "c-green" : v >= 0.6 ? "c-orange" : "c-weak";
+const prodCls = v => v == null ? "c-faint" : v >= 0.7 ? "c-red" : v >= 0.6 ? "c-orange" : "c-green";
+const local = iso => iso ? new Date(iso).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "–";
+const clock = iso => iso ? new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
+const dur = s => { if (s == null) return "–"; s = Math.round(s); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+  return h ? `${h}h ${m}m` : m ? `${m}m ${String(x).padStart(2, "0")}s` : `${x}s`; };
+async function api(path) {
+  const r = await fetch(path, { cache: "no-store" });
+  if (!r.ok && r.status !== 404) throw new Error(`${path}: HTTP ${r.status}`);
+  return r.json();
+}
+const hasChart = () => typeof Chart !== "undefined";
+if (hasChart()) {
+  Chart.defaults.color = C.weak; Chart.defaults.font.family = "Inter, sans-serif"; Chart.defaults.font.size = 11;
+  Chart.defaults.borderColor = C.grid; Chart.defaults.animation = false;
+  Chart.defaults.plugins.legend.labels.boxWidth = 12; Chart.defaults.plugins.legend.labels.boxHeight = 3;
+  Chart.defaults.plugins.tooltip.backgroundColor = "#22252b"; Chart.defaults.plugins.tooltip.borderColor = "rgba(204,204,220,0.2)";
+  Chart.defaults.plugins.tooltip.borderWidth = 1; Chart.defaults.plugins.tooltip.titleColor = C.text; Chart.defaults.plugins.tooltip.bodyColor = C.text;
+}
+let charts = [];
+function chart(canvas, cfg) { if (!hasChart() || !canvas) return null; const c = new Chart(canvas, cfg); charts.push(c); return c; }
+function clearCharts() { charts.forEach(c => c.destroy()); charts = []; }
+
+// panel builders
+function panel(span, title, body, { info = "", right = "", height = null, cls = "" } = {}) {
+  return `<div class="panel s${span} ${cls}" ${height ? `style="height:${height}px"` : ""}>
+    <div class="ph"><h3>${esc(title)}</h3>${info ? `<span class="info" title="${esc(info)}">ⓘ</span>` : ""}
+    <span class="right">${right}</span></div><div class="pb">${body}</div></div>`;
+}
+function stat(span, title, value, { sub = "", color = "", spark = null, info = "" } = {}) {
+  const id = spark ? "sp" + Math.random().toString(36).slice(2) : "";
+  const html = panel(span, title, `<div class="v ${color}">${value}</div>${sub ? `<div class="sub">${sub}</div>` : ""}
+    ${spark ? `<canvas class="spark" id="${id}"></canvas>` : ""}`, { cls: "stat", info });
+  return { html, after: spark ? () => sparkline($("#" + id), spark.values, spark.color || C.blue) : null };
+}
+function sparkline(canvas, values, color) {
+  chart(canvas, { type: "line", data: { labels: values.map((_, i) => i), datasets: [{ data: values, borderColor: color,
+    borderWidth: 1.5, pointRadius: 0, fill: true, backgroundColor: color + "26", tension: 0.3 }] },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false }, tooltip: { enabled: false } },
+      scales: { x: { display: false }, y: { display: false, beginAtZero: true } } } });
+}
+function barGauge(rows, { max = null, color = v => C.green, fmtv = v => v, labelWidth = 90 } = {}) {
+  if (!rows.length) return `<div class="empty">No data</div>`;
+  const m = max ?? Math.max(...rows.map(r => r.value), 1);
+  return rows.map(r => { const c = color(r); const w = Math.max(0, Math.min(100, 100 * r.value / m));
+    return `<div class="bg-row" style="grid-template-columns:${labelWidth}px 1fr 80px"><span class="lbl" title="${esc(r.label)}">${esc(r.label)}</span>
+    <div class="bg-track"><div class="bg-fill" style="width:${w}%;background:linear-gradient(90deg, ${c}55, ${c})"></div></div>
+    <span class="bg-val" style="color:${c}">${fmtv(r.value, r)}</span></div>`; }).join("");
+}
+function stackGauge(rows) {   // rows: {label, parts: [{value, color, name}]}
+  const m = Math.max(...rows.map(r => r.parts.reduce((a, p) => a + p.value, 0)), 1);
+  return rows.map(r => { const tot = r.parts.reduce((a, p) => a + p.value, 0);
+    return `<div class="bg-row"><span class="lbl">${esc(r.label)}</span><div class="stack" style="width:${100 * tot / m}%">
+      ${r.parts.map(p => `<div title="${esc(p.name)}: ${p.value}" style="width:${tot ? 100 * p.value / tot : 0}%;background:${p.color}"></div>`).join("")}
+      </div><span class="bg-val">${tot}</span></div>`; }).join("");
+}
+
+// sortable table
+const tableState = {};
+function table(id, cols, rows, { click = null, limit = 0 } = {}) {
+  const st = tableState[id] || (tableState[id] = { key: null, asc: false, shown: limit || Infinity });
+  let data = rows.slice();
+  if (st.key) { const col = cols.find(c => c.key === st.key); const get = col?.sort || (r => r[st.key]);
+    data.sort((a, b) => { const x = get(a), y = get(b); if (x == null && y == null) return 0; if (x == null) return 1; if (y == null) return -1;
+      return (x < y ? -1 : x > y ? 1 : 0) * (st.asc ? 1 : -1); }); }
+  const total = data.length; data = data.slice(0, st.shown);
+  const head = cols.map(c => `<th data-t="${id}" data-k="${c.key}" class="${st.key === c.key ? "sorted" + (st.asc ? " asc" : "") : ""}"
+    ${c.title ? `title="${esc(c.title)}"` : ""}>${esc(c.label)}</th>`).join("");
+  const body = data.map((r, i) => `<tr class="${click ? "click" : ""}" data-t="${id}" data-i="${esc(r.candidate_id ?? i)}">${cols.map(c =>
+    `<td class="${c.num ? "num" : ""} ${c.cls || ""}">${c.fmt ? c.fmt(r[c.key], r) : esc(r[c.key] ?? "–")}</td>`).join("")}</tr>`).join("");
+  const more = total > data.length ? `<div class="more"><a data-more="${id}">Show ${Math.min(200, total - data.length)} more of ${total - data.length}</a></div>` : "";
+  return `<table class="gt" id="tbl-${id}"><thead><tr>${head}</tr></thead><tbody>${body ||
+    `<tr><td colspan="${cols.length}" class="empty">No rows</td></tr>`}</tbody></table>${more}`;
+}
+document.addEventListener("click", e => {
+  const th = e.target.closest("th[data-t]");
+  if (th && th.closest("#drawer")) return;
+  if (th) { const st = tableState[th.dataset.t]; if (st.key === th.dataset.k) st.asc = !st.asc; else { st.key = th.dataset.k; st.asc = false; } render(); return; }
+  const more = e.target.closest("[data-more]");
+  if (more) { tableState[more.dataset.more].shown += 200; render(); return; }
+  const link = e.target.closest("[data-alpha]");
+  if (link) { e.stopPropagation(); openAlpha(link.dataset.alpha); return; }
+  const tr = e.target.closest("tr.click");
+  if (tr && tr.dataset.i && !tr.dataset.i.match(/^\d+$/)) openAlpha(tr.dataset.i);
+});
+const alphaLink = id => id ? `<a data-alpha="${esc(id)}" class="mono">${esc(short(id) || id)}</a>` : "–";
+
+// ------------------------------------------------------------------ state
+const S = { tab: "live", live: null, alphas: null, runs: null, pool: null, levers: null, models: null,
+  liveRun: null, filt: { region: "", decision: "", origin: "", q: "" }, worksClass: "all", lastAlphas: 0, error: null };
+const TAB_NAMES = { live: "Live", overview: "Overview", alphas: "Alphas", runs: "Runs", pool: "Pool & submissions", works: "What works" };
+function inRange(iso) { const d = +$("#range").value; if (!d) return true; return iso && (Date.now() - new Date(iso)) <= d * 86400e3; }
+
+async function load(force = false) {
+  try {
+    const need = { live: ["live", "alphas"], overview: ["alphas", "pool", "runs"], alphas: ["alphas"], runs: ["runs"],
+      pool: ["pool"], works: ["levers", "models"] }[S.tab];
+    const jobs = [api("/api/live").then(x => S.live = x.runs)];
+    for (const n of need) {
+      if (n === "live") continue;
+      if (n === "alphas" && !force && S.alphas && Date.now() - S.lastAlphas < 30000) continue;
+      jobs.push(api("/api/" + n).then(x => { S[n] = n === "alphas" ? x.alphas : n === "runs" ? x.runs : n === "levers" ? x.levers : x;
+        if (n === "alphas") S.lastAlphas = Date.now(); }));
+    }
+    await Promise.all(jobs);
+    S.error = null;
+  } catch (err) { S.error = String(err); }
+  $("#updated").textContent = "Last updated " + new Date().toLocaleTimeString();
+  render();
+}
+
+// ------------------------------------------------------------------ render
+function render() {
+  clearCharts();
+  document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === S.tab));
+  $("#crumb-tab").textContent = TAB_NAMES[S.tab];
+  const running = (S.live || []).filter(r => r.status === "running");
+  const lb = $("#live-badge"); lb.textContent = running.length ? `${running.length} running` : "idle"; lb.className = "badge" + (running.length ? " live" : "");
+  if (S.alphas) $("#alpha-badge").textContent = S.alphas.length;
+  const out = { html: "", after: [] };
+  if (S.error) out.html += `<div class="notice err">Could not reach the dashboard server: ${esc(S.error)}</div>`;
+  ({ live: renderLive, overview: renderOverview, alphas: renderAlphas, runs: renderRuns, pool: renderPool, works: renderWorks })[S.tab](out);
+  $("#main").innerHTML = out.html;
+  out.after.forEach(f => f && f());
+}
+function push(out, x) { if (typeof x === "string") out.html += x; else { out.html += x.html; out.after.push(x.after); } }
+
+// ---------------- Live
+function renderLive(out) {
+  const runs = S.live || [];
+  const opts = runs.map(r => `<option value="${esc(r.run_id)}" ${r.run_id === S.liveRun ? "selected" : ""}>${esc(r.run_id)} · ${esc(r.status)}</option>`).join("");
+  if (!S.liveRun || !runs.some(r => r.run_id === S.liveRun)) S.liveRun = (runs.find(r => r.status === "running") || runs[0] || {}).run_id;
+  $("#vars").innerHTML = runs.length ? `<div class="var"><label>Run</label><select id="live-run">${opts}</select></div>` : "";
+  const sel = $("#live-run"); if (sel) { sel.value = S.liveRun; sel.onchange = () => { S.liveRun = sel.value; render(); }; }
+  const r = runs.find(x => x.run_id === S.liveRun);
+  if (!r) { push(out, `<div class="notice">No run has written live status yet. Runs started with <span class="mono">cli research</span> or
+    <span class="mono">cli run</span> show up here while they go.</div>`); return; }
+  if (r.status !== "running") push(out, `<div class="notice ${r.status === "lost" ? "err" : ""}">No run is going on. Showing
+    <b>${esc(r.run_id)}</b> (${esc(r.status)}${r.reason ? ": " + esc(r.reason) : ""}), last update ${local(r.updated_at)}.</div>`);
+  if (r.quiet_seconds) push(out, `<div class="notice">No update for ${dur(r.quiet_seconds)} (waiting on BRAIN or a model).</div>`);
+  const st = r.state || {}, cnt = r.counts || {};
+  const elapsed = (new Date(r.status === "running" ? Date.now() : r.updated_at) - new Date(r.started_at)) / 1000;
+  const statusTxt = r.status === "running" ? `<span class="dot"></span>Running` : r.status[0].toUpperCase() + r.status.slice(1);
+  push(out, stat(4, "Status", statusTxt, { color: { running: "c-green", lost: "c-red", stopped: "c-orange" }[r.status] || "c-weak",
+    sub: r.kind === "batch" ? "hand batch" : (st.regions || []).join(" · ") || "every region" }));
+  push(out, stat(3, "Elapsed", dur(elapsed), { sub: "started " + clock(r.started_at) }));
+  if (r.kind === "research") {
+    push(out, stat(3, "Round", `${st.round ?? "–"}<span class="c-faint" style="font-size:20px"> / ${st.rounds ?? "–"}</span>`));
+    const sm = st.simulations || {};
+    push(out, stat(4, "Simulations", `${sm.used ?? 0}<span class="c-faint" style="font-size:20px"> / ${sm.max ?? "–"}</span>`,
+      { sub: sm.committed > sm.used ? `${sm.committed - sm.used} on BRAIN or queued` : "used / budget" }));
+    const mc = st.model_calls || {};
+    push(out, stat(3, "Model calls", `${mc.used ?? 0}`, { sub: mc.max ? `of ${mc.max}` : "no cap" }));
+  } else {
+    push(out, stat(10, "Batch", `<span class="mono" style="font-size:16px">${esc(st.file || "")}</span>`, { sub: `${st.total ?? "?"} candidates · ${esc(st.client || "")}` }));
+  }
+  push(out, stat(2, "Accepted", cnt.accept || 0, { color: cnt.accept ? "c-green" : "c-weak" }));
+  push(out, stat(2, "Repair", cnt.repair || 0, { color: "c-yellow" }));
+  push(out, stat(3, "Rejected", cnt.reject || 0, { color: "c-red", sub: `${cnt.simulated || 0} simulated` }));
+
+  const runningRows = (r.running || []).map(x => ({ ...x }));
+  push(out, panel(14, `On BRAIN now (${runningRows.length}${r.waiting ? `, ${r.waiting} waiting` : ""})`, runningRows.length ? table("live-run", [
+    { key: "candidate_id", label: "Alpha", fmt: v => `<span class="mono">${esc(short(v))}</span>` },
+    { key: "region", label: "Region" }, { key: "dataset", label: "Dataset" },
+    { key: "lever", label: "Fix", fmt: v => v ? `<span class="mono c-weak">${esc(v)}</span>` : `<span class="c-faint">new</span>` },
+    { key: "phase", label: "Phase", fmt: v => v === "fetching" ? `<span class="c-blue">fetching results</span>` : esc(v || "–") },
+    { key: "elapsed", label: "Time", num: true, fmt: v => dur(v) },
+    { key: "progress", label: "BRAIN progress", fmt: v => v == null ? `<span class="c-faint">–</span>` :
+      `<span class="prog"><div style="width:${Math.min(100, v <= 1 ? v * 100 : v)}%"></div></span> ${Math.round(v <= 1 ? v * 100 : v)}%` },
+  ], runningRows) : `<div class="empty">Nothing on BRAIN right now</div>`, { height: 300, info: "BRAIN's progress arrives every ~15 s" }));
+
+  const models = Object.entries(st.models || {}).map(([m, v]) => ({ model: m, ...v }));
+  push(out, panel(10, "Models", models.length ? table("live-models", [
+    { key: "model", label: "Model", fmt: (v, x) => `<span class="mono">${esc(v)}</span>${x.generator ? ` <span class="badge">gen</span>` : ""}` },
+    { key: "status", label: "State", fmt: v => pill(v) },
+    { key: "calls", label: "Calls", num: true },
+    { key: "reason", label: "Why", cls: "wrap", fmt: v => v ? `<span title="${esc(v)}">${esc(String(v).slice(0, 110))}</span>` : "" },
+  ], models) : `<div class="empty">–</div>`, { height: 300 }));
+
+  const dec = (r.decisions || []).slice().reverse();
+  push(out, panel(14, "Decisions", table("live-dec", [
+    { key: "t", label: "Time", fmt: v => `<span class="c-faint">${clock(v)}</span>` },
+    { key: "candidate_id", label: "Alpha", fmt: v => alphaLink(v) },
+    { key: "region", label: "Region" }, { key: "lever", label: "Fix", fmt: v => v ? `<span class="mono c-weak">${esc(v)}</span>` : `<span class="c-faint">new</span>` },
+    { key: "decision", label: "Decision", fmt: v => pill(v) }, { key: "failure_class", label: "Class", fmt: v => esc(v && v !== "none" ? v : "") },
+    { key: "sharpe", label: "Sharpe", num: true, fmt: v => `<span class="${sharpeCls(v)}">${fmt(v)}</span>` },
+    { key: "fitness", label: "Fitness", num: true, fmt: v => `<span class="${fitCls(v)}">${fmt(v)}</span>` },
+    { key: "turnover", label: "Turnover", num: true, fmt: v => pct(v, 0) },
+  ], dec, { limit: 100 }), { height: 440 }));
+  const lv = t => /accept/.test(t) ? "lv-ok" : /down|error|fail|lost|stopp/i.test(t) ? "lv-err" : /paused|waiting|rate|empty/i.test(t) ? "lv-warn" : "lv-info";
+  const ev = (r.events || []).slice().reverse();
+  push(out, panel(10, "Log", `<div class="logs">${ev.map(e => `<div class="${lv(e.text)}"><span class="t">${clock(e.t)}</span>${esc(e.text)}</div>`).join("") ||
+    `<div class="empty">No lines yet</div>`}</div>`, { height: 440 }));
+  if (st.cross_region_leads?.length) push(out, panel(24, "Close leads from other regions", st.cross_region_leads.map(alphaLink).join(" · ")));
+}
+
+// ---------------- Overview
+function rowsInRange() { return (S.alphas || []).filter(a => inRange(a.simulated_at)); }
+function renderOverview(out) {
+  $("#vars").innerHTML = "";
+  if (!S.alphas) { push(out, `<div class="notice">Loading…</div>`); return; }
+  const rows = rowsInRange(), comp = rows.filter(a => a.status === "complete");
+  const acc = rows.filter(a => a.decision === "accept"), rep = rows.filter(a => a.decision === "repair");
+  const days = {}; rows.forEach(a => { const d = (a.simulated_at || "").slice(0, 10); if (!d) return;
+    const x = days[d] ||= { sims: 0, accept: 0, repair: 0, reject: 0, other: 0 }; x.sims++; x[["accept", "repair", "reject"].includes(a.decision) ? a.decision : "other"]++; });
+  const dk = Object.keys(days).sort();
+  const sims = dk.map(d => days[d].sims);
+  const best = comp.reduce((m, a) => a.sharpe != null && (m == null || a.sharpe > m.sharpe) ? a : m, null);
+  const pool = S.pool?.pool || [];
+  push(out, stat(4, "Alphas simulated", rows.length, { spark: { values: sims, color: C.blue }, sub: `${comp.length} complete` }));
+  push(out, stat(4, "Accepted", acc.length, { color: "c-green", spark: { values: dk.map(d => days[d].accept), color: C.green },
+    sub: rows.length ? `${(100 * acc.length / rows.length).toFixed(1)}% of simulated` : "" }));
+  push(out, stat(4, "Submitted (pool)", pool.length, { color: "c-blue", sub: `${(S.pool?.accepted_not_in_pool || []).filter(a => !a.sibling_in_pool).length} accepted lineage(s) not submitted` }));
+  push(out, stat(4, "Open repairs", rep.length, { color: "c-yellow", sub: "decision repair, latest" }));
+  push(out, stat(4, "Best Sharpe", best ? fmt(best.sharpe) : "–", { color: sharpeCls(best?.sharpe), sub: best ? `<a data-alpha="${esc(best.candidate_id)}">${esc(short(best.candidate_id))}</a>` : "" }));
+  const lastDay = dk[dk.length - 1];
+  push(out, stat(4, "Latest day", lastDay ? days[lastDay].sims : 0, { sub: lastDay ? `simulations on ${lastDay}` : "" }));
+
+  push(out, panel(16, "Simulations per day, by decision", `<div class="chartbox" style="height:250px"><canvas id="c-days"></canvas></div>`, { height: 300 }));
+  const dcount = { accept: acc.length, repair: rep.length, reject: rows.filter(a => a.decision === "reject").length,
+    pending: rows.filter(a => a.decision === "pending").length };
+  push(out, panel(8, "Decisions", `<div class="chartbox" style="height:250px"><canvas id="c-dec"></canvas></div>`, { height: 300 }));
+  out.after.push(() => {
+    chart($("#c-days"), { type: "bar", data: { labels: dk, datasets: [
+      { label: "accept", data: dk.map(d => days[d].accept), backgroundColor: C.green },
+      { label: "repair", data: dk.map(d => days[d].repair), backgroundColor: C.yellow + "cc" },
+      { label: "reject", data: dk.map(d => days[d].reject), backgroundColor: C.red + "cc" },
+      { label: "other", data: dk.map(d => days[d].other), backgroundColor: "rgba(204,204,220,0.3)" }] },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: "bottom", align: "start" } },
+        scales: { x: { stacked: true, grid: { display: false } }, y: { stacked: true, beginAtZero: true } } } });
+    chart($("#c-dec"), { type: "doughnut", data: { labels: Object.keys(dcount), datasets: [{ data: Object.values(dcount),
+      backgroundColor: [C.green, C.yellow, C.red, C.blue], borderColor: "#181b1f", borderWidth: 2 }] },
+      options: { responsive: true, maintainAspectRatio: false, cutout: "62%", plugins: { legend: { position: "right" } } } });
+  });
+  const regions = {}; rows.forEach(a => { const g = regions[a.region] ||= { accept: 0, repair: 0, reject: 0, other: 0, best: null };
+    g[["accept", "repair", "reject"].includes(a.decision) ? a.decision : "other"]++; if (a.sharpe != null && (g.best == null || a.sharpe > g.best)) g.best = a.sharpe; });
+  const rk = Object.keys(regions).sort((a, b) => Object.values(regions[b]).slice(0, 4).reduce((x, y) => x + y) - Object.values(regions[a]).slice(0, 4).reduce((x, y) => x + y));
+  push(out, panel(12, "Simulations by region", stackGauge(rk.map(k => ({ label: k, parts: [
+    { name: "accept", value: regions[k].accept, color: C.green }, { name: "repair", value: regions[k].repair, color: C.yellow + "cc" },
+    { name: "reject", value: regions[k].reject, color: C.red + "bb" }, { name: "other", value: regions[k].other, color: "rgba(204,204,220,0.3)" }] }))),
+    { height: 330, info: "Rotation should keep these even. Green accept, yellow repair, red reject" }));
+  const cls = {}; rows.forEach(a => { if (["repair", "reject"].includes(a.decision) && a.failure_class) cls[a.failure_class] = (cls[a.failure_class] || 0) + 1; });
+  push(out, panel(12, "Why alphas fail (latest decision's class)", barGauge(Object.entries(cls).sort((a, b) => b[1] - a[1]).map(([k, v]) => ({ label: k, value: v })),
+    { color: () => C.orange }), { height: 330 }));
+  push(out, panel(12, "Sharpe distribution (complete alphas)", `<div class="chartbox" style="height:260px"><canvas id="c-hist"></canvas></div>`,
+    { height: 310, info: `BRAIN's bar is ${SHARPE_BAR} in most markets; the dashed area is |Sharpe| ≥ 1` }));
+  out.after.push(() => {
+    const bins = []; for (let b = -3; b < 5; b += 0.25) bins.push(+b.toFixed(2));
+    const counts = bins.map(() => 0); comp.forEach(a => { if (a.sharpe == null) return; counts[Math.min(bins.length - 1, Math.max(0, Math.floor((a.sharpe + 3) / 0.25)))]++; });
+    chart($("#c-hist"), { type: "bar", data: { labels: bins.map(b => b.toFixed(2)), datasets: [{ data: counts, barPercentage: 1, categoryPercentage: 0.95,
+      backgroundColor: bins.map(b => b >= SHARPE_BAR ? C.green : b >= 1 ? C.orange : b <= -1 ? C.red + "aa" : "rgba(87,148,242,0.55)") }] },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } },
+        scales: { x: { grid: { display: false }, ticks: { autoSkip: true, maxTicksLimit: 9 } }, y: { beginAtZero: true } } } });
+  });
+  push(out, panel(12, "Latest accepts", table("ov-acc", [
+    { key: "candidate_id", label: "Alpha", fmt: v => alphaLink(v) }, { key: "region", label: "Region" },
+    { key: "sharpe", label: "Sharpe", num: true, fmt: v => `<span class="${sharpeCls(v)}">${fmt(v)}</span>` },
+    { key: "fitness", label: "Fitness", num: true, fmt: v => `<span class="${fitCls(v)}">${fmt(v)}</span>` },
+    { key: "prod_corr", label: "PROD", num: true, fmt: v => `<span class="${prodCls(v)}">${fmt(v, 3)}</span>` },
+    { key: "decided_at", label: "Decided", fmt: v => `<span class="c-faint">${local(v)}</span>` },
+  ], acc.slice().sort((a, b) => (b.decided_at || "").localeCompare(a.decided_at || "")), { click: true, limit: 12 }), { height: 310 }));
+}
+
+// ---------------- Alphas
+function renderAlphas(out) {
+  const all = S.alphas || [];
+  const uniq = k => [...new Set(all.map(a => a[k]).filter(Boolean))].sort();
+  const f = S.filt;
+  const sel = (id, label, vals, cur) => `<div class="var"><label>${label}</label><select id="${id}"><option value="">All</option>${vals.map(v =>
+    `<option ${v === cur ? "selected" : ""}>${esc(v)}</option>`).join("")}</select></div>`;
+  const origins = uniq("origin").reverse();
+  $("#vars").innerHTML = sel("f-region", "Region", uniq("region"), f.region) + sel("f-decision", "Decision", uniq("decision"), f.decision) +
+    sel("f-origin", "Run", origins, f.origin) +
+    `<div class="var"><label>Search</label><input id="f-q" placeholder="id, dataset, expression class, check…" value="${esc(f.q)}" style="min-width:260px"></div>`;
+  for (const [id, k] of [["f-region", "region"], ["f-decision", "decision"], ["f-origin", "origin"]]) $("#" + id).onchange = e => { f[k] = e.target.value; render(); };
+  const q = $("#f-q"); q.oninput = e => { f.q = e.target.value; clearTimeout(q._t); q._t = setTimeout(() => { render(); const n = $("#f-q"); n.focus(); n.setSelectionRange(n.value.length, n.value.length); }, 250); };
+  if (!S.alphas) { push(out, `<div class="notice">Loading…</div>`); return; }
+  const needle = f.q.toLowerCase();
+  const rows = all.filter(a => inRange(a.simulated_at) && (!f.region || a.region === f.region) && (!f.decision || a.decision === f.decision)
+    && (!f.origin || a.origin === f.origin) && (!needle || [a.candidate_id, a.dataset, a.lever, a.model, a.failure_class,
+      ...(a.failed_checks || []).map(c => c.name)].join(" ").toLowerCase().includes(needle)));
+  const n = rows.length, acc = rows.filter(a => a.decision === "accept").length;
+  const s = rows.map(a => a.sharpe).filter(v => v != null).sort((a, b) => a - b);
+  push(out, stat(6, "Alphas", n, { sub: "after filters and time range" }));
+  push(out, stat(6, "Accepted", acc, { color: "c-green" }));
+  push(out, stat(6, "Median Sharpe", s.length ? fmt(s[Math.floor(s.length / 2)]) : "–", { color: sharpeCls(s[Math.floor(s.length / 2)]) }));
+  push(out, stat(6, "|Sharpe| ≥ 1", s.length ? pct(s.filter(v => Math.abs(v) >= 1).length / s.length, 0) : "–", { sub: `${s.filter(v => Math.abs(v) >= 1).length} alphas` }));
+  push(out, panel(24, "Simulated alphas", table("alphas", [
+    { key: "simulated_at", label: "Simulated", fmt: v => `<span class="c-faint">${local(v)}</span>` },
+    { key: "candidate_id", label: "Alpha", fmt: v => `<span class="mono">${esc(short(v) || v)}</span>`, title: "click a row to inspect" },
+    { key: "origin", label: "Run", fmt: v => `<span class="c-weak mono">${esc(v)}</span>` },
+    { key: "region", label: "Region" }, { key: "dataset", label: "Dataset" },
+    { key: "lever", label: "Fix", fmt: v => v ? `<span class="mono c-weak">${esc(v.length > 22 ? v.slice(0, 22) + "…" : v)}</span>` : `<span class="c-faint">new</span>` },
+    { key: "decision", label: "Decision", fmt: v => pill(v) },
+    { key: "failure_class", label: "Class", fmt: v => esc(v && v !== "none" ? v : "") },
+    { key: "sharpe", label: "Sharpe", num: true, fmt: v => `<span class="${sharpeCls(v)}">${fmt(v)}</span>` },
+    { key: "fitness", label: "Fitness", num: true, fmt: v => `<span class="${fitCls(v)}">${fmt(v)}</span>` },
+    { key: "turnover", label: "Turnover", num: true, fmt: v => pct(v, 0) },
+    { key: "returns", label: "Returns", num: true, fmt: v => pct(v, 1) },
+    { key: "rn_sharpe", label: "Risk-neut.", num: true, title: "BRAIN's risk-neutralized Sharpe", fmt: v => `<span class="${sharpeCls(v)}">${fmt(v)}</span>` },
+    { key: "prod_corr", label: "PROD", num: true, fmt: v => `<span class="${prodCls(v)}">${fmt(v, 3)}</span>` },
+    { key: "failed_checks", label: "Failed BRAIN checks", sort: r => (r.failed_checks || []).length, fmt: (v, r) =>
+      (v || []).slice(0, 4).map(c => `<span class="chip" title="${esc(c.name)}: ${c.value ?? "?"} vs ${c.limit ?? "?"}">${esc(c.name.replace(/^LOW_|_SHARPE$/g, "").toLowerCase())}</span>`).join("") +
+      ((v || []).length > 4 ? `<span class="c-faint">+${v.length - 4}</span>` : "") +
+      (r.pending_checks || []).map(c => `<span class="chip warn" title="${esc(c)} not finished on BRAIN">${esc(c.toLowerCase())}…</span>`).join("") },
+  ], rows, { click: true, limit: 200 }), { right: `${n} rows · click a row to inspect` }));
+}
+
+// ---------------- Runs
+function renderRuns(out) {
+  $("#vars").innerHTML = "";
+  if (!S.runs) { push(out, `<div class="notice">Loading…</div>`); return; }
+  const runs = S.runs.filter(r => inRange(r.started_at) || r.status === "running");
+  const research = runs.filter(r => r.kind === "research");
+  push(out, stat(6, "Runs", runs.length, { sub: `${research.length} research, ${runs.length - research.length} batches` }));
+  push(out, stat(6, "Accepts from runs", runs.reduce((a, r) => a + (r.accepted || 0), 0), { color: "c-green" }));
+  push(out, stat(6, "Alphas per research run", research.length ? fmt(research.reduce((a, r) => a + (r.alphas || 0), 0) / research.length, 0) : "–"));
+  const lost = research.reduce((a, r) => a + (r.models_down || []).length, 0);
+  push(out, stat(6, "Models lost in runs", lost, { color: lost ? "c-orange" : "c-green", sub: "down for the rest of a run" }));
+  const chronological = runs.slice().reverse();
+  push(out, panel(24, "Alphas and accepts per run", `<div class="chartbox" style="height:220px"><canvas id="c-runs"></canvas></div>`, { height: 270 }));
+  out.after.push(() => chart($("#c-runs"), { type: "bar", data: { labels: chronological.map(r => r.kind === "research" ? short(r.run_id) || r.run_id.slice(2, 10) : r.run_id),
+    datasets: [{ label: "repair", data: chronological.map(r => r.repair || 0), backgroundColor: C.yellow + "bb" },
+      { label: "reject", data: chronological.map(r => r.rejected || 0), backgroundColor: C.red + "aa" },
+      { label: "accept", data: chronological.map(r => r.accepted || 0), backgroundColor: C.green },
+      { type: "line", label: "best Sharpe", data: chronological.map(r => r.best_sharpe), yAxisID: "y2", borderColor: C.blue, backgroundColor: C.blue, pointRadius: 3, borderWidth: 1.5 }] },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: "bottom", align: "start" } },
+      scales: { x: { stacked: true, grid: { display: false }, ticks: { callback(v) { const l = this.getLabelForValue(v); return l.replace(/^rs/, ""); } } },
+        y: { stacked: true, beginAtZero: true, title: { display: true, text: "alphas" } }, y2: { position: "right", grid: { display: false }, title: { display: true, text: "best Sharpe" } } } } }));
+  push(out, panel(24, "Runs", table("runs", [
+    { key: "run_id", label: "Run", fmt: (v, r) => `<span class="mono">${esc(v)}</span>` },
+    { key: "kind", label: "Kind", fmt: v => `<span class="c-weak">${esc(v)}</span>` },
+    { key: "status", label: "Status", fmt: v => pill(v) },
+    { key: "started_at", label: "Started", fmt: v => local(v) },
+    { key: "duration", label: "Duration", sort: r => r.ended_at && r.started_at ? new Date(r.ended_at) - new Date(r.started_at) : null,
+      fmt: (v, r) => r.started_at ? dur(((r.ended_at ? new Date(r.ended_at) : new Date()) - new Date(r.started_at)) / 1000) : "–" },
+    { key: "regions_this_run", label: "Regions", fmt: (v, r) => esc((v || r.regions_simulated || []).join(" · ")) },
+    { key: "alphas", label: "Alphas", num: true },
+    { key: "accepted", label: "Accept", num: true, fmt: v => v ? `<span class="c-green">${v}</span>` : "0" },
+    { key: "repair", label: "Repair", num: true }, { key: "rejected", label: "Reject", num: true },
+    { key: "best_sharpe", label: "Best", num: true, fmt: (v, r) => r.best_alpha ? `<a data-alpha="${esc(r.best_alpha)}" class="${sharpeCls(v)}">${fmt(v)}</a>` : "–" },
+    { key: "median_abs_sharpe", label: "Median |S|", num: true, fmt: v => fmt(v) },
+    { key: "model_calls", label: "Model calls", num: true, fmt: v => v ?? "–" },
+    { key: "models_down", label: "Models lost", sort: r => (r.models_down || []).length, fmt: (v, r) => (v || []).map(m =>
+      `<span class="chip" title="${esc(m)}: ${esc((r.models_down_reasons || {})[m] || "")}">${esc(modelName(m))}</span>`).join("") },
+    { key: "stop_reason", label: "Why it stopped", cls: "wrap", fmt: v => esc(v || "") },
+  ], runs), {}));
+}
+
+// ---------------- Pool
+function renderPool(out) {
+  $("#vars").innerHTML = "";
+  const p = S.pool; if (!p) { push(out, `<div class="notice">Loading…</div>`); return; }
+  const cols = [
+    { key: "candidate_id", label: "Alpha", fmt: v => alphaLink(v) },
+    { key: "region", label: "Region" }, { key: "dataset", label: "Dataset" },
+    { key: "brain_sim_id", label: "BRAIN simulation", fmt: v => `<span class="mono c-weak">${esc(v || "–")}</span>` },
+    { key: "sharpe", label: "Sharpe", num: true, fmt: v => `<span class="${sharpeCls(v)}">${fmt(v)}</span>` },
+    { key: "fitness", label: "Fitness", num: true, fmt: v => `<span class="${fitCls(v)}">${fmt(v)}</span>` },
+    { key: "turnover", label: "Turnover", num: true, fmt: v => pct(v, 0) },
+    { key: "prod_corr", label: "PROD", num: true, fmt: v => `<span class="${prodCls(v)}">${fmt(v, 3)}</span>` },
+    { key: "self_corr", label: "Self corr.", num: true, fmt: v => fmt(v, 3) },
+    { key: "min_year_sharpe", label: "Worst year", num: true, fmt: v => `<span class="${sharpeCls(v)}">${fmt(v)}</span>` },
+  ];
+  const regions = [...new Set(p.pool.map(a => a.region))];
+  push(out, stat(6, "Submitted alphas", p.pool.length, { color: "c-blue", sub: regions.join(" · ") }));
+  const fresh = p.accepted_not_in_pool.filter(a => !a.sibling_in_pool).length;
+  push(out, stat(6, "Accepted, not submitted", `${fresh}<span class="c-faint" style="font-size:20px"> + ${p.accepted_not_in_pool.length - fresh}</span>`, { color: fresh ? "c-green" : "c-weak", sub: "new lineages + siblings of submitted ones" }));
+  push(out, stat(6, "Waiting on BRAIN checks", p.awaiting_checks.length, { color: p.awaiting_checks.length ? "c-yellow" : "c-weak", sub: "run cli recheck later" }));
+  push(out, stat(6, "Regions covered", regions.length, { sub: "of 10 markets" }));
+  push(out, panel(24, "Submitted (pool)", table("pool", [...cols, { key: "pool_event", label: "How", fmt: v => pill(v === "admitted" ? "accept" : v) },
+    { key: "admitted_at", label: "Since", fmt: v => local(v) }], p.pool, { click: true })));
+  push(out, panel(24, "Accepted, not submitted", table("pool-acc", [...cols, { key: "decided_at", label: "Accepted", fmt: v => local(v) },
+    { key: "sibling_in_pool", label: "Lineage", fmt: v => v ? `<span class="c-orange" title="a sibling of this lineage is submitted: they correlate">sibling submitted: ${alphaLink(v)}</span>` : `<span class="c-green">no submission yet</span>` }],
+    p.accepted_not_in_pool, { click: true }), { info: "Siblings of one lineage correlate: submit one, then `cli pool --submitted <id>`" }));
+  push(out, panel(24, "Pending: BRAIN checks not finished", table("pool-wait", [...cols, { key: "pending_checks", label: "Waiting for", fmt: v => (v || []).map(c => `<span class="chip warn">${esc(c)}</span>`).join("") }],
+    p.awaiting_checks, { click: true })));
+}
+
+// ---------------- What works
+function renderWorks(out) {
+  const L = S.levers || [];
+  const classes = [...new Set(L.map(r => r.parent_class))].sort((a, b) => a === "all" ? -1 : b === "all" ? 1 : a.localeCompare(b));
+  $("#vars").innerHTML = `<div class="var"><label>Parent failure class</label><select id="w-cls">${classes.map(c => `<option ${c === S.worksClass ? "selected" : ""}>${esc(c)}</option>`).join("")}</select></div>`;
+  $("#w-cls").onchange = e => { S.worksClass = e.target.value; render(); };
+  const rows = L.filter(r => r.parent_class === S.worksClass);
+  push(out, panel(12, "Repair fixes: share that raised Sharpe", barGauge(rows.filter(r => r.children >= 2).slice(0, 18).map(r => ({ label: r.lever, value: r.sharpe_up_share ?? 0, n: r.children })),
+    { max: 1, labelWidth: 220, color: r => r.value >= 0.6 ? C.green : r.value >= 0.4 ? C.yellow : C.red, fmtv: (v, r) => `${Math.round(v * 100)}% <span class="c-faint">(${r.n})</span>` }),
+    { height: 520, info: "Children with a parent result; fixes tried at least twice" }));
+  push(out, panel(12, "Repair fixes", table("levers", [
+    { key: "lever", label: "Fix", fmt: v => `<span class="mono">${esc(v)}</span>` },
+    { key: "children", label: "Tried", num: true }, { key: "accepted", label: "Accept", num: true, fmt: v => v ? `<span class="c-green">${v}</span>` : "0" },
+    { key: "repair", label: "Still repair", num: true },
+    { key: "median_d_sharpe", label: "Δ Sharpe", num: true, fmt: v => `<span class="${v > 0 ? "c-green" : v < 0 ? "c-red" : ""}">${v > 0 ? "+" : ""}${fmt(v)}</span>` },
+    { key: "median_d_fitness", label: "Δ Fitness", num: true, fmt: v => `<span class="${v > 0 ? "c-green" : v < 0 ? "c-red" : ""}">${v > 0 ? "+" : ""}${fmt(v)}</span>` },
+  ], rows), { height: 520, info: "Medians of child minus parent" }));
+  const M = S.models || { model: [], dataset: [] };
+  const mcols = [{ key: "name", label: "Name", fmt: v => `<span class="mono">${esc(v)}</span>` }, { key: "alphas", label: "Alphas", num: true },
+    { key: "accepted", label: "Accept", num: true, fmt: v => v ? `<span class="c-green">${v}</span>` : "0" }, { key: "repair", label: "Repair", num: true },
+    { key: "mean_abs_sharpe", label: "Mean |S|", num: true, fmt: v => fmt(v) },
+    { key: "share_abs_sharpe_1", label: "|S| ≥ 1", num: true, fmt: v => pct(v, 0) },
+    { key: "best_sharpe", label: "Best", num: true, fmt: v => `<span class="${sharpeCls(v)}">${fmt(v)}</span>` }];
+  push(out, panel(10, "Generator models (new alphas)", table("models", mcols, M.model), { height: 420 }));
+  push(out, panel(14, "Datasets by market", table("datasets", mcols, M.dataset, { limit: 60 }), { height: 420 }));
+}
+
+// ------------------------------------------------------------------ inspect drawer
+async function openAlpha(id) {
+  $("#drawer").classList.add("open"); $("#drawer-bg").classList.add("open");
+  $("#dh").innerHTML = `<h2>${esc(id)}</h2><div class="meta">Loading…</div>`; $("#dbody").innerHTML = "";
+  let d; try { d = await api("/api/alpha?id=" + encodeURIComponent(id)); } catch (e) { $("#dbody").innerHTML = `<div class="notice err">${esc(e)}</div>`; return; }
+  if (d.error) { $("#dbody").innerHTML = `<div class="notice err">${esc(d.error)}</div>`; return; }
+  const a = d.alpha, c = d.candidate;
+  $("#dh").innerHTML = `<h2>${esc(id)}</h2><div class="meta">${pill(a.decision)} ${a.failure_class && a.failure_class !== "none" ? esc(a.failure_class) : ""}
+    <span>·</span> ${esc(c.region)} ${esc(c.universe)} D${esc(c.delay)} <span>·</span> ${esc(c.dataset)} <span>·</span> ${esc(c.model)}
+    ${a.brain_sim_id ? `<span>·</span> <span class="mono">BRAIN ${esc(a.brain_sim_id)}</span>` : ""}</div>
+    <div class="tabs" id="dtabs">${["Overview", "Checks", "Yearly", "PnL", "Lineage", "History"].map((t, i) =>
+      `<div class="tab ${i ? "" : "active"}" data-d="${t}">${t}</div>`).join("")}</div>`;
+  const kv = (k, v, cls = "") => `<div><span>${k}</span><b class="${cls}">${v}</b></div>`;
+  const alt = d.alt_stats || {}, rn = alt.risk_neutralized || {}, inv = alt.investability_constrained || {};
+  const pages = {
+    Overview: () => `<div class="kv">${kv("Sharpe", fmt(a.sharpe), sharpeCls(a.sharpe))}${kv("Fitness", fmt(a.fitness), fitCls(a.fitness))}
+      ${kv("Turnover", pct(a.turnover))}${kv("Returns", pct(a.returns))}${kv("Drawdown", pct(a.drawdown))}${kv("Margin", fmt(a.margin_bps) + " bps")}
+      ${kv("Sub-universe", `${fmt(a.sub_sharpe)} <span class="c-faint" style="font-size:12px">/ ${fmt(a.sub_cutoff)}</span>`)}
+      ${kv("PROD corr.", fmt(a.prod_corr, 3), prodCls(a.prod_corr))}${kv("Self corr.", fmt(a.self_corr, 3))}
+      ${kv("Risk-neutralized", fmt(rn.sharpe), sharpeCls(rn.sharpe))}${kv("Investability", fmt(inv.sharpe), sharpeCls(inv.sharpe))}${kv("Worst year", fmt(a.min_year_sharpe), sharpeCls(a.min_year_sharpe))}</div>
+      <h4>Expression</h4><div class="code">${esc(c.expression)}</div>
+      <h4>Settings</h4><div class="kv">${kv("Neutralization", esc(c.neutralization))}${kv("Decay", esc(c.decay))}${kv("Truncation", esc(c.truncation))}
+      ${kv("Fix", esc(c.lever || "new"))}${kv("Generation", esc(c.generation))}${kv("Prompt", esc(c.prompt_version))}</div>
+      <h4>Hypothesis</h4><div class="code" style="font-family:Inter,sans-serif;font-size:13px">${esc(c.hypothesis || "–")}</div>
+      ${d.reviews?.length ? `<h4>Critic reviews</h4>${table("d-rev", [{ key: "critic_model", label: "Critic", fmt: v => `<span class="mono">${esc(v)}</span>` },
+        { key: "role", label: "Role" }, { key: "verdict", label: "Verdict", fmt: v => pill(v === "simulate" ? "accept" : v === "drop" ? "reject" : "repair") + " " + esc(v) },
+        { key: "reason", label: "Why", cls: "wrap", fmt: (v, r) => esc(r.reason || r.reasons || r.rationale || "") }], d.reviews)}` : ""}`,
+    Checks: () => table("d-checks", [{ key: "name", label: "BRAIN check", fmt: v => `<span class="mono">${esc(v)}</span>` },
+      { key: "passed", label: "Result", fmt: v => v === true ? pill("up").replace(">up<", ">PASS<") : v === false ? pill("down").replace(">down<", ">FAIL<") : `<span class="c-faint">not ruled</span>` },
+      { key: "value", label: "Value", num: true, fmt: v => fmt(v, 4) }, { key: "limit", label: "Limit", num: true, fmt: v => fmt(v, 4) }], d.checks)
+      + `<h4>Decision gates</h4>` + table("d-gates", [{ key: "name", label: "Gate", fmt: v => `<span class="mono">${esc(v)}</span>` },
+      { key: "passed", label: "Result", fmt: v => v === true ? `<span class="c-green">pass</span>` : v === false ? `<span class="c-red">fail</span>` : `<span class="c-faint">–</span>` },
+      { key: "value", label: "Value", num: true, fmt: v => typeof v === "number" ? fmt(v, 3) : esc(v ?? "–") },
+      { key: "threshold", label: "Threshold", num: true, fmt: v => esc(Array.isArray(v) ? v.join(" – ") : v ?? "–") },
+      { key: "note", label: "Note", cls: "wrap" }], (d.decisions.at(-1) || {}).gates || []),
+    Yearly: () => `<div class="chartbox" style="height:240px"><canvas id="d-year"></canvas></div>` + table("d-yearly", [
+      { key: "year", label: "Year" }, { key: "sharpe", label: "Sharpe", num: true, fmt: v => `<span class="${sharpeCls(v)}">${fmt(v)}</span>` },
+      { key: "fitness", label: "Fitness", num: true, fmt: v => fmt(v) }, { key: "returns", label: "Returns", num: true, fmt: v => pct(v) },
+      { key: "turnover", label: "Turnover", num: true, fmt: v => pct(v) }, { key: "max_drawdown", label: "Drawdown", num: true, fmt: v => pct(v) },
+      { key: "long_count", label: "Long", num: true }, { key: "short_count", label: "Short", num: true }], d.yearly),
+    PnL: () => d.pnl.dates.length ? `<div class="chartbox" style="height:360px"><canvas id="d-pnl"></canvas></div>` : `<div class="empty">No daily PnL stored</div>`,
+    Lineage: () => { const tree = n => `<li><span class="node ${n.candidate_id === id ? "me" : ""}"><a data-alpha="${esc(n.candidate_id)}" class="mono">${esc(short(n.candidate_id) || n.candidate_id)}</a>
+        ${n.lever ? `<span class="mono c-weak">${esc(n.lever)}</span>` : ""} ${pill(n.decision)}
+        <span class="${sharpeCls(n.sharpe)}">S ${fmt(n.sharpe)}</span> <span class="${fitCls(n.fitness)}">F ${fmt(n.fitness)}</span></span>
+        ${(n.children || []).length ? `<ul>${n.children.map(tree).join("")}</ul>` : ""}</li>`;
+      return `<div class="tree"><ul>${tree(d.lineage.tree)}</ul></div>`; },
+    History: () => d.results.map((r, i) => `<h4>Result ${i + 1} · ${esc(r.status)} · ${local(r.simulated_at)}</h4>
+      <div class="code">${r.notes.map(esc).join("\n") || "–"}</div>`).join("") + d.decisions.map((x, i) => `<h4>Decision ${i + 1} · ${esc(x.decision)} / ${esc(x.failure_class)} · ${local(x.decided_at)}</h4>
+      <div class="code">${x.reasons.map(esc).join("\n")}</div>`).join(""),
+  };
+  const show = t => { clearDrawerCharts(); document.querySelectorAll("#dtabs .tab").forEach(x => x.classList.toggle("active", x.dataset.d === t));
+    $("#dbody").innerHTML = pages[t]();
+    if (t === "Yearly" && hasChart()) drawerCharts.push(new Chart($("#d-year"), { type: "bar", data: { labels: d.yearly.map(y => y.year),
+      datasets: [{ label: "Sharpe", data: d.yearly.map(y => y.sharpe), backgroundColor: d.yearly.map(y => y.sharpe >= SHARPE_BAR ? C.green : y.sharpe >= 1 ? C.orange : y.sharpe >= 0 ? C.blue + "aa" : C.red) }] },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { grid: { display: false } } } } }));
+    if (t === "PnL" && hasChart() && d.pnl.dates.length) drawerCharts.push(new Chart($("#d-pnl"), { type: "line", data: { labels: d.pnl.dates,
+      datasets: [{ label: "Cumulative PnL", data: d.pnl.values, borderColor: C.green, backgroundColor: C.green + "22", fill: true, pointRadius: 0, borderWidth: 1.5, tension: 0.1 }] },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } },
+        scales: { x: { ticks: { maxTicksLimit: 10 }, grid: { display: false } }, y: { ticks: { callback: v => (v / 1e6).toFixed(1) + "M" } } } } }));
+  };
+  document.querySelectorAll("#dtabs .tab").forEach(x => x.onclick = () => show(x.dataset.d));
+  show("Overview");
+}
+let drawerCharts = [];
+function clearDrawerCharts() { drawerCharts.forEach(c => c.destroy()); drawerCharts = []; }
+function closeDrawer() { $("#drawer").classList.remove("open"); $("#drawer-bg").classList.remove("open"); clearDrawerCharts(); }
+$("#dclose").onclick = closeDrawer; $("#drawer-bg").onclick = closeDrawer;
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
+
+// ------------------------------------------------------------------ wiring
+function setTab(t) { S.tab = t; try { localStorage.setItem("qip-tab", t); } catch (e) {} history.replaceState(null, "", "#" + t); load(); }
+document.querySelectorAll(".tab[data-tab]").forEach(t => t.onclick = () => setTab(t.dataset.tab));
+$("#refresh-btn").onclick = () => load(true);
+$("#range").onchange = () => { try { localStorage.setItem("qip-range", $("#range").value); } catch (e) {} render(); };
+let timer = null;
+function schedule() { clearInterval(timer); const s = +$("#interval").value; if (s) timer = setInterval(() => { if (!document.hidden) load(); }, s * 1000); }
+$("#interval").onchange = () => { try { localStorage.setItem("qip-interval", $("#interval").value); } catch (e) {} schedule(); };
+try {
+  const h = location.hash.slice(1); const t = (TAB_NAMES[h] ? h : null) || localStorage.getItem("qip-tab"); if (t && TAB_NAMES[t]) S.tab = t;
+  const r = localStorage.getItem("qip-range"); if (r) $("#range").value = r;
+  const i = localStorage.getItem("qip-interval"); if (i) $("#interval").value = i;
+} catch (e) {}
+schedule();
+load(true);
+const openFromHash = () => { const m = location.hash.match(/^#alpha=(.+)$/); if (m) openAlpha(decodeURIComponent(m[1])); };
+window.addEventListener("hashchange", openFromHash); openFromHash();
+</script>
+</body>
+</html>

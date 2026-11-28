@@ -34,6 +34,7 @@ generator:
       prod_correlation: [ts_regression, group_mean, group_cartesian_product]
       self_correlation: [ts_regression, group_mean, bucket]
       sub_universe: [group_mean, ts_scale, scale_down]
+      investability: [ts_target_tvr_decay, trade_when, ts_decay_linear]
       concentration: [scale_down, ts_scale, quantile]
       event: [days_from_last_change, last_diff_value, ts_step, vec_count]
 

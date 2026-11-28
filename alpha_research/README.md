@@ -743,6 +743,20 @@ by hand. `blend_planner.py` does it in the pipeline (`blend_plan:` in `config/ag
 Children carry levers `blend_plan` and `partner_alone`; blend hypotheses start with
 `[blend partner=<dataset> weight=<w>]`, and later plans see the market's past pairings.
 
+## Dashboard (2026-11-28)
+
+```bash
+PYTHONPATH=src python3 -m alpha_research.cli dashboard            # opens http://127.0.0.1:8050
+```
+
+A read-only web page for this Mac only (the server binds 127.0.0.1 and refuses other Host
+headers). Start it in a second terminal while `cli research` or `cli run` works: both write
+`data/live/<run id>.json` (turn off with `--no-live`), which the Live tab shows with BRAIN's
+progress every ~15 s. Tabs: Live (status, alphas on BRAIN, models up/paused/down, decisions,
+log), Overview, Alphas (filter, sort, click a row for checks, yearly Sharpe, PnL, lineage),
+Runs, Pool & submissions, What works (repair fixes, generator models, datasets). Charts load
+Chart.js from jsDelivr; without internet the tables still work.
+
 ## Regenerating fixtures
 
 ```bash

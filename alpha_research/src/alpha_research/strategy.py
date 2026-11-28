@@ -371,6 +371,7 @@ _FAILURE_ADVICE = {
     "fitness": "fitness is the most common failure: returns are small relative to turnover; slow the signal down",
     "self_correlation": "self-correlation is the most common failure: the pool already has these ideas; use different datasets or operators",
     "sub_universe": "sub-universe Sharpe is the most common failure: the signal only works in illiquid names; prefer liquid fields",
+    "investability": "investability-constrained Sharpe is the most common failure: the alphas trade too fast for BRAIN's trading limits; prefer slower signals (longer windows, decay) on liquid names",
     "concentration": "weight concentration is the most common failure: rank or winsorize before combining",
     "drawdown": "drawdown is the most common failure: volatility-scale the signal",
     "recent_sharpe": "recent-years Sharpe is the most common failure: the signals have faded lately; prefer less crowded fields and test robustness to the recent regime",

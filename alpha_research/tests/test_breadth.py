@@ -250,3 +250,17 @@ def test_aggregates_balance_sheet_items_horizons_and_crowded_items():
     assert [x.item for x in items] == ["est_12m_grm_4wks", "est_12m_sal_4wks",
                                        "est_12m_eps_4wks"]           # one grm, no net debt
     assert b.item_root("est_12m_grm_1mth") == b.item_root("est_12m_grm_4wks")
+
+
+def test_no_heavier_weight_when_an_item_is_heavily_used():
+    # IND 2026-11-28: weight 2 with pre-tax profit (1,595 alphas) gave PROD 0.81, weight 1 0.71
+    from alpha_research.breadth import BreadthConfig, Family, variants
+    cfg = BreadthConfig(enabled=True, weights=(1.0, 2.0), min_items=2, items_per_variant=3)
+    def fam(item, usage):
+        return Family(dataset="analyst44", item=item, up=f"{item}_up", down=f"{item}_dn",
+                      count=None, usage=usage, coverage=1.0, vector=False, category="analyst")
+    light = {"analyst44": [fam("eps_a", 20), fam("sales_b", 30), fam("ebit_c", 40)]}
+    assert [w for _, _, w in variants(light, set(), cfg)] == [1.0, 2.0]
+    heavy = {"analyst44": [fam("eps_a", 20), fam("sales_b", 30),
+                           fam("pretaxprofit_c", cfg.heavy_item_alphas)]}
+    assert [w for _, _, w in variants(heavy, set(), cfg)] == [1.0]

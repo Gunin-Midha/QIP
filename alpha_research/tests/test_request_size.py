@@ -48,7 +48,7 @@ def test_413_becomes_request_too_large_with_the_hosts_numbers():
     assert (e.requested, e.limit, e.input_only) == (11002, 8000, False)
     e = too_large("m", 413, GROQ_ITPM)
     assert (e.requested, e.limit, e.input_only) == (11644, 7000, True)
-    assert too_large("m", 429, GROQ_TPM) is None
+    assert too_large("m", 429, "Rate limit reached ... try again in 7.9s") is None
     assert too_large("m", 413, None).requested is None
 
 

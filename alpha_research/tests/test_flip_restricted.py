@@ -27,11 +27,13 @@ def _flip_on(config):
         config.repair, flip_short_restricted=True))
 
 
-def test_default_off_and_real_config_on(config):
+def test_default_off_and_real_config_off_after_the_measurement(config):
     assert config.repair.flip_short_restricted is False
     assert not config.repair.sign_mirrors("CHN") and config.repair.sign_mirrors("USA")
+    # 2026-11-28: three CHN flips did not mirror (-5.23 -> +0.47, -3.39 -> +0.07,
+    # -2.23 -> +0.96), so the real config is back to BRAIN's guide
     real = load_config(ROOT / "config" / "thresholds.yaml")
-    assert real.repair.sign_mirrors("CHN")
+    assert not real.repair.sign_mirrors("CHN") and real.repair.sign_mirrors("USA")
 
 
 def test_chn_negative_near_miss_goes_to_repair_when_on(config, playbook, memory, candidate):

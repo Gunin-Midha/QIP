@@ -50,6 +50,7 @@ FAILURE_PRIORITY = (
     "sharpe",
     "fitness",
     "recent_sharpe",
+    "investability",
     "sub_universe",
     "concentration",
     "drawdown",
@@ -62,6 +63,10 @@ FAILURE_PRIORITY = (
 BRAIN_CHECK_TO_CLASS = {
     "LOW_SHARPE": "sharpe",
     "LOW_FITNESS": "fitness",
+    # returns are one of fitness's two parts (fitness = Sharpe x sqrt(|returns| / max(
+    # turnover, 12.5%))); as "other" the 25 CHN LOW_RETURNS failures had no levers (failure
+    # review 2026-11-27). feasibility.returns_weak then leaves the turnover cuts out.
+    "LOW_RETURNS": "fitness",
     "LOW_TURNOVER": "turnover",
     "HIGH_TURNOVER": "turnover",
     "CONCENTRATED_WEIGHT": "concentration",
@@ -79,7 +84,12 @@ BRAIN_CHECK_TO_CLASS = {
     "LOW_ROBUST_UNIVERSE_SHARPE": "sub_universe",
     "LOW_ROBUST_UNIVERSE_SHARPE.WITH_RATIO": "sub_universe",
     "LOW_ROBUST_UNIVERSE_RETURNS": "sub_universe",
-    "LOW_INVESTABILITY_CONSTRAINED_SHARPE": "sub_universe",
+    # the alpha with BRAIN's trading limits applied (ASI, JPN; limit ~0.7 x the alpha's
+    # own Sharpe). Its own class since 2026-11-27 (owner): over 58 ASI/JPN alphas the
+    # constrained / full Sharpe ratio falls with turnover (correlation -0.68; all 27 under
+    # 15% turnover passed), and the sub-universe levers it used to get (smaller universe,
+    # factor neutralizations, backfill) lowered or kept the ratio. Slowing levers come first.
+    "LOW_INVESTABILITY_CONSTRAINED_SHARPE": "investability",
     # ASI: the alpha must also hold on the region's Japanese stocks (value = their Sharpe,
     # limit 1.0). A sub-universe question too; as class "other" it had no levers and blocked
     # every repair of the best ASI lead in run rs20261125111614 (owner 2026-11-25)

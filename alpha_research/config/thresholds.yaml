@@ -103,7 +103,9 @@ repair:
   # Owner 2026-11-27: flip negative near misses in short-restricted markets (CHN) too, one
   # simulation each, to measure whether the opposite alpha mirrors there (BRAIN's guide says
   # it may not). false = no flips there (a negative value counts with its sign).
-  flip_short_restricted: true
+  # 2026-11-28: measured, CHN flips do not mirror (hand_20261128_chn_flip_*): -5.23 -> +0.47,
+  # -3.39 -> +0.07, -2.23 -> +0.96 (decay 10: +0.39); back to BRAIN's guide.
+  flip_short_restricted: false
 
 # Simulator
 simulator:

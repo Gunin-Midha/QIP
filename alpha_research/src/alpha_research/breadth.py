@@ -289,7 +289,10 @@ def variants(fams: Mapping[str, list[Family]], own: set, config: BreadthConfig, 
         if len(fs) < config.min_items:
             continue
         low = fs[:k]
-        plan = [(low, w) for w in config.weights]
+        # a weight above the first only when no item is heavily used: IND 2026-11-28, weight 2
+        # on items incl. pre-tax profit (1,595 BRAIN alphas) raised PROD_CORRELATION 0.71 -> 0.81
+        heavy = any(f.usage >= config.heavy_item_alphas for f in low)
+        plan = [(low, w) for i, w in enumerate(config.weights) if i == 0 or not heavy]
         nxt = fs[k:2 * k]
         if len(nxt) >= config.min_items:
             plan.append((nxt, config.weights[0]))

@@ -32,6 +32,13 @@ Method
    c. Sub-universe fails, the sub-universe Sharpe is below limit share x bar, and the alpha's
       own ratio (sub-universe / full Sharpe) is below ``blend_min_parent_ratio_share`` x the
       limit share: blends are out (the base has no large-cap part to blend onto).
+   d. Fitness fails (Sharpe and turnover pass) and returns are its weak part (``returns_weak``: LOW_RETURNS fails, or
+      even turnover cut to BRAIN's 12.5% floor at the same Sharpe and returns would give
+      less than ``returns_margin`` x the fitness bar; cuts also lose returns): the turnover
+      cuts (``turnover_levers``) are out, and ``emphasize_tails`` is offered only then (a
+      returns lever; it does nothing for a turnover problem). Failure review 2026-11-27: EUR
+      Sharpe 1.99 / fitness 0.82 at returns 3.85%, turnover 23% (best case 1.10 for a bar of
+      1.0) got only turnover cuts.
 2. ``measured_alone(fields, market)``: BRAIN results of our alphas in the market that read
    exactly these signal fields (base fields and groups aside), e.g. a partner tested alone.
    ``partner_check`` then refuses a partner whose measured sub-universe ratio is below the
@@ -48,6 +55,8 @@ from .fastexpr import FastExprError, FastExprSpec, analyze
 
 BLEND_LEVERS = frozenset({"blend_other_dataset", "blend_plan", "recipe_blend", "breadth_blend"})
 PART_LEVERS = frozenset({"reweight_legs", "drop_weak_legs"})
+RETURNS_LEVER = "emphasize_tails"
+TURNOVER_FLOOR = 0.125   # BRAIN's fitness uses max(turnover, 12.5%)
 NEUTRALIZING = ("neutralize_", "set_neutralization")
 
 
@@ -66,6 +75,12 @@ class FeasibilityConfig:
     weak_part_ratio_share: float = 0.6
     weak_part_sharpe_share: float = 0.5
     strong_part_share: float = 0.9
+    # returns are fitness's weak part when the best turnover cut gives < margin x bar (cuts
+    # also lose returns, so the best case needs headroom)
+    returns_margin: float = 1.2
+    # levers that only cut turnover: out when returns are fitness's weak part
+    turnover_levers: tuple[str, ...] = ("increase_decay", "lengthen_ts_window",
+                                        "wrap_in_smoothing", "hump")
 
     @classmethod
     def from_dict(cls, raw) -> "FeasibilityConfig":
@@ -85,10 +100,10 @@ class FeasibilityConfig:
                 if not isinstance(v, bool):
                     raise ConfigError("agents config: repair.feasibility.enabled must be "
                                       "true or false")
-            elif f.name == "tilt_levers":
+            elif f.name in ("tilt_levers", "turnover_levers"):
                 if not isinstance(v, (list, tuple)) or not all(isinstance(x, str) for x in v):
-                    raise ConfigError("agents config: repair.feasibility.tilt_levers must be "
-                                      "a list of lever names")
+                    raise ConfigError(f"agents config: repair.feasibility.{f.name} must "
+                                      f"be a list of lever names")
                 v = tuple(v)
             elif isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 10:
                 raise ConfigError(f"agents config: repair.feasibility.{f.name} must be a "
@@ -111,6 +126,36 @@ def sharpe_bar(decision=None, result=None) -> float | None:
             if g.name in ("sharpe", "brain:LOW_SHARPE") and _num(g.threshold):
                 return float(g.threshold)
     return None
+
+
+def fitness_bar(decision=None, result=None) -> float | None:
+    """BRAIN's LOW_FITNESS limit for the alpha, else our fitness gate's threshold."""
+    cv = ((getattr(result, "check_values", None) or {}).get("LOW_FITNESS") or {})
+    if _num(cv.get("limit")):
+        return float(cv["limit"])
+    if decision is not None:
+        for g in decision.gate_results:
+            if g.name in ("fitness", "brain:LOW_FITNESS") and _num(g.threshold):
+                return float(g.threshold)
+    return None
+
+
+def best_turnover_fitness(result) -> float | None:
+    """Fitness if turnover fell to BRAIN's 12.5% floor at the same Sharpe and returns: the
+    most any turnover cut can give (in practice cuts also lose some returns)."""
+    if result is None or not _num(result.sharpe) or not _num(result.returns):
+        return None
+    return abs(result.sharpe) * (abs(result.returns) / TURNOVER_FLOOR) ** 0.5
+
+
+def returns_weak(decision, result, margin: float = 1.0) -> bool:
+    """Returns, not turnover, hold fitness down (method step 1d)."""
+    if result is None:
+        return False
+    if (result.checks or {}).get("LOW_RETURNS") is False:
+        return True
+    bar, best = fitness_bar(decision, result), best_turnover_fitness(result)
+    return bar is not None and best is not None and best < bar * margin
 
 
 def ratio(result) -> float | None:
@@ -177,6 +222,20 @@ def blocked(name: str, *, mechanical: bool, decision, result, failing: Collectio
         else:
             return (f"Sharpe needs x{need:.2f}; mechanical levers never raised Sharpe more "
                     f"than x{1 + config.max_mechanical_sharpe_gain:.2f}")
+    if "fitness" in failing:
+        # only a fitness failure of an alpha whose Sharpe passes: with Sharpe failing too,
+        # fitness follows Sharpe; with turnover failing, the cuts are that class's fix
+        weak = ("sharpe" not in failing and "turnover" not in failing
+                and returns_weak(decision, result, config.returns_margin))
+        if weak and any(p in config.turnover_levers for p in parts):
+            best = best_turnover_fitness(result)
+            why = (" (LOW_RETURNS fails)" if (result.checks or {}).get("LOW_RETURNS") is False
+                   else f": even at 12.5% turnover fitness would be {best:.2f}")
+            return f"returns are fitness's weak part{why}; cutting turnover cannot close the gap"
+        if not weak and RETURNS_LEVER in parts:
+            return "turnover, not returns, holds fitness down: emphasize_tails is for returns"
+    elif RETURNS_LEVER in parts:
+        return "emphasize_tails is a fitness lever (returns); fitness does not fail"
     if "sub_universe" in failing:
         floor = sub_floor(decision, result)
         sub = result.sub_universe_sharpe if _num(result.sub_universe_sharpe) else None

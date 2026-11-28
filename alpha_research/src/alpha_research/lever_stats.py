@@ -112,6 +112,12 @@ class RepairLearningConfig:
     examples_in_prompt: int = 3          # successful past repairs shown to the repair model
     resume_from_memory: bool = True      # re-repair parents whose child was never simulated
     max_resume: int = 3                  # at most this many, closest to accept first
+    # open repairs of regions outside this run's rotation resumed anyway when this close to
+    # accept (lever_stats.distance), at most cross_region_leads per run (0 = off): run
+    # rs20261126082238 queued a wave for an IND alpha at distance 0.13, stopped before it
+    # went out, and IND did not come back in rotation for two days
+    cross_region_distance: float | None = 0.15
+    cross_region_leads: int = 2
     max_share_per_round: float = 0.5     # share of a round's slots queued repairs may take first
     max_depth: int = 2                   # repair generations below the original candidate
     max_trials_per_root: int = 4         # repair simulations per original candidate
@@ -176,6 +182,10 @@ class RepairLearningConfig:
         return cls(order=order, secondary_weight=float(num("secondary_weight", 0, 1)),
                    prior=(float(prior[0]), float(prior[1])), examples_in_prompt=examples,
                    resume_from_memory=resume, max_resume=count("max_resume", 0),
+                   cross_region_distance=(None if sec.get("cross_region_distance",
+                                                          d.cross_region_distance) is None
+                                          else float(num("cross_region_distance", 0, 10))),
+                   cross_region_leads=count("cross_region_leads", 0),
                    max_share_per_round=float(num("max_share_per_round", 0, 1)),
                    max_depth=count("max_depth", 1),
                    max_trials_per_root=count("max_trials_per_root", 1),
@@ -272,6 +282,11 @@ def slack(failure_class: str, decision: DecisionRecord | None,
                 if floor is not None and g.name in SUB_UNIVERSE_GATES:
                     vals.append(floor)
                     continue
+                if failure_class == "investability":
+                    s = _ratio_slack(g.value, g.threshold, result)
+                    if s is not None:
+                        vals.append(s)
+                        continue
                 s = _gate_slack(g.name, g.value, g.threshold)
                 if s is not None:
                     vals.append(s)
@@ -282,6 +297,19 @@ def slack(failure_class: str, decision: DecisionRecord | None,
 
 
 SUB_UNIVERSE_GATES = ("sub_universe", "brain:LOW_SUB_UNIVERSE_SHARPE")
+
+
+def _ratio_slack(value, limit, result: ResultRecord | None) -> float | None:
+    """Investability slack as a share of the alpha's own Sharpe: (value - limit) / Sharpe.
+    BRAIN's limit is ~0.7 x the alpha's Sharpe, so cutting the full Sharpe also cuts the
+    raw gap; on the ratio only a child that trades in a more investable way gains. None when
+    the numbers are missing or the Sharpe is not positive."""
+    if result is None or not isinstance(result.sharpe, (int, float)) or result.sharpe <= 0:
+        return None
+    if isinstance(value, bool) or isinstance(limit, bool) \
+            or not isinstance(value, (int, float)) or not isinstance(limit, (int, float)):
+        return None
+    return round((value - limit) / result.sharpe, 6)
 
 
 def _sub_floor_slack(decision: DecisionRecord | None,

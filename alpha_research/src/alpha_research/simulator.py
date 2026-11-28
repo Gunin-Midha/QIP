@@ -151,6 +151,24 @@ def holdout_leak(result: ResultRecord, config: Config) -> str | None:
     return None
 
 
+EMPTY_ALPHA = "empty alpha"
+
+
+def empty_alpha(result: ResultRecord) -> str | None:
+    """Why a complete result holds no alpha at all, else None: BRAIN reports turnover 0,
+    a zero (or missing) Sharpe and no long or short position in any year. In memory
+    (2026-11-27) all 4 such results added an unfilled vec_* part to the signal, so a missing
+    vector value made the whole expression NaN on every stock and day."""
+    if result.turnover != 0 or result.sharpe not in (0, None):
+        return None
+    rows = result.yearly or []
+    if not rows or any((y.long_count or 0) > 0 or (y.short_count or 0) > 0 for y in rows):
+        return None
+    return (f"{EMPTY_ALPHA}: BRAIN held no positions in any year (turnover 0, Sharpe 0); "
+            "the expression is NaN everywhere, usually a vec_* or sparse part added "
+            "without a fill for missing values")
+
+
 # ---------------------------------------------------------------------------
 # normalization
 # ---------------------------------------------------------------------------
@@ -268,7 +286,8 @@ class Simulator:
                  on_status: Callable[[dict], None] | None = None,
                  on_ready: Callable[[str], None] | None = None,
                  on_result: Callable[[CandidateRecord, ResultRecord], None] | None = None,
-                 more: Callable[[int], list[CandidateRecord]] | None = None
+                 more: Callable[[int], list[CandidateRecord]] | None = None,
+                 status_every: float | None = None
                  ) -> list[ResultRecord]:
         """Results in the order of ``candidates``, each persisted as it finishes. At most
         ``max_concurrent`` (default ``simulator.max_concurrent``) run on BRAIN at a time; a
@@ -311,7 +330,9 @@ class Simulator:
 
         active: list[_Job] = []
         total = len(waiting)
-        every = self.config.simulator.progress_every_seconds
+        # ``status_every`` (the dashboard's live file) overrides the console's cadence
+        every = status_every if status_every is not None \
+            else self.config.simulator.progress_every_seconds
         last_status = self.clock()
         hooked = on_ready is not None and hasattr(self.client, "on_ready")
         if hooked:
@@ -478,6 +499,15 @@ class Simulator:
         if leak:
             result.status = "invalid"  # never decide on numbers that saw the holdout
             result.notes.append(f"invalid: {leak}")
+        empty = empty_alpha(result) if result.status == "complete" else None
+        if empty:
+            # an expression bug, not evidence about the data: as failed it is decided
+            # reject / incomplete and still counts as a used simulation, and the Arm
+            # Designer, Strategy, lessons and dataset scores (complete results only) never
+            # count it. The research loop then tries the alpha once with missing vector
+            # values filled (research._retry_empty).
+            result.status = "failed"
+            result.notes.append(empty)
         if result.status in ("complete", "failed"):
             result.notes.extend(metric_validator.validate_result(result))
         return result

@@ -136,9 +136,11 @@ def test_bandit_driver_floor_holds(capsys):
 def test_robust_universe_checks_map_to_sub_universe():
     from alpha_research.evaluator import check_class
     for name in ("LOW_ROBUST_UNIVERSE_SHARPE", "LOW_ROBUST_UNIVERSE_SHARPE.WITH_RATIO",
-                 "LOW_ROBUST_UNIVERSE_RETURNS", "LOW_INVESTABILITY_CONSTRAINED_SHARPE",
+                 "LOW_ROBUST_UNIVERSE_RETURNS",
                  "LOW_ASI_JPN_SHARPE"):   # ASI's Japanese stocks: owner 2026-11-25
         assert check_class("brain:" + name) == "sub_universe"
+    # its own class since 2026-11-27 (test_investability_empty.py)
+    assert check_class("brain:LOW_INVESTABILITY_CONSTRAINED_SHARPE") == "investability"
     assert check_class("brain:SOME_NEW_CHECK") == "other"
 
 
