@@ -309,9 +309,20 @@ def test_unused_variables_are_errors_as_on_brain(spec):
     # BRAIN, 2026-11-14: 'ERROR: Found unused variables "liq"'
     e = analyze("a = rank(close); liq = rank(adv20); ts_decay_linear(a, 5)", spec).errors
     assert e == ["variable 'liq' is defined but never used (BRAIN refuses unused variables)"]
-    # used in a later assignment counts; so does reuse after redefinition
+    # used in a later assignment counts
     assert analyze("a = rank(close); b = a * 2; b", spec).errors == []
-    assert analyze("a = rank(close); a = a + rank(volume); a", spec).errors == []
+    # a redefinition is an error (BRAIN 2026-11-28: 'Attempted to redefine variable "m"')
+    assert any("assigned twice" in x for x in
+               analyze("a = rank(close); a = a + rank(volume); a", spec).errors)
+
+
+def test_required_arguments_by_name_are_errors_as_on_brain(spec):
+    # BRAIN: 'Unknown attribute "group"' (2026-11-23), 'Unknown attribute "d"' (2026-11-15)
+    assert any("required argument 'group'" in x for x in
+               analyze("group_rank(close, group=industry)", spec).errors)
+    assert any("required argument 'd'" in x for x in
+               analyze("ts_product(returns, d=5)", spec).errors)
+    assert analyze("ts_backfill(close, 20, k=1)", spec).errors == []   # optional: fine
 
 
 def test_operator_limit_counts_calls_and_arithmetic_as_brain_does(spec):

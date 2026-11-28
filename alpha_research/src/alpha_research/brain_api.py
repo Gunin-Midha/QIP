@@ -128,6 +128,10 @@ class BrainApiConfig:
     # stop a research run before a round when the login has less than this left: a new
     # login needs the biometric check, which an unattended run cannot answer; None = never
     login_reserve_seconds: float | None = None
+    # while alphas run, stop when the login has less than this left (RealBrainClient.
+    # check_login before each poll; BRAIN is asked at most every login_check_every_seconds)
+    login_margin_seconds: float | None = None
+    login_check_every_seconds: float = 600.0
 
 
 _CANDIDATE_SETTINGS = {"region", "universe", "delay", "decay", "neutralization", "truncation"}
@@ -147,8 +151,9 @@ def brain_config_from_dict(raw, source: str = "<dict>") -> BrainApiConfig:
     for key in ("request_timeout_seconds", "recordset_max_wait_seconds",
                 "rate_limit_max_wait_seconds", "check_max_wait_seconds",
                 "self_correlation_max_wait_seconds", "relogin_within_seconds",
-                "login_reserve_seconds"):
-        if key in raw and not (key in ("relogin_within_seconds", "login_reserve_seconds")
+                "login_reserve_seconds", "login_margin_seconds", "login_check_every_seconds"):
+        if key in raw and not (key in ("relogin_within_seconds", "login_reserve_seconds",
+                                       "login_margin_seconds")
                                and raw[key] is None):
             v = raw[key]
             if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
@@ -172,7 +177,8 @@ def brain_config_from_dict(raw, source: str = "<dict>") -> BrainApiConfig:
             raise ConfigError(f"{source}: retry_error_messages must be a list of strings")
         kw["retry_error_messages"] = tuple(msgs)
     unknown = set(raw) - {"settings", "session_file", "quota_reserve",
-                          "relogin_within_seconds", "login_reserve_seconds", *kw}
+                          "relogin_within_seconds", "login_reserve_seconds",
+                          "login_margin_seconds", *kw}
     if unknown:
         raise ConfigError(f"{source}: unknown keys {sorted(unknown)}")
     return BrainApiConfig(settings=dict(settings), **kw)
@@ -768,6 +774,39 @@ class RealBrainClient:
             return None
         return quota_text(self.quota, f"BRAIN's daily simulation limit is nearly used "
                                       f"(reserve {reserve})")
+
+    def login_left(self) -> float | None:
+        """Seconds the login has left, from BRAIN at most every ``login_check_every_seconds``
+        and counted down locally in between; None when unknown."""
+        if not hasattr(self.session, "expires_in"):
+            return None
+        now = time.monotonic()
+        cached = getattr(self, "_login_seen", None)
+        if cached is None or now - cached[0] >= self.config.login_check_every_seconds:
+            try:
+                left = self.session.expires_in()
+            except (ConnectionError, TimeoutError):
+                left = None
+            if left is None and cached is not None and cached[1] is not None:
+                left = 0.0    # BRAIN no longer reports a login it reported: it ended early
+            self._login_seen = cached = (now, left)   # an unknown expiry is cached too
+        if cached[1] is None:
+            return None
+        return cached[1] - (now - cached[0])
+
+    def check_login(self) -> None:
+        """Raise BrainLoginRequired when the login has less than ``login_margin_seconds``
+        left (the simulator calls this before each poll). A login ended early (BRAIN reports
+        no expiry while we were logged in) counts as lost."""
+        margin = self.config.login_margin_seconds
+        if margin is None or not hasattr(self.session, "expires_in"):
+            return
+        left = self.login_left()
+        if left is not None and left < margin:
+            raise BrainLoginRequired(
+                f"BRAIN login ends in {max(left, 0) / 60:.0f} min (brain.yaml "
+                f"login_margin_seconds {margin:g}); alphas still on BRAIN are recovered at "
+                f"the next run start")
 
     def login_stop(self) -> str | None:
         """Why a run should stop before its next round: the BRAIN login ends within

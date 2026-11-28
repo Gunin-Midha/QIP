@@ -112,14 +112,16 @@ simulator:
   max_poll_seconds: 1800   # GLB simulations took over 600 s (run rs20261111162604); ASI
                            # model110 repairs were still running after 18 min (2026-11-23)
   poll_interval_seconds: 5
+  max_poll_wait_seconds: 60   # longest sleep between polls, whatever BRAIN's Retry-After asks
   max_retries: 3
   progress_every_seconds: null    # status line every N s while simulations run; null = only
                                   # a line as each one finishes (owner 2026-11-23: no
                                   # periodic status lines)
-  max_concurrent: 4               # simulations on BRAIN at once (owner 2026-11-14: 8 ran together
+  max_concurrent: 6               # simulations on BRAIN at once (owner 2026-11-14: 8 ran together
                                   # with no 429; 2026-11-24: 4, since BRAIN computed PROD_CORRELATION
                                   # for only the first 2-4 of a batch of 8 within minutes, the
-                                  # rest took hours). OQ-3: over the account's limit BRAIN
+                                  # rest took hours; owner 2026-11-28: 6, BRAIN allows 8 at once,
+                                  # for faster runs). OQ-3: over the account's limit BRAIN
                                   # answers 429 and the client waits for a slot
   cancel_stuck_after_hours: 6     # cancel a simulation still unfinished on BRAIN 6 h after its
                                   # submission (run start / `cli brain cancel`; 2026-11-24: 7

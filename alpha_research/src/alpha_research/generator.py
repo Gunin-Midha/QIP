@@ -1038,6 +1038,10 @@ def build_system_prompt(spec: FastExprSpec, datafields: Collection[str] | None,
         "- Syntax: function calls, + - * /, comparisons, && and ||, numbers, and optional "
         "'name = expression;' statements before the final expression. Nothing else: no "
         "ternary operator, no indexing, no comments.",
+        "- Each variable is assigned once (BRAIN refuses redefining one: m2 = "
+        "ts_backfill(m, 63), not m = ts_backfill(m, 63)) and is used later; never name a "
+        "variable after a datafield. Required arguments go by position; only optional "
+        "ones are written name=value.",
         "- Window arguments are in trading days.",
         "",
         "Operators:",

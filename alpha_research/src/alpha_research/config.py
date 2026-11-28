@@ -112,6 +112,9 @@ class SimulatorConfig:
     # stuck at 90% for up to 10 days); None = never cancel. Recovery collects results that
     # finish later than our wait (max_poll_seconds) before this.
     cancel_stuck_after_hours: float | None = None
+    # longest sleep between two polls, whatever BRAIN's Retry-After asks (owner 2026-11-28:
+    # run rs20261128045753 sat an hour after its last result with one alpha on BRAIN)
+    max_poll_wait_seconds: float = 60.0
 
 
 # failure classes whose repair can be limited to near misses, and the gate each one reads
@@ -332,6 +335,9 @@ def config_from_dict(raw: Any, source: str = "<dict>") -> Config:
         cancel_stuck_after_hours=(_num(s, "simulator", "cancel_stuck_after_hours", lo=0.0,
                                        nullable=True)
                                   if "cancel_stuck_after_hours" in s else None),
+        max_poll_wait_seconds=(_num(s, "simulator", "max_poll_wait_seconds", lo=0.001,
+                                    nullable=False)
+                               if "max_poll_wait_seconds" in s else 60.0),
     )
 
     # optional section: configs written before it existed keep working (no near-miss limit)

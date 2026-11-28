@@ -385,7 +385,13 @@ class Simulator:
             if topup is not None:
                 total += topup()
 
+        guard = getattr(self.client, "check_login", None)
         while waiting or active:
+            if guard is not None:
+                # the login ends soon (BRAIN's limit, or ended elsewhere): stop now and leave
+                # the running alphas on BRAIN for the next start's recovery, rather than
+                # polling into a login nobody can renew (BrainLoginRequired)
+                guard()
             while waiting and len(active) < limit:
                 job = waiting.popleft()
                 if job.sim_id is None:
@@ -558,4 +564,7 @@ class Simulator:
             else job.progress
         wait = raw.get("retry_after")
         wait = float(wait) if isinstance(wait, (int, float)) and wait > 0 else cfg.poll_interval_seconds
+        # never sleep longer than max_poll_wait_seconds, nor past the alpha's own timeout
+        wait = min(wait, cfg.max_poll_wait_seconds,
+                   max(cfg.max_poll_seconds - elapsed, cfg.poll_interval_seconds))
         return None, False, wait

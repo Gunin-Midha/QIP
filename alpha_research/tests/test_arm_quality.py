@@ -96,7 +96,7 @@ def _store(memory, candidate, cid, dataset, region, sharpe, decision="reject", m
     universe, neut = MARKETS[region]
     memory.put_candidate(candidate(candidate_id=cid, dataset=dataset, region=region,
                                    universe=universe, neutralization=neut,
-                                   prompt_version="gen-v17", model=model,
+                                   prompt_version="gen-v18", model=model,
                                    expression=f"rank(ts_mean(volume, {len(cid) + 2}))"))
     memory.put_result(ResultRecord(cid, "complete", sharpe=sharpe))
     memory.put_decision(DecisionRecord(cid, decision, "sharpe", gate_results=[
@@ -122,8 +122,8 @@ def test_an_arm_added_during_a_run_gets_its_own_record_else_the_markets(memory, 
     for _ in range(4):
         run.director.update(pv, False)
     run.director.update(pv, True)
-    old_key = ("thin_ds", "USA", "gen-v17", "claude-test", 1)
-    new_key = ("never_ds", "USA", "gen-v17", "claude-test", 1)
+    old_key = ("thin_ds", "USA", "gen-v18", "claude-test", 1)
+    new_key = ("never_ds", "USA", "gen-v18", "claude-test", 1)
     run._add_arm(old_key, _plan("thin_ds"), [])
     run._add_arm(new_key, _plan("never_ds"), [])
     run._seed_new_arms()
@@ -139,7 +139,7 @@ def test_arms_with_evidence_get_the_floor_share(memory, config, playbook, candid
     usa_pv = [k for k in run.director.arms if k[1] == "USA"]
     others = []
     for i in range(5):     # five untried arms with blank records
-        key = (f"new{i}", "USA", "gen-v17", "claude-test", 1)
+        key = (f"new{i}", "USA", "gen-v18", "claude-test", 1)
         run._add_arm(key, _plan(f"new{i}"), [])
         others.append(key)
     for k in usa_pv:       # the evidence arm has a poor record

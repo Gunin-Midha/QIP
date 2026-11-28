@@ -1300,3 +1300,38 @@ Fixes: designer `min_brain_alphas` 300 (thinner datasets only as the exploration
 Strategy Evolution new-dataset arm on them), `weights.uncrowded` 0; director
 `evidence_floor_share` 0.4 at `evidence_sharpe` 1.0; arms added during a run credited with
 their own record, else the market's average (`new_arm_prior: market`); `thin_dead_after` 4.
+
+## Run rs20261128045753 report; poll wait cap and login guard (2026-11-28)
+
+Report: stopped on "BRAIN login lost" (BRAIN asked for the biometric check mid-run) after the
+process sat about an hour with one alpha on BRAIN; 46 simulations, 0 accepts; 9 resumed
+repairs all blocked (depth limit, lineage budget, patience), cross-region leads all in
+lineages with an accept; models: 0 empty replies, no pauses, one too-large request per Groq
+model, only Gemini down (its 20 free calls a day). Its model-written lessons claimed a median
+turnover drop of -1.028 and called the failed ASI breadth blends a "low-cost tune-up"; a rule
+write superseded them.
+
+Fix: the simulator sleeps at most `simulator.max_poll_wait_seconds` (60) between polls and
+never past an alpha's own timeout, whatever BRAIN's Retry-After asks; before each poll or
+submit it calls `RealBrainClient.check_login`, which raises BrainLoginRequired when the login
+has less than `login_margin_seconds` (300) left (GET /authentication at most every
+`login_check_every_seconds` 600, counted down locally; a login BRAIN stops reporting counts as
+ended). The run then writes its report and lessons; alphas still on BRAIN are recovered at the
+next start.
+
+## Six simulations at a time; incomplete alphas caught before BRAIN (2026-11-28, owner)
+
+`simulator.max_concurrent` 6 (was 4 since 2026-11-24; BRAIN allows 8 at once).
+
+Incomplete results since 2026-11-23 (72): 21 timeouts and 31 simulations cancelled after
+sitting on BRAIN (BRAIN-side; timeouts are recovered at the next start), 6 BRAIN internal
+errors, 2 empty alphas (sparse other546 vector fields), and expressions BRAIN refused. Over all
+of memory BRAIN refused 20 alphas: 14 by how the expression was written, all now caught by
+`fastexpr.analyze`; 6 by its own errors, which no check can prevent. Two rules are new
+(replay over memory: they flag exactly the alphas BRAIN refused, nothing it accepted):
+- a variable assigned twice (BRAIN: 'Attempted to redefine variable "m"'): the first three
+  alphas of run rs20261128085344 were Critic revisions that wrote `m = ts_backfill(m, 63)`;
+- a required argument written by name (BRAIN: 'Unknown attribute "group"', 'Unknown
+  attribute "d"'): `group_rank(x, group=country)`, `ts_product(x, d=5)`.
+The Generator (gen-v18), Critic (critic-v7) and Repair Agent (repair-v13) prompts state both
+rules; the validator enforces them whatever a model writes.

@@ -457,8 +457,10 @@ def test_simulator_runs_end_to_end_on_real_client(bcfg, config, memory, candidat
     assert r.daily_pnl is not None and len(r.daily_pnl) == 300
     assert "brain_alpha_id: A1" in r.notes
     assert vc.sleeps == [2.5, 2.5, 1.0]          # two sim polls, one recordset wait
-    body = transport.calls[1]["body"]
-    assert transport.calls[1]["path"] == "/simulations" and body["regular"] == candidate().expression
+    # the simulator also asks how long the login has left (GET /authentication, 2026-11-28)
+    submit = next(c for c in transport.calls if c["method"] == "POST" and c["path"] == "/simulations")
+    assert submit["body"]["regular"] == candidate().expression
+    assert transport.paths("GET").count("/authentication") == 1   # unknown expiry cached
     assert memory.pending() == []
 
 

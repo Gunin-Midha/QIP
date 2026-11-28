@@ -152,7 +152,7 @@ def _lead(memory, candidate, cid, region, tvr):
     memory.put_candidate(candidate(candidate_id=cid, region=region, universe=universe,
                                    neutralization=neut, decay=4,
                                    expression=f"rank(ts_zscore(volume, {len(cid) + 3}))",
-                                   prompt_version="gen-v17", model="claude-test"))
+                                   prompt_version="gen-v18", model="claude-test"))
     memory.put_result(ResultRecord(cid, "complete", sharpe=1.7, turnover=tvr))
     memory.put_decision(DecisionRecord(cid, "repair", "turnover", gate_results=[
         GateResult("turnover_range", False, tvr, (0.01, 0.7), "")]))

@@ -56,3 +56,9 @@ relogin_within_seconds: 10800
 # (owner 2026-11-26: runs go on while nobody is at the terminal). A round takes 30-60 min.
 # null = never.
 login_reserve_seconds: 2700
+# While alphas run on BRAIN, stop (report, lessons; running alphas recovered at the next
+# start) once the login has less than this left, instead of polling into a lost login (run
+# rs20261128045753 sat an hour after its last result). BRAIN is asked how long the login has
+# at most every login_check_every_seconds. null = never.
+login_margin_seconds: 300
+login_check_every_seconds: 600

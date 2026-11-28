@@ -563,6 +563,15 @@ class _Walker:
         else:
             self.operators.add(node.name)
             n = len(node.args) + len(node.kwargs)
+            # BRAIN refuses a required argument written by name ('Unknown attribute
+            # "group" encountered' for group_rank(x, group=country), 2026-11-23; "d" for
+            # ts_product(x, d=5), 2026-11-15): only optional arguments take a keyword
+            required = [p for p in op.params if p not in op.optional]
+            for key, _ in node.kwargs:
+                if key in required:
+                    self.err(f"{node.name}: required argument {key!r} must be written by "
+                             f"position, not as {key}=... (BRAIN: 'Unknown attribute "
+                             f"\"{key}\"'); signature: {op.signature}")
             if n < op.min_args or (op.max_args is not None and n > op.max_args):
                 want = (f"{op.min_args}" if op.max_args == op.min_args else
                         f"at least {op.min_args}" if op.max_args is None else
@@ -625,6 +634,11 @@ def analyze(expression: str, spec: FastExprSpec, *,
         if isinstance(stmt, Assign):
             if last:
                 w.err("the last statement must be the alpha expression, not an assignment")
+            # BRAIN refuses a second assignment to a name ('Attempted to redefine variable
+            # "m"', run rs20261128085344: Critic revisions wrote m = ts_backfill(m, 63))
+            if stmt.name in w.variables:
+                w.err(f"variable {stmt.name!r} is assigned twice (BRAIN refuses redefining "
+                      f"a variable); give the new value its own name")
             if stmt.name in spec.operators:
                 w.err(f"variable {stmt.name!r} has the same name as an operator")
             if stmt.name in spec.reserved_names:

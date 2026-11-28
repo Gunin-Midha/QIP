@@ -154,10 +154,10 @@ def test_strategy_prompt_is_cut_to_its_cap(monkeypatch):
 
     monkeypatch.setattr(strategy, "summarize", lambda outcomes, **kw: _summary(200))
     evo = StrategyEvolution(StrategyConfig(max_prompt_chars=9000), llm=Model(),
-                            context="ctx").evolve([], "gen-v17")
+                            context="ctx").evolve([], "gen-v18")
     assert seen["size"] <= 9000
     assert any("records trimmed" in n for n in evo.notes)
-    uncut = StrategyEvolution(StrategyConfig(), llm=Model(), context="ctx").evolve([], "gen-v17")
+    uncut = StrategyEvolution(StrategyConfig(), llm=Model(), context="ctx").evolve([], "gen-v18")
     assert seen["size"] > 9000 and not any("trimmed" in n for n in uncut.notes)
 
 

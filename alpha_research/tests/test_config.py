@@ -10,7 +10,7 @@ def test_main_config_loads_with_nulls():
     assert cfg.gates.turnover_max == 0.70
     assert cfg.risk.max_drawdown is None
     assert cfg.diversity.min_marginal_pool_sharpe_gain is None
-    assert cfg.simulator.max_concurrent == 4   # 2026-11-24 (was 8): BRAIN checks queue past ~4
+    assert cfg.simulator.max_concurrent == 6   # owner 2026-11-28 (was 4; BRAIN allows 8)
     assert cfg.simulator.cancel_stuck_after_hours == 6
 
 
