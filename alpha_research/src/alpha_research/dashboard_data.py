@@ -533,12 +533,21 @@ class DashboardData:
                 child.get("fitness"), parent.get("fitness")) else None
             for key in ((lever, "all"), (lever, cls)):
                 stats.setdefault(key, []).append((d, ds, df))
+        # submitted alphas credit every fix on the path from their lineage's original
+        on_path: dict[str, set] = {}
+        for sid in (p["candidate_id"] for p in self.pool()["pool"]):
+            for cid in self.lineage(sid)["ancestors"]:
+                lev = (self.cands.get(cid) or {}).get("lever")
+                if lev and lev != "critic_revision":
+                    on_path.setdefault(lev, set()).add(sid)
         rows = []
         for (lever, cls), xs in stats.items():
             dss = [x[1] for x in xs if x[1] is not None]
             dfs = [x[2] for x in xs if x[2] is not None]
             rows.append({"lever": lever, "parent_class": cls, "children": len(xs),
                          "accepted": sum(1 for x in xs if x[0] == "accept"),
+                         "submitted": len(on_path.get(lever, ())) if cls == "all" else None,
+                         "submitted_ids": sorted(on_path.get(lever, ())),
                          "repair": sum(1 for x in xs if x[0] == "repair"),
                          "median_d_sharpe": _r(statistics.median(dss), 2) if dss else None,
                          "median_d_fitness": _r(statistics.median(dfs), 2) if dfs else None,
@@ -547,26 +556,65 @@ class DashboardData:
         rows.sort(key=lambda r: (r["parent_class"] != "all", -r["children"]))
         return {"levers": rows}
 
+    def _credit(self, root: str) -> str:
+        """Who wrote a lineage's original alpha: its generator model; seeds are the owner's
+        alphas (their model field is only the arm they ran under); hand-written roots "hand"."""
+        if root.startswith("seed_"):
+            return "seed (owner's alpha)"
+        model = (self.cands.get(root) or {}).get("model")
+        return model if model and model != "hand" else "hand"
+
     def models(self) -> dict:
+        """Per generator model and per market/dataset: the quality of the fresh alphas (as
+        first written), and the accepts and submissions anywhere in the lineages they started
+        (credit to the original's model and dataset, owner 2026-11-28: no alpha has passed as
+        first written; every accept came from repairs, most of them hand rescues)."""
         self.refresh()
-        groups: dict[tuple, list] = {}
+        groups: dict[tuple, dict] = {}
+
+        def group(kind: str, name: str) -> dict:
+            return groups.setdefault((kind, name), {"fresh": [], "accepted": set(),
+                                                    "lineages": set(), "submitted": set(),
+                                                    "pipeline": set()})
+
         for r in self._simulated():
-            if r["status"] != "complete":
+            # as first simulated: no repair; a Critic revision counts (its original was never
+            # simulated or stored)
+            fresh = (not r.get("lever") and not r.get("parent_id")) or (
+                r.get("lever") == "critic_revision" and r.get("parent_id") not in self.cands)
+            if r["status"] != "complete" or not fresh:
                 continue
-            if r.get("model") and r["model"] != "hand" and not r.get("lever"):
-                groups.setdefault(("model", r["model"]), []).append(r)
-            groups.setdefault(("dataset", f"{r['region']} / {r['dataset']}"), []).append(r)
+            if r.get("model") and r["model"] != "hand" and not r["candidate_id"].startswith("seed_"):
+                group("model", r["model"])["fresh"].append(r)
+            group("dataset", f"{r['region']} / {r['dataset']}")["fresh"].append(r)
+        submitted = {p["candidate_id"] for p in self.pool()["pool"]}
+        for cid, d in self.decisions.items():
+            if d.get("decision") != "accept" or cid not in self.cands \
+                    or (self.results.get(cid) or {}).get("status") != "complete":
+                continue
+            root = self.lineage(cid)["root"]
+            rc = self.cands.get(root) or {}
+            for g in (group("model", self._credit(root)),
+                      group("dataset", f"{rc.get('region')} / {rc.get('dataset')}")):
+                g["accepted"].add(cid)
+                g["lineages"].add(root)
+                if cid in submitted:
+                    g["submitted"].add(cid)
+                if not cid.startswith("hand_"):
+                    g["pipeline"].add(cid)
         out = {"model": [], "dataset": []}
-        for (kind, name), xs in groups.items():
+        for (kind, name), g in groups.items():
+            xs = g["fresh"]
             s = [abs(x["sharpe"]) for x in xs if x.get("sharpe") is not None]
-            out[kind].append({"name": name, "alphas": len(xs),
-                              "accepted": sum(1 for x in xs if x.get("decision") == "accept"),
-                              "repair": sum(1 for x in xs if x.get("decision") == "repair"),
-                              "mean_abs_sharpe": _r(statistics.mean(s), 2) if s else None,
-                              "best_sharpe": max((x["sharpe"] for x in xs
-                                                  if x.get("sharpe") is not None), default=None),
-                              "share_abs_sharpe_1": _r(sum(1 for v in s if v >= 1) / len(s), 2)
-                              if s else None})
+            out[kind].append({
+                "name": name, "alphas": len(xs),
+                "accepted_lineages": len(g["lineages"]), "accepted": len(g["accepted"]),
+                "accepted_by_pipeline": len(g["pipeline"]), "submitted": len(g["submitted"]),
+                "submitted_ids": sorted(g["submitted"]), "accepted_ids": sorted(g["accepted"]),
+                "mean_abs_sharpe": _r(statistics.mean(s), 2) if s else None,
+                "best_sharpe": max((x["sharpe"] for x in xs if x.get("sharpe") is not None),
+                                   default=None),
+                "share_abs_sharpe_1": _r(sum(1 for v in s if v >= 1) / len(s), 2) if s else None})
         for k in out:
-            out[k].sort(key=lambda g: -g["alphas"])
+            out[k].sort(key=lambda g: (-g["submitted"], -g["accepted_lineages"], -g["alphas"]))
         return out

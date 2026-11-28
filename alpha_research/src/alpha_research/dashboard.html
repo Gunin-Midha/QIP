@@ -608,19 +608,24 @@ function renderWorks(out) {
     { height: 520, info: "Children with a parent result; fixes tried at least twice" }));
   push(out, panel(12, "Repair fixes", table("levers", [
     { key: "lever", label: "Fix", fmt: v => `<span class="mono">${esc(v)}</span>` },
-    { key: "children", label: "Tried", num: true }, { key: "accepted", label: "Accept", num: true, fmt: v => v ? `<span class="c-green">${v}</span>` : "0" },
+    { key: "children", label: "Tried", num: true },
+    { key: "submitted", label: "Submitted", num: true, title: "submitted alphas with this fix on the path from their original (all classes)",
+      fmt: (v, r) => v ? `<span class="c-blue" title="${esc((r.submitted_ids || []).join(", "))}">${v}</span>` : `<span class="c-faint">${v === null ? "" : 0}</span>` },
     { key: "repair", label: "Still repair", num: true },
     { key: "median_d_sharpe", label: "Δ Sharpe", num: true, fmt: v => `<span class="${v > 0 ? "c-green" : v < 0 ? "c-red" : ""}">${v > 0 ? "+" : ""}${fmt(v)}</span>` },
     { key: "median_d_fitness", label: "Δ Fitness", num: true, fmt: v => `<span class="${v > 0 ? "c-green" : v < 0 ? "c-red" : ""}">${v > 0 ? "+" : ""}${fmt(v)}</span>` },
   ], rows), { height: 520, info: "Medians of child minus parent" }));
   const M = S.models || { model: [], dataset: [] };
-  const mcols = [{ key: "name", label: "Name", fmt: v => `<span class="mono">${esc(v)}</span>` }, { key: "alphas", label: "Alphas", num: true },
-    { key: "accepted", label: "Accept", num: true, fmt: v => v ? `<span class="c-green">${v}</span>` : "0" }, { key: "repair", label: "Repair", num: true },
-    { key: "mean_abs_sharpe", label: "Mean |S|", num: true, fmt: v => fmt(v) },
-    { key: "share_abs_sharpe_1", label: "|S| ≥ 1", num: true, fmt: v => pct(v, 0) },
-    { key: "best_sharpe", label: "Best", num: true, fmt: v => `<span class="${sharpeCls(v)}">${fmt(v)}</span>` }];
-  push(out, panel(10, "Generator models (new alphas)", table("models", mcols, M.model), { height: 420 }));
-  push(out, panel(14, "Datasets by market", table("datasets", mcols, M.dataset, { limit: 60 }), { height: 420 }));
+  const ids = v => (v || []).map(alphaLink).join(" · ");
+  const mcols = [{ key: "name", label: "Name", fmt: v => `<span class="mono">${esc(v)}</span>` },
+    { key: "submitted", label: "Submitted", num: true, title: "submitted alphas whose lineage started with this one's alpha",
+      fmt: v => v ? `<span class="c-blue">${v}</span>` : `<span class="c-faint">0</span>` },
+    { key: "submitted_ids", label: "Submitted alphas", sort: r => r.submitted, fmt: v => ids(v) || `<span class="c-faint">–</span>` },
+    { key: "alphas", label: "Alphas written", num: true, title: "alphas as first written (no repair)" }];
+  push(out, panel(24, "Generator models: submitted alphas", table("models", mcols, M.model),
+    { info: "A submitted alpha counts for the model that wrote its lineage's original alpha, however many repairs (pipeline or hand) it took. Seeds are your own alphas." }));
+  push(out, panel(24, "Datasets by market: submitted alphas", table("datasets", mcols, M.dataset, { limit: 60 }), { height: 460,
+    info: "A submitted alpha counts for the market and dataset of its lineage's original alpha" }));
 }
 
 // ------------------------------------------------------------------ inspect drawer

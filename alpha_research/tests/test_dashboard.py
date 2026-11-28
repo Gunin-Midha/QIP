@@ -195,3 +195,25 @@ def test_memory_is_opened_read_only(memory, candidate):
     with pytest.raises(Exception, match="readonly"):
         con.execute("CREATE TABLE x (a)")
     con.close()
+
+
+def test_models_get_credit_for_accepts_anywhere_in_their_lineages(memory, candidate):
+    # owner 2026-11-28: no alpha passed as first written; the model that wrote the original
+    # gets the accepts its repairs (pipeline or hand) reached
+    rid = "rs20261127153052"
+    memory.put_candidate(candidate(candidate_id=f"{rid}r01a1_001", model="gem", dataset="pv1"))
+    memory.put_result(ResultRecord(f"{rid}r01a1_001", "complete", sharpe=1.2))
+    memory.put_decision(DecisionRecord(f"{rid}r01a1_001", "repair", "sharpe"))
+    memory.put_candidate(candidate(candidate_id="hand_20261128_fix", model="hand", lever="hump",
+                                   parent_id=f"{rid}r01a1_001", expression="rank(close)"))
+    memory.put_result(ResultRecord("hand_20261128_fix", "complete", sharpe=2.0))
+    memory.put_decision(DecisionRecord("hand_20261128_fix", "accept", "none"))
+    memory.put_candidate(candidate(candidate_id=f"{rid}r01a2_001", model="qw",
+                                   expression="rank(volume)"))
+    memory.put_result(ResultRecord(f"{rid}r01a2_001", "complete", sharpe=-0.5))
+    memory.put_decision(DecisionRecord(f"{rid}r01a2_001", "reject", "sharpe"))
+    m = {x["name"]: x for x in DashboardData(memory.data_dir).models()["model"]}
+    assert (m["gem"]["accepted_lineages"], m["gem"]["accepted"], m["gem"]["alphas"]) == (1, 1, 1)
+    assert m["gem"]["accepted_by_pipeline"] == 0 and m["gem"]["accepted_ids"] == ["hand_20261128_fix"]
+    assert (m["qw"]["accepted_lineages"], m["qw"]["alphas"]) == (0, 1)
+    assert "hand" not in m        # the hand fix is credited to the original's model
