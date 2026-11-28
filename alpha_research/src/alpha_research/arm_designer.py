@@ -44,7 +44,12 @@ Method
    or BRAIN's risk-neutralized) is below ``dead_sharpe_share`` x the market's Sharpe bar. A
    dead dataset's arms get no more slots (designed or plan arms), its design counts as done,
    and it is not designed again. Run rs20261127085437: EUR model307, the exploration arm,
-   kept taking refill slots after 5 alphas at |Sharpe| <= 0.36.
+   kept taking refill slots after 5 alphas at |Sharpe| <= 0.36. Thinly used datasets (fewer
+   than ``min_brain_alphas`` BRAIN alphas) are dead after ``thin_dead_after`` such alphas
+   (owner 2026-11-28; run rs20261128045753 gave 16 GLB alphas to other546, best 0.85).
+6. Usage (owner 2026-11-28): a dataset with fewer than ``min_brain_alphas`` BRAIN alphas (or
+   no count) is picked only as an exploration arm (step 1), never as a category or
+   next-best pick.
 """
 
 from __future__ import annotations
@@ -78,6 +83,10 @@ class DesignerConfig:
     near_distance: float = 0.6
     dead_after_alphas: int = 0          # 0 = off (method step 5)
     dead_sharpe_share: float = 0.3
+    # thinly used datasets (fewer than min_brain_alphas BRAIN alphas, or unknown): only as an
+    # exploration arm, and dead after thin_dead_after weak alphas (steps 1, 5; 0 = off)
+    min_brain_alphas: int = 0
+    thin_dead_after: int = 0
 
     @classmethod
     def from_dict(cls, raw) -> "DesignerConfig":
@@ -89,7 +98,8 @@ class DesignerConfig:
         known = {"enabled", "arms_per_batch", "done_after_alphas", "explore_arms",
                  "exploit_arms", "exploit_min_share",
                  "min_signal_fields", "weights", "decay_by_category", "settings_evidence",
-                 "near_distance", "dead_after_alphas", "dead_sharpe_share"}
+                 "near_distance", "dead_after_alphas", "dead_sharpe_share",
+                 "min_brain_alphas", "thin_dead_after"}
         if set(raw) - known:
             raise ConfigError(f"agents config: designer: unknown keys {sorted(set(raw) - known)}")
 
@@ -132,7 +142,9 @@ class DesignerConfig:
                    weights=weights, decay_by_category=dict(decays),
                    settings_evidence=pos_int("settings_evidence"), near_distance=float(near),
                    dead_after_alphas=pos_int("dead_after_alphas", 0),
-                   dead_sharpe_share=float(dead_share))
+                   dead_sharpe_share=float(dead_share),
+                   min_brain_alphas=pos_int("min_brain_alphas", 0),
+                   thin_dead_after=pos_int("thin_dead_after", 0))
 
 
 # ---------------------------------------------------------------------------- step 1
@@ -223,14 +235,26 @@ def choose_datasets(scored: list[dict], config: DesignerConfig,
         take(row, f"exploit: our best |Sharpe| here {row['our_best_sharpe']}")
     for row in [r for r in scored if r["our_alphas"] == 0][:config.explore_arms]:
         take(row, "exploration: never simulated in this market")
+    # every other pick needs real use on BRAIN (owner 2026-11-28: run rs20261128045753 put
+    # 3 of 4 arms per market on datasets with 2-42 BRAIN alphas; over memory, fresh alphas on
+    # datasets with < 50 BRAIN alphas: mean |Sharpe| 0.35, 4% >= 1; >= 500: 1.0+, 40%+)
+    used = [r for r in scored if not thin(r, config)]
     seen = {r["category"] for r in picked}
-    for row in scored:
+    for row in used:
         if row["category"] not in seen:
             seen.add(row["category"])
             take(row, f"best score in category {row['category']}")
-    for row in scored:
+    for row in used:
         take(row, "next best score")
     return picked
+
+
+def thin(row: Mapping, config: DesignerConfig) -> bool:
+    """A dataset with fewer than ``min_brain_alphas`` BRAIN alphas (unknown counts as thin)."""
+    if config.min_brain_alphas <= 0:
+        return False
+    n = row.get("brain_alphas", row.get("alpha_count"))
+    return n is None or n < config.min_brain_alphas
 
 
 # ---------------------------------------------------------------------------- step 2
@@ -309,10 +333,13 @@ FRESH_LEVERS = (None, "", "critic_revision")
 
 
 def dead_datasets(outcomes: list[dict], region: str, delay: int, bar: float,
-                  config: DesignerConfig) -> dict[str, tuple[int, float]]:
+                  config: DesignerConfig,
+                  brain_alphas: Mapping[str, int | None] | None = None
+                  ) -> dict[str, tuple[int, float]]:
     """{dataset: (new alphas, best |Sharpe|)} of the datasets dead in this market (method
-    step 5)."""
-    if config.dead_after_alphas <= 0 or not bar:
+    step 5). ``brain_alphas`` ({dataset: BRAIN's alpha count}) turns on the thin rule: a
+    thinly used dataset is dead after ``thin_dead_after`` alphas below the same cut."""
+    if (config.dead_after_alphas <= 0 and config.thin_dead_after <= 0) or not bar:
         return {}
     seen: dict[str, list[float]] = {}
     for o in outcomes:
@@ -322,8 +349,15 @@ def dead_datasets(outcomes: list[dict], region: str, delay: int, bar: float,
             continue
         seen.setdefault(c.dataset, []).append(_best_sharpe(r) or 0.0)
     cut = config.dead_sharpe_share * bar
+
+    def need(ds: str) -> int:
+        if brain_alphas is not None and config.thin_dead_after > 0 \
+                and thin({"brain_alphas": brain_alphas.get(ds)}, config):
+            return config.thin_dead_after
+        return config.dead_after_alphas if config.dead_after_alphas > 0 else 10 ** 9
+
     return {ds: (len(v), max(v)) for ds, v in seen.items()
-            if len(v) >= config.dead_after_alphas and max(v) < cut}
+            if len(v) >= need(ds) and max(v) < cut}
 
 
 def batch_done(designs: list[dict], fresh: Mapping[str, int],

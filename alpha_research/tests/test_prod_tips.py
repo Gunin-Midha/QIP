@@ -159,6 +159,9 @@ def test_new_dataset_arms_go_to_the_least_crowded_dataset_first(memory, config, 
             "flow": {"dataset": "newds", "dataset_value_score": 1.0,
                      "dataset_alpha_count": 5000},
             "insd": {"dataset": "insiders9", "dataset_value_score": 5.0,
+                     "dataset_alpha_count": 400},
+            # thinly used (owner 2026-11-28: designer.min_brain_alphas 300): no new arm
+            "thin": {"dataset": "thin9", "dataset_value_score": 9.0,
                      "dataset_alpha_count": 50}}
     markets = {(r, 1): (list(meta), meta) for r in ("USA", "EUR", "JPN")}
     agents = dataclasses.replace(
@@ -176,9 +179,10 @@ def test_new_dataset_arms_go_to_the_least_crowded_dataset_first(memory, config, 
     def fake_evolve(*a, **k):
         seen.update(k.get("dataset_info") or {})
         return Evolution("gen-v13+evo1", "guidance",
-                         [("newds", "flow idea"), ("insiders9", "insider idea")])
+                         [("newds", "flow idea"), ("insiders9", "insider idea"),
+                          ("thin9", "thin idea")])
 
     run.strategist.evolve = fake_evolve
     run._evolve(1)
     assert seen["insiders9"]["value_score"] == 5.0
-    assert [k[0] for k in run.arms if k[0] in ("newds", "insiders9")] == ["insiders9"]
+    assert [k[0] for k in run.arms if k[0] in ("newds", "insiders9", "thin9")] == ["insiders9"]

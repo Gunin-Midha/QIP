@@ -36,8 +36,8 @@ Arm = tuple  # (dataset, region, prompt_version[, generator model, delay])
 
 @dataclass
 class ArmState:
-    successes: int = 0
-    failures: int = 0
+    successes: float = 0   # counts; a new arm may start from a market's average record
+    failures: float = 0
 
 
 def _region(arm) -> object:
@@ -107,16 +107,34 @@ class Orchestrator:
             give(everyone)
         return {a: slots[a] for a in self.arms}
 
-    def add_arm(self, arm: Hashable, like: Hashable | None = None) -> bool:
-        """Add a new arm: a fresh Beta(1, 1) prior, or a copy of arm ``like``'s posterior
+    def add_arm(self, arm: Hashable, like: Hashable | None = None,
+                prior: tuple[float, float] | None = None) -> bool:
+        """Add a new arm: a fresh Beta(1, 1) prior, a copy of arm ``like``'s posterior
         (Strategy Evolution's successor of an arm starts from what that arm showed, not
-        from scratch). Returns False if the arm already exists."""
+        from scratch), or ``prior`` = (successes, failures) to start from. Returns False if
+        the arm already exists."""
         if arm in self.state:
             return False
         self.arms.append(arm)
         old = self.state.get(like) if like is not None else None
-        self.state[arm] = ArmState(old.successes, old.failures) if old else ArmState()
+        if old:
+            self.state[arm] = ArmState(old.successes, old.failures)
+        elif prior is not None:
+            self.state[arm] = ArmState(prior[0], prior[1])
+        else:
+            self.state[arm] = ArmState()
         return True
+
+    def market_record(self, region, delay=None) -> tuple[float, float] | None:
+        """The average (successes, failures) of the arms of a region (and delay, arm index 4)
+        that have any record; None when none has."""
+        rows = [self.state[a] for a in self.arms if isinstance(a, tuple) and len(a) > 1
+                and a[1] == region and (delay is None or len(a) < 5 or a[4] == delay)
+                and self.state[a].successes + self.state[a].failures > 0]
+        if not rows:
+            return None
+        return (sum(r.successes for r in rows) / len(rows),
+                sum(r.failures for r in rows) / len(rows))
 
     def update(self, arm: Hashable, passed: bool) -> None:
         if arm not in self.state:

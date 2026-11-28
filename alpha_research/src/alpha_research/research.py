@@ -329,6 +329,13 @@ class AgentsConfig:
     # alphas pending on BRAIN's checks are fetched again every this many rounds during a
     # run (0 = only at the start); one decided repair starts its wave at once
     recheck_every_rounds: int = 0
+    # each market's arms whose dataset gave us best |Sharpe| (raw or risk-neutralized) >=
+    # evidence_sharpe get at least this share of the market's new-alpha slots (None = off)
+    evidence_floor_share: float | None = None
+    evidence_sharpe: float = 1.0
+    # a new arm (designed or new-dataset) with no record of its own starts from the
+    # market's average record ("market") or a blank one ("blank")
+    new_arm_prior: str = "blank"
     region_floor_share: float | None = None   # each region's minimum share of a round
     max_region_share: float | None = None     # no region above this share while others are below
     regions_per_run: int | None = None        # rotation: work on this many regions per run
@@ -368,6 +375,13 @@ def _bool(sec: dict, name: str, key: str) -> bool:
     v = sec.get(key)
     if not isinstance(v, bool):
         raise ConfigError(f"agents config: {name}.{key} must be true or false")
+    return v
+
+
+def _choice(sec: dict, key: str, allowed: tuple[str, ...]) -> str:
+    v = sec.get(key, allowed[0])
+    if v not in allowed:
+        raise ConfigError(f"agents config: director.{key} must be one of {list(allowed)}")
     return v
 
 
@@ -482,6 +496,10 @@ def agents_config_from_dict(raw) -> AgentsConfig:
         repair=RepairLearningConfig.from_dict(secs["repair"]),
         max_arm_share=_opt_num(secs["director"], "director", "max_arm_share", 0, 1),
         region_floor_share=_opt_num(secs["director"], "director", "region_floor_share", 0, 1),
+        evidence_floor_share=_opt_num(secs["director"], "director", "evidence_floor_share", 0, 1),
+        evidence_sharpe=(_opt_num(secs["director"], "director", "evidence_sharpe", 0, 10)
+                         if secs["director"].get("evidence_sharpe") is not None else 1.0),
+        new_arm_prior=_choice(secs["director"], "new_arm_prior", ("blank", "market")),
         max_region_share=_opt_num(secs["director"], "director", "max_region_share", 0, 1),
         refill_passes=(_pos_int(secs["director"], "director", "refill_passes", lo=0)
                        if "refill_passes" in secs["director"] else 0),
@@ -928,6 +946,8 @@ class ResearchRun:
         self.stop_requested = False        # first Ctrl-C: finish what is on BRAIN, then stop
         self.interrupts = 0                # Ctrl-C presses during run(catch_interrupt=True)
         self.live = None                   # dashboard: live.LiveStatus (attach_live)
+        self._new_arms: list[tuple] = []   # arms added during the run, to credit (_seed_new_arms)
+        self._evidence = None              # (round, {(dataset, region, delay): best |Sharpe|})
         self.current_round = 0
         self.max_rounds = None
         self.dropped_on_stop: list[str] = []   # screened alphas not sent to BRAIN after Ctrl-C
@@ -1016,18 +1036,20 @@ class ResearchRun:
         key = (c.dataset, c.region, self.generator_config.prompt_version, model, c.delay)
         return key if key in self.arms else None
 
-    def _warm_start(self) -> int:
+    def _warm_start(self, only: set | None = None, outcomes: list[dict] | None = None) -> int:
         """Credit the Director with every decided alpha in memory, counted the way a run
         counts them: repair children of one parent (its waves) as one result, a success
-        when any of them was accepted; every other alpha as itself."""
+        when any of them was accepted; every other alpha as itself. ``only``: credit just
+        these arms (arms added during the run: designed or new-dataset arms)."""
         n = 0
-        outcomes = self.memory.candidate_outcomes()
+        outcomes = outcomes if outcomes is not None else self.memory.candidate_outcomes()
         models = arm_models(outcomes, self.memory.critic_reviews())
         waves: dict[str, list[tuple[tuple, bool]]] = {}
         for row in outcomes:
             c, d = row["candidate"], row["decision"]
             key = self._arm_of(c, models.get(c.candidate_id))
-            if d is None or d.decision not in DECIDED or key is None:
+            if d is None or d.decision not in DECIDED or key is None \
+                    or (only is not None and key not in only):
                 continue
             if c.parent_id and c.lever and c.lever != "critic_revision":
                 waves.setdefault(c.parent_id, []).append((key, d.decision == "accept"))
@@ -1038,6 +1060,71 @@ class ResearchRun:
             self.director.update(members[0][0], any(ok for _, ok in members))
             n += 1
         return n
+
+    def _seed_new_arms(self, outcomes: list[dict] | None = None) -> None:
+        """Arms added during the run (designed, new-dataset): credit their own record from
+        memory (owner 2026-11-28: added after the warm start, a designed arm used to restart
+        every run from a blank record, so a dataset with 12 rejects looked as good as an
+        untried one); with none, start from the market's average record
+        (``director.new_arm_prior: market``)."""
+        keys, self._new_arms = set(self._new_arms), []
+        if not keys:
+            return
+        self._warm_start(only=keys, outcomes=outcomes)
+        if self.agents.new_arm_prior != "market":
+            return
+        for k in keys:
+            st = self.director.state.get(k)
+            if st is None or st.successes + st.failures > 0:
+                continue
+            others = [a for a in self.director.arms if a not in keys]
+            rows = [self.director.state[a] for a in others if a[1] == k[1] and a[4] == k[4]
+                    and self.director.state[a].successes + self.director.state[a].failures > 0]
+            if rows:
+                st.successes = sum(r.successes for r in rows) / len(rows)
+                st.failures = sum(r.failures for r in rows) / len(rows)
+
+    def _evidence_keys(self, live: list[tuple]) -> set[tuple]:
+        """Live arms whose dataset gave us best |Sharpe| (raw or risk-neutralized) >=
+        ``director.evidence_sharpe`` in their market (any alpha, repairs included)."""
+        if self.agents.evidence_floor_share is None:
+            return set()
+        if self._evidence is None or self._evidence[0] != self.current_round:
+            best: dict[tuple, float] = {}
+            for o in self.memory.candidate_outcomes():
+                c, r = o["candidate"], o["result"]
+                if r is None or r.status != "complete":
+                    continue
+                vals = [abs(r.sharpe)] if r.sharpe is not None else []
+                rn = ((r.alt_stats or {}).get("risk_neutralized") or {}).get("sharpe")
+                if isinstance(rn, (int, float)) and not isinstance(rn, bool):
+                    vals.append(abs(rn))
+                if vals:
+                    k = (c.dataset, c.region, c.delay)
+                    best[k] = max(best.get(k, 0.0), max(vals))
+            self._evidence = (self.current_round, best)
+        best = self._evidence[1]
+        cut = self.agents.evidence_sharpe
+        return {k for k in live if best.get((k[0], k[1], k[4]), 0.0) >= cut}
+
+    def _director_allocate(self, n: int, arms: list[tuple], **kw) -> dict:
+        """The Director's allocation of ``n`` slots over ``arms``, with at least
+        ``director.evidence_floor_share`` of them to the arms with evidence (owner
+        2026-11-28: in run rs20261128045753 JPN other176, the dataset of our submitted JPN
+        alpha, and GLB pv1 got no slot while untried thin datasets took 31 of 43)."""
+        a = self.agents
+        ev = [k for k in arms if k in self._evidence_keys(arms)]
+        floor = math.ceil(a.evidence_floor_share * n) if ev and a.evidence_floor_share else 0
+        floor = min(floor, n)
+        out = {k: 0 for k in self.director.arms}
+        if floor:
+            for k, m in self.director.allocate(floor, a.floor_share, None, only=ev).items():
+                out[k] += m
+        if n - floor:
+            for k, m in self.director.allocate(n - floor, a.floor_share, a.max_arm_share,
+                                               only=arms, **kw).items():
+                out[k] += m
+        return out
 
     def _pick_regions(self) -> tuple[dict[str, int], list[str] | None]:
         """Region rotation (``director.regions_per_run``): simulations per plan region in
@@ -1470,13 +1557,16 @@ class ResearchRun:
         """Datasets dead in the run's markets (arm_designer.dead_datasets); a line for each
         newly dead one."""
         cfg = self.agents.designer
-        if cfg.dead_after_alphas <= 0:
+        if cfg.dead_after_alphas <= 0 and cfg.thin_dead_after <= 0:
             return
         outcomes = outcomes if outcomes is not None else self.memory.candidate_outcomes()
         markets = {(k[1], k[4]) for k in self.arms if self._in_run(k)}
         for region, delay in sorted(markets):
+            meta = self.catalog_of(region, delay)[1]
+            counts = ({ds: f.get("alpha_count") for ds, f in dataset_facts(meta).items()}
+                      if meta and cfg.thin_dead_after > 0 else None)
             now = arm_designer.dead_datasets(outcomes, region, delay,
-                                             self._market_bar(region, delay), cfg)
+                                             self._market_bar(region, delay), cfg, counts)
             old = self.dead.get((region, delay), {})
             for ds, (n, best) in now.items():
                 if ds not in old:
@@ -1557,6 +1647,7 @@ class ResearchRun:
                     "batch_id", "region", "delay", "dataset", "category", "why", "score",
                     "parts", "facts", "settings_why")})
             self.inactive |= {k for k in keys if k not in designed}
+        self._seed_new_arms(outcomes)
 
     def _prepare_seeds(self) -> None:
         """Turn the plan's seeds into fresh root candidates on BRAIN's current period (the
@@ -1906,6 +1997,19 @@ class ResearchRun:
     def _allocate(self, slots: int, live: list[tuple]) -> dict:
         a = self.agents
         if self.run_regions is None:
+            if a.evidence_floor_share:
+                alloc = {k: 0 for k in self.director.arms}
+                for r in dict.fromkeys(k[1] for k in live):
+                    arms_r = [k for k in live if k[1] == r]
+                    n_r = round(slots * len(arms_r) / len(live))
+                    for k, m in self._director_allocate(n_r, arms_r).items():
+                        alloc[k] += m
+                short = slots - sum(alloc.values())
+                if short > 0:
+                    for k, m in self.director.allocate(short, a.floor_share, a.max_arm_share,
+                                                       only=live).items():
+                        alloc[k] += m
+                return consolidate(alloc, a.min_batch)
             return consolidate(self.director.allocate(
                 slots, a.floor_share, a.max_arm_share, only=live,
                 region_floor_share=a.region_floor_share,
@@ -1917,8 +2021,7 @@ class ResearchRun:
         alloc = {k: 0 for k in self.director.arms}
         for r, n in per_region.items():
             if n:
-                got = consolidate(self.director.allocate(n, a.floor_share, a.max_arm_share,
-                                                         only=[k for k in live if k[1] == r]),
+                got = consolidate(self._director_allocate(n, [k for k in live if k[1] == r]),
                                   a.min_batch)
                 for k, m in got.items():
                     alloc[k] += m
@@ -2463,12 +2566,21 @@ class ResearchRun:
         models = [m for m in self.models.generator if m not in self.counter.down]  # paused ok
         picks = [(*mk, models[(i + p) % len(models)]) for p in range(len(models))
                  for i, mk in enumerate(markets)] if models else []
+        # thinly used datasets (designer.min_brain_alphas) get no new-dataset arm here: the
+        # designer's exploration arm is their one way in (owner 2026-11-28)
+        dz = self.agents.designer
+        def known_thin(p) -> bool:
+            n = (facts.get((p[1], p[2]), {}).get(p[0]) or {}).get("alpha_count")
+            return n is not None and arm_designer.thin({"brain_alphas": n}, dz)
+
+        picks = [p for p in picks if not known_thin(p)]
         for ds, region, delay, plan, model in picks[:self.agents.strategy.max_new_arms]:
             settings = dataclasses.replace(plan.settings, dataset=ds)
             sources = deque(Source("hypothesis", t) for t in new_ds[ds])
             self._add_arm((ds, region, evo.prompt_version, model, delay),
                           ArmPlan(ds, settings, sources, evo.guidance_for(region),
                                   catalog=plan.catalog), added)
+        self._seed_new_arms()
         self.log[-1]["evolution"] = {"prompt_version": evo.prompt_version, "source": evo.source,
                                      "guidance": evo.guidance, "hypotheses": evo.hypotheses,
                                      "region_guidance": evo.region_guidance,
@@ -2486,6 +2598,8 @@ class ResearchRun:
         self.repair_queue[key] = deque()
         if self.director.add_arm(key, like=like):
             added.append(arm_label(key))
+            if like is None:
+                self._new_arms.append(key)
         return True
 
     # ------------------------------------------------------------------ report

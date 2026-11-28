@@ -107,7 +107,16 @@ designer:
   exploit_arms: 1
   exploit_min_share: 0.6
   min_signal_fields: 5
-  weights: {value: 1.0, uncrowded: 1.0, fields: 0.5, evidence: 1.0, novelty: 0.5, prod: 1.0}
+  # uncrowded 0 since 2026-11-28 (was 1.0): it favoured datasets nobody uses, where fresh
+  # alphas average |Sharpe| 0.35 (memory, < 50 BRAIN alphas, 112 alphas, 4% >= 1); production
+  # correlation is left to the blend levers (analyst revision breadth: 7 of 11 accepts)
+  weights: {value: 1.0, uncrowded: 0.0, fields: 0.5, evidence: 1.0, novelty: 0.5, prod: 1.0}
+  # owner 2026-11-28 (run rs20261128045753: 31 of 43 alphas on datasets with 2-42 BRAIN
+  # alphas, best |Sharpe| 0.85): a dataset with fewer BRAIN alphas than this (or no count) is
+  # only ever the exploration arm, and is dead after thin_dead_after alphas below
+  # dead_sharpe_share x bar (well-used datasets keep dead_after_alphas)
+  min_brain_alphas: 300
+  thin_dead_after: 4
   decay_by_category: {pv: 4, analyst: 5, earnings: 5, fundamental: 6, model: 6, default: 6}
   settings_evidence: 3
   near_distance: 0.6
@@ -261,6 +270,15 @@ director:
   # Regions (consultant level, builder defaults 2026-11-11, OQ-18): each region in the plan
   # gets at least floor(region_floor_share x slots / n_regions) slots per round, and none
   # gets more than max_region_share of a round while another region is below it.
+  # Evidence floor and new-arm prior (owner 2026-11-28; run rs20261128045753 gave JPN
+  # other176, the dataset of our submitted JPN alpha, and GLB pv1 no slot while untried
+  # thin datasets took 31 of 43): in each market the arms whose dataset gave us best
+  # |Sharpe| (raw or risk-neutralized, any alpha) >= evidence_sharpe get at least
+  # evidence_floor_share of the market's new-alpha slots; an arm added during a run gets its
+  # own record from memory, and with none the market's average record (new_arm_prior).
+  evidence_floor_share: 0.4
+  evidence_sharpe: 1.0
+  new_arm_prior: market
   region_floor_share: 0.5
   max_region_share: 0.6
   # Region rotation (owner 2026-11-11: each run covers a few regions, the next run others,

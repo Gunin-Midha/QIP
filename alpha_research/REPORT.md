@@ -1273,3 +1273,30 @@ Owner: track runs on a web page instead of the terminal, this Mac only, Grafana 
   tables, inspect drawer).
 Hard rule 1 now allows this one server module; the definition-of-done greps exclude
 `*dashboard*`.
+
+## Arm quality after run rs20261128045753 (2026-11-28, owner)
+
+Run `rs20261128045753` (DEU, GLB, JPN; still going when analysed): 43 alphas, all rejected,
+mean |Sharpe| 0.31, none at 1. Causes, from memory:
+
+| BRAIN alphas on the dataset | Fresh alphas | Mean \|Sharpe\| | \|Sharpe\| >= 1 | >= 1.58 |
+|---|---|---|---|---|
+| < 50 | 112 | 0.35 | 4% | 2 |
+| 50-500 | 17 | 0.48 | 12% | 1 |
+| 500-5,000 | 97 | 1.01 | 40% | 27 |
+| >= 5,000 | 170 | 1.06 | 43% | 41 |
+
+- The Arm Designer's score rewarded few BRAIN alphas (`uncrowded`), BRAIN's value score and
+  novelty, so 3 of 4 arms per market were datasets with 2-42 BRAIN alphas (GLB other546,
+  fundamental93; JPN model77, other546, pv173; DEU model53, news20, insider data): 31 of 43
+  alphas.
+- The Director starved the arms with evidence: JPN other176 (our submitted JPN alpha's
+  dataset) and GLB pv1 got no slot. A designed arm was added after the warm start, so its own
+  past rejects were never credited and an untried or failed thin dataset looked as good as
+  any.
+- Nothing was within repair distance, so no repair wave ran.
+
+Fixes: designer `min_brain_alphas` 300 (thinner datasets only as the exploration arm; no
+Strategy Evolution new-dataset arm on them), `weights.uncrowded` 0; director
+`evidence_floor_share` 0.4 at `evidence_sharpe` 1.0; arms added during a run credited with
+their own record, else the market's average (`new_arm_prior: market`); `thin_dead_after` 4.
